@@ -539,9 +539,10 @@
         
         hidePanel();
         
+        const taskId = 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
+        const label = opt.label;
+        
         try {
-          const taskId = 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
-          const label = opt.label;
           notify('download_start', {
             taskId, title: info.title, quality: opt.label, bvid: info.bvid,
             videoUrl: opt.videoUrl, audioUrl: opt.audioUrl,
