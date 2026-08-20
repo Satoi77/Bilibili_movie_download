@@ -1,10 +1,11 @@
 // content.js - Bridge between page context and extension
 (function() {
-  // Inject page script
+  // Inject page script with extension base URL
   if (!document.getElementById('bilibili-downloader-ext')) {
     const s = document.createElement('script');
     s.id = 'bilibili-downloader-ext';
     s.src = chrome.runtime.getURL('content-page.js');
+    s.dataset.extBase = chrome.runtime.getURL('');
     (document.head || document.documentElement).appendChild(s);
   }
 
