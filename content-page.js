@@ -232,8 +232,9 @@
   // ─── FFmpeg (in page context, bypassing CSP via Blob URLs) ───
   let ffmpegCache = null; // { instance, blobURLs }
 
-  // Get extension base URL from injected script element
-  const EXT_BASE = document.getElementById('bilibili-downloader-ext')?.dataset?.extBase || '';
+  // Get extension base URL
+  const EXT_ID = 'ehfapjpiedoiakpjpcohlbifnionkihp';
+  const EXT_BASE = 'chrome-extension://' + EXT_ID + '/';
 
   function createObjectURLFromExtension(path, mimeType) {
     return fetch(EXT_BASE + path)
