@@ -1,13 +1,41 @@
 // content.js - Bridge between page context and extension
 (function() {
-  // Inject page script with extension base URL
-  if (!document.getElementById('bilibili-downloader-ext')) {
-    const s = document.createElement('script');
-    s.id = 'bilibili-downloader-ext';
-    s.src = chrome.runtime.getURL('content-page.js');
-    s.dataset.extBase = chrome.runtime.getURL('');
-    (document.head || document.documentElement).appendChild(s);
+  // Pre-fetch FFmpeg files from extension context (where chrome-extension:// is allowed)
+  // and expose them as Blob URLs for the page context
+  async function preFetchFFmpeg() {
+    const files = [
+      { path: 'lib/ffmpeg.js', mime: 'text/javascript', key: 'js' },
+      { path: 'lib/ffmpeg-core.js', mime: 'text/javascript', key: 'core' },
+      { path: 'lib/ffmpeg-core.wasm', mime: 'application/wasm', key: 'wasm' },
+      { path: 'lib/ffmpeg-core.worker.js', mime: 'text/javascript', key: 'worker' }
+    ];
+    const urls = {};
+    for (const f of files) {
+      const r = await fetch(chrome.runtime.getURL(f.path));
+      const buf = await r.arrayBuffer();
+      urls[f.key] = URL.createObjectURL(new Blob([buf], { type: f.mime }));
+    }
+    return urls;
   }
+
+  // Inject page script after FFmpeg URLs are ready
+  preFetchFFmpeg().then(urls => {
+    // Expose URLs to page context via a global before injecting the main script
+    const setupScript = document.createElement('script');
+    setupScript.textContent = 'window.__biliDL_ffmpegURLs = ' + JSON.stringify(urls) + ';';
+    (document.head || document.documentElement).appendChild(setupScript);
+    setupScript.remove();
+
+    // Now inject the page script
+    if (!document.getElementById('bilibili-downloader-ext')) {
+      const s = document.createElement('script');
+      s.id = 'bilibili-downloader-ext';
+      s.src = chrome.runtime.getURL('content-page.js');
+      (document.head || document.documentElement).appendChild(s);
+    }
+  }).catch(e => {
+    console.error('[B站下载助手] Failed to pre-fetch FFmpeg:', e);
+  });
 
   // Pending merge callbacks (taskId → callback)
   const pendingMerges = new Map();

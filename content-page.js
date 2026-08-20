@@ -232,15 +232,9 @@
   // ─── FFmpeg (in page context, bypassing CSP via Blob URLs) ───
   let ffmpegCache = null; // { instance, blobURLs }
 
-  // Get extension base URL
-  const EXT_ID = 'ehfapjpiedoiakpjpcohlbifnionkihp';
-  const EXT_BASE = 'chrome-extension://' + EXT_ID + '/';
-
-  function createObjectURLFromExtension(path, mimeType) {
-    return fetch(EXT_BASE + path)
-      .then(r => r.arrayBuffer())
-      .then(buf => URL.createObjectURL(new Blob([buf], { type: mimeType })));
-  }
+  // Pre-fetched Blob URLs from content.js (avoids CSP blocking chrome-extension:// fetch)
+  const ffmpegURLs = window.__biliDL_ffmpegURLs || {};
+  delete window.__biliDL_ffmpegURLs; // cleanup
 
   function loadScript(url) {
     return new Promise((resolve, reject) => {
@@ -255,24 +249,22 @@
   async function getFFmpeg() {
     if (ffmpegCache?.instance?.loaded) return ffmpegCache.instance;
 
-    const jsURL = await createObjectURLFromExtension('lib/ffmpeg.js', 'text/javascript');
-    await loadScript(jsURL);
-    URL.revokeObjectURL(jsURL);
+    if (!ffmpegURLs.js) throw new Error('FFmpeg JS URL not pre-fetched by content script');
+
+    await loadScript(ffmpegURLs.js);
 
     const FFmpegClass = self.FFmpegWASM?.FFmpeg || self.FFmpegWASM;
     if (!FFmpegClass) throw new Error('FFmpeg class not found after script load');
 
     const instance = new FFmpegClass();
 
-    const [coreURL, wasmURL, workerURL] = await Promise.all([
-      createObjectURLFromExtension('lib/ffmpeg-core.js', 'text/javascript'),
-      createObjectURLFromExtension('lib/ffmpeg-core.wasm', 'application/wasm'),
-      createObjectURLFromExtension('lib/ffmpeg-core.worker.js', 'text/javascript')
-    ]);
+    await instance.load({
+      coreURL: ffmpegURLs.core,
+      wasmURL: ffmpegURLs.wasm,
+      workerURL: ffmpegURLs.worker
+    });
 
-    await instance.load({ coreURL, wasmURL, workerURL });
-
-    ffmpegCache = { instance, blobURLs: [coreURL, wasmURL, workerURL] };
+    ffmpegCache = { instance, blobURLs: Object.values(ffmpegURLs) };
     console.log('[B站下载助手] FFmpeg loaded once, cached for reuse');
     return instance;
   }
