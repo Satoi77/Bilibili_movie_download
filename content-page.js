@@ -229,20 +229,6 @@
     return name.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').substring(0, 200);
   }
 
-  async function getDeleteRawSetting() {
-    return new Promise((resolve) => {
-      const handler = (event) => {
-        if (event.data?.source !== 'bilibili-downloader') return;
-        if (event.data.type !== 'settings_result') return;
-        window.removeEventListener('message', handler);
-        resolve(event.data.data?.deleteRawAfterMerge || false);
-      };
-      window.addEventListener('message', handler);
-      window.postMessage({ source: 'bilibili-downloader', type: 'GET_SETTINGS' }, '*');
-      setTimeout(() => { window.removeEventListener('message', handler); resolve(false); }, 3000);
-    });
-  }
-
   // ─── FFmpeg (in page context, bypassing CSP via Blob URLs) ───
   function createObjectURLFromExtension(path, mimeType) {
     return fetch(chrome.runtime.getURL(path))
@@ -298,16 +284,6 @@
     setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 5000);
   }
 
-  async function saveBlobAs(blob, downloadPath) {
-    // Extract filename from path for <a download>
-    const filename = downloadPath.split('/').pop() || downloadPath;
-    saveBlob(blob, filename);
-  }
-
-  async function deleteDownloadedFile(downloadPath) {
-    console.log('[B站下载助手] Note: <a download> file cannot be auto-deleted:', downloadPath);
-  }
-
   // ─── Single video download ───
   async function downloadSingleVideo(videoInfo, qualityIdx, existingTaskId, collectionName) {
     const data = await getPlayUrl(videoInfo.aid, videoInfo.bvid, videoInfo.cid, 80);
@@ -332,11 +308,6 @@
     const taskId = existingTaskId || ('task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6));
     const title = videoInfo.title;
     const label = QMAP[q] || q + 'P';
-    const deleteRaw = await getDeleteRawSetting();
-    
-    // Build folder paths
-    const folder = collectionName ? sanitizeFilename(collectionName) : '';
-    const sourcesFolder = folder ? `${folder}/sources` : 'sources';
     
     notify('download_start', {
       taskId, title, quality: label, bvid: videoInfo.bvid,
@@ -345,39 +316,24 @@
     });
     
     try {
-      // Download audio
+      // Download audio + video in parallel
       notify('download_progress', { taskId, phase: 'audio', percent: 0, label: '音频' });
-      const audioBlob = await downloadBlob(bestAudio.baseUrl, taskId, 'audio', '音频');
-      const safeTitle = sanitizeFilename(title);
-      const audioPath = `${sourcesFolder}/${safeTitle}_${label}_音频.m4s`;
-      await saveBlobAs(audioBlob, audioPath);
-      
-      // Download video
       notify('download_progress', { taskId, phase: 'video', percent: 0, label: '视频' });
-      const videoBlob = await downloadBlob(bestVideo.baseUrl, taskId, 'video', '视频');
-      const videoPath = `${sourcesFolder}/${safeTitle}_${label}_视频.m4s`;
-      await saveBlobAs(videoBlob, videoPath);
+      
+      const [audioBlob, videoBlob] = await Promise.all([
+        downloadBlob(bestAudio.baseUrl, taskId, 'audio', '音频'),
+        downloadBlob(bestVideo.baseUrl, taskId, 'video', '视频')
+      ]);
       
       notify('download_progress', { taskId, phase: 'audio', percent: 100, label: '音频' });
       notify('download_progress', { taskId, phase: 'video', percent: 100, label: '视频' });
       
-      // Merge
-      try {
-        notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '合并中' });
-        const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, title);
-        const mergedPath = `${folder ? folder + '/' : ''}${safeTitle}_${label}.mp4`;
-        await saveBlobAs(mergedBlob, mergedPath);
-        notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
-        
-        // Delete raw files if setting enabled
-        if (deleteRaw) {
-          await deleteDownloadedFile(audioPath);
-          await deleteDownloadedFile(videoPath);
-          console.log('[B站下载助手] Raw files deleted:', audioPath, videoPath);
-        }
-      } catch(mergeErr) {
-        console.warn('[B站下载助手] Merge failed, keeping raw files:', mergeErr);
-      }
+      // Merge into single mp4
+      notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '合并中' });
+      const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, title);
+      const safeTitle = sanitizeFilename(title);
+      saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`);
+      notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
       
       notify('download_complete', { taskId });
     } catch(e) {
@@ -567,45 +523,30 @@
         try {
           const taskId = 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
           const label = opt.label;
-          const deleteRaw = await getDeleteRawSetting();
-          
           notify('download_start', {
             taskId, title: info.title, quality: opt.label, bvid: info.bvid,
             videoUrl: opt.videoUrl, audioUrl: opt.audioUrl,
             videoSize: opt.videoSize, audioSize: opt.audioSize
           });
           
-          // Download audio
+          // Download audio + video in parallel
           notify('download_progress', { taskId, phase: 'audio', percent: 0, label: '音频' });
-          const audioBlob = await downloadBlob(opt.audioUrl, taskId, 'audio', '音频');
-          const safeTitle = sanitizeFilename(info.title);
-          const audioPath = `sources/${safeTitle}_${label}_音频.m4s`;
-          await saveBlobAs(audioBlob, audioPath);
-          
-          // Download video
           notify('download_progress', { taskId, phase: 'video', percent: 0, label: '视频' });
-          const videoBlob = await downloadBlob(opt.videoUrl, taskId, 'video', '视频');
-          const videoPath = `sources/${safeTitle}_${label}_视频.m4s`;
-          await saveBlobAs(videoBlob, videoPath);
+          
+          const [audioBlob, videoBlob] = await Promise.all([
+            downloadBlob(opt.audioUrl, taskId, 'audio', '音频'),
+            downloadBlob(opt.videoUrl, taskId, 'video', '视频')
+          ]);
           
           notify('download_progress', { taskId, phase: 'audio', percent: 100, label: '音频' });
           notify('download_progress', { taskId, phase: 'video', percent: 100, label: '视频' });
           
-          // Merge
-          try {
-            notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '合并中' });
-            const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, info.title);
-            await saveBlobAs(mergedBlob, `${safeTitle}_${label}.mp4`);
-            notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
-            
-            // Delete raw files if setting enabled
-            if (deleteRaw) {
-              await deleteDownloadedFile(audioPath);
-              await deleteDownloadedFile(videoPath);
-            }
-          } catch(mergeErr) {
-            console.warn('[B站下载助手] Merge failed:', mergeErr);
-          }
+          // Merge into single mp4
+          notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '合并中' });
+          const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, info.title);
+          const safeTitle = sanitizeFilename(info.title);
+          saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`);
+          notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
           
           notify('download_complete', { taskId });
         } catch(e) {
