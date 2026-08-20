@@ -1,0 +1,762 @@
+// content-page.js - Page context: UI + Download + Progress reporting
+(function() {
+  if (window.__biliDLInjected) return;
+  window.__biliDLInjected = true;
+
+  // ─── Constants ───
+  const QMAP = {16:'360P',32:'480P',64:'720P',80:'1080P',112:'1080P高码率',120:'4K',125:'HDR'};
+
+  // ─── Bridge to extension ───
+  function notify(type, data) {
+    window.postMessage({ source: 'bilibili-downloader', type, data }, '*');
+  }
+
+  // ─── API Helpers ───
+  async function fetchPageHTML(url) {
+    const r = await fetch(url || location.href, {credentials:'include'});
+    return r.text();
+  }
+
+  function parseInitialState(html) {
+    let m = html.match(/<script>window\.__INITIAL_STATE__=(.+?)<\/script>/);
+    if (m && m[1]) {
+      try {
+        let s = m[1].replace(/;\(function\(\)\{.*?\}\(\)\);?$/, '');
+        const st = JSON.parse(s);
+        if (st.videoData) return st.videoData;
+      } catch(e) {}
+    }
+    return null;
+  }
+
+  async function getVideoInfo(url) {
+    const html = await fetchPageHTML(url);
+    const vd = parseInitialState(html);
+    if (!vd) return null;
+    return { aid: vd.aid, bvid: vd.bvid, cid: vd.cid, title: vd.title, pages: vd.pages || [] };
+  }
+
+  async function getVideoInfoByBvid(bvid) {
+    try {
+      const r = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, {credentials:'include'});
+      const d = await r.json();
+      if (d.code !== 0 || !d.data) return null;
+      const vd = d.data;
+      return { aid: vd.aid, bvid: vd.bvid, cid: vd.cid, title: vd.title, pages: vd.pages || [] };
+    } catch(e) {
+      console.warn('[B站下载助手] getVideoInfoByBvid error:', bvid, e);
+      return null;
+    }
+  }
+
+  async function getPlayUrl(avid, bvid, cid, qn = 80) {
+    const url = `https://api.bilibili.com/x/player/wbi/playurl?qn=${qn}&fnver=0&fnval=4048&fourk=1&avid=${avid}&bvid=${bvid}&cid=${cid}`;
+    const r = await fetch(url, {credentials:'include'});
+    const d = await r.json();
+    if (d.code !== 0) return null;
+    return d.data;
+  }
+
+  async function sniffCollection() {
+    const videos = [];
+    const seen = new Set();
+    let collectionName = '';
+    
+    // Extract from __INITIAL_STATE__
+    try {
+      const html = await fetchPageHTML();
+      const stateMatch = html.match(/<script>window\.__INITIAL_STATE__=(.+?)<\/script>/);
+      if (stateMatch && stateMatch[1]) {
+        let stateStr = stateMatch[1].replace(/;\(function\(\)\{.*?\}\(\)\);?$/, '');
+        const state = JSON.parse(stateStr);
+        
+        // Extract collection name from multiple possible locations
+        if (state.ugc_season?.title) {
+          collectionName = state.ugc_season.title;
+        } else if (state.collection?.title) {
+          collectionName = state.collection.title;
+        } else if (state.series?.title) {
+          collectionName = state.series.title;
+        } else if (state.title && state.sections) {
+          // Direct top-level with sections = collection page
+          collectionName = state.title;
+        }
+        
+        // Extract videos from ugc_season
+        if (state.ugc_season?.section) {
+          state.ugc_season.section.forEach(section => {
+            (section.episodes || []).forEach(ep => {
+              const bvid = ep.bvid;
+              if (bvid && !seen.has(bvid)) {
+                seen.add(bvid);
+                videos.push({
+                  bvid,
+                  title: ep.title || ep.arc?.title || '',
+                  aid: ep.aid || ep.arc?.aid,
+                  cid: ep.cid,
+                  url: `https://www.bilibili.com/video/${bvid}`
+                });
+              }
+            });
+          });
+        }
+        
+        // Multi-page video
+        if (state.videoData?.pages && state.videoData.pages.length > 1) {
+          if (!collectionName) collectionName = state.videoData.title || '';
+          state.videoData.pages.forEach(p => {
+            const bvid = state.videoData.bvid;
+            if (!seen.has(bvid + '_p' + p.page)) {
+              seen.add(bvid + '_p' + p.page);
+              videos.push({
+                bvid,
+                title: `P${p.page} ${p.part || ''}`,
+                aid: state.videoData.aid,
+                cid: p.cid,
+                url: `https://www.bilibili.com/video/${bvid}?p=${p.page}`
+              });
+            }
+          });
+        }
+      }
+    } catch(e) {
+      console.warn('[B站下载助手] __INITIAL_STATE__ parse error:', e);
+    }
+    
+    // DOM fallback: data-key attributes
+    if (videos.length === 0) {
+      const items = document.querySelectorAll('[data-key^="BV"]');
+      items.forEach(item => {
+        const bvid = item.getAttribute('data-key');
+        if (!bvid || seen.has(bvid)) return;
+        seen.add(bvid);
+        const titleEl = item.querySelector('.title-txt') || item.querySelector('[class*="title"]');
+        const title = titleEl?.textContent?.trim() || '';
+        if (title) {
+          videos.push({ bvid, title, url: `https://www.bilibili.com/video/${bvid}` });
+        }
+      });
+    }
+    
+    // Fallback collection name
+    if (!collectionName && videos.length > 0) {
+      collectionName = document.title?.replace(/- Bilibili.*$/, '').replace(/_哔哩哔哩.*$/, '').trim() || '合集下载';
+    }
+    
+    console.log('[B站下载助手] Sniffed videos:', videos.length, 'collection:', collectionName);
+    return { videos, collectionName };
+  }
+
+  function fmtSize(bytes) {
+    if (!bytes) return '未知';
+    if (bytes > 1073741824) return (bytes/1073741824).toFixed(2)+'GB';
+    if (bytes > 1048576) return (bytes/1048576).toFixed(2)+'MB';
+    if (bytes > 1024) return (bytes/1024).toFixed(2)+'KB';
+    return bytes+'B';
+  }
+
+  // ─── Download with progress ───
+  async function downloadBlob(url, taskId, phase, label) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${label} HTTP ${r.status}`);
+    
+    const total = parseInt(r.headers.get('content-length') || '0');
+    const reader = r.body.getReader();
+    const chunks = [];
+    let received = 0;
+    
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      
+      const percent = total > 0 ? Math.round(received / total * 100) : -1;
+      notify('download_progress', {
+        taskId, phase, percent,
+        received, total,
+        label
+      });
+    }
+    
+    return new Blob(chunks);
+  }
+
+  function saveBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
+  }
+
+  async function saveBlobAs(blob, downloadPath) {
+    const arrayBuf = await blob.arrayBuffer();
+    return new Promise((resolve, reject) => {
+      const requestId = downloadPath + '_' + Date.now();
+      const handler = (event) => {
+        if (event.data?.source !== 'bilibili-downloader') return;
+        if (event.data.type !== 'save_result') return;
+        if (event.data.data.requestId !== requestId) return;
+        window.removeEventListener('message', handler);
+        clearTimeout(timeout);
+        if (event.data.data.success) resolve();
+        else reject(new Error(event.data.data.error || 'Download failed'));
+      };
+      window.addEventListener('message', handler);
+      const timeout = setTimeout(() => { window.removeEventListener('message', handler); reject(new Error('Save timeout')); }, 120000);
+      
+      window.postMessage({
+        source: 'bilibili-downloader',
+        type: 'SAVE_FILE',
+        data: { requestId, buffer: arrayBuf, path: downloadPath, mime: blob.type }
+      }, '*');
+    });
+  }
+
+  async function deleteDownloadedFile(downloadPath) {
+    window.postMessage({
+      source: 'bilibili-downloader',
+      type: 'DELETE_FILE',
+      data: { path: downloadPath }
+    }, '*');
+  }
+
+  function sanitizeFilename(name) {
+    return name.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').substring(0, 200);
+  }
+
+  async function getDeleteRawSetting() {
+    return new Promise((resolve) => {
+      const handler = (event) => {
+        if (event.data?.source !== 'bilibili-downloader') return;
+        if (event.data.type !== 'settings_result') return;
+        window.removeEventListener('message', handler);
+        resolve(event.data.data?.deleteRawAfterMerge || false);
+      };
+      window.addEventListener('message', handler);
+      window.postMessage({ source: 'bilibili-downloader', type: 'GET_SETTINGS' }, '*');
+      // Timeout fallback
+      setTimeout(() => { window.removeEventListener('message', handler); resolve(false); }, 3000);
+    });
+  }
+
+  // ─── FFmpeg Merge (via offscreen document) ───
+  function mergeWithFFmpeg(audioBlob, videoBlob, title) {
+    return new Promise(async (resolve, reject) => {
+      const taskId = 'merge_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
+      
+      const timeout = setTimeout(() => reject(new Error('Merge timeout (60s)')), 60000);
+      
+      const handler = (event) => {
+        if (event.data?.source !== 'bilibili-downloader') return;
+        if (event.data.type !== 'merge_result') return;
+        if (event.data.data.taskId !== taskId) return;
+        
+        window.removeEventListener('message', handler);
+        clearTimeout(timeout);
+        
+        if (event.data.data.success) {
+          console.log('[B站下载助手] Merge succeeded');
+          resolve(new Blob([event.data.data.buffer], { type: 'video/mp4' }));
+        } else {
+          console.error('[B站下载助手] Merge failed:', event.data.data.error);
+          reject(new Error(event.data.data.error || 'Merge failed'));
+        }
+      };
+      
+      window.addEventListener('message', handler);
+      
+      try {
+        const audioBuf = await audioBlob.arrayBuffer();
+        const videoBuf = await videoBlob.arrayBuffer();
+        console.log('[B站下载助手] Sending merge request, audio:', audioBuf.byteLength, 'video:', videoBuf.byteLength);
+        
+        window.postMessage({
+          source: 'bilibili-downloader',
+          type: 'merge_request',
+          data: { taskId, audio: audioBuf, video: videoBuf }
+        }, '*');
+      } catch(e) {
+        window.removeEventListener('message', handler);
+        clearTimeout(timeout);
+        reject(e);
+      }
+    });
+  }
+
+  // ─── Single video download ───
+  async function downloadSingleVideo(videoInfo, qualityIdx, existingTaskId, collectionName) {
+    const data = await getPlayUrl(videoInfo.aid, videoInfo.bvid, videoInfo.cid, 80);
+    if (!data?.dash) {
+      console.error('[B站下载助手] getPlayUrl returned null or no dash:', data);
+      throw new Error('获取播放地址失败');
+    }
+    console.log('[B站下载助手] dash videos:', data.dash.video.length, 'audios:', data.dash.audio.length);
+    
+    const videoByQ = {};
+    data.dash.video.forEach(v => {
+      if (!videoByQ[v.id]) videoByQ[v.id] = [];
+      videoByQ[v.id].push(v);
+    });
+    
+    const options = Object.keys(videoByQ).map(Number).sort((a,b) => b-a);
+    const q = options[qualityIdx] || options[0];
+    const streams = videoByQ[q].sort((a,b) => b.bandwidth - a.bandwidth);
+    const bestVideo = streams[0];
+    const bestAudio = data.dash.audio[0];
+    
+    const taskId = existingTaskId || ('task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6));
+    const title = videoInfo.title;
+    const label = QMAP[q] || q + 'P';
+    const deleteRaw = await getDeleteRawSetting();
+    
+    // Build folder paths
+    const folder = collectionName ? sanitizeFilename(collectionName) : '';
+    const sourcesFolder = folder ? `${folder}/sources` : 'sources';
+    
+    notify('download_start', {
+      taskId, title, quality: label, bvid: videoInfo.bvid,
+      videoUrl: bestVideo.baseUrl, audioUrl: bestAudio.baseUrl,
+      videoSize: bestVideo.size || 0, audioSize: bestAudio.size || 0
+    });
+    
+    try {
+      // Download audio
+      notify('download_progress', { taskId, phase: 'audio', percent: 0, label: '音频' });
+      const audioBlob = await downloadBlob(bestAudio.baseUrl, taskId, 'audio', '音频');
+      const safeTitle = sanitizeFilename(title);
+      const audioPath = `${sourcesFolder}/${safeTitle}_${label}_音频.m4s`;
+      await saveBlobAs(audioBlob, audioPath);
+      
+      // Download video
+      notify('download_progress', { taskId, phase: 'video', percent: 0, label: '视频' });
+      const videoBlob = await downloadBlob(bestVideo.baseUrl, taskId, 'video', '视频');
+      const videoPath = `${sourcesFolder}/${safeTitle}_${label}_视频.m4s`;
+      await saveBlobAs(videoBlob, videoPath);
+      
+      notify('download_progress', { taskId, phase: 'audio', percent: 100, label: '音频' });
+      notify('download_progress', { taskId, phase: 'video', percent: 100, label: '视频' });
+      
+      // Merge
+      try {
+        notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '合并中' });
+        const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, title);
+        const mergedPath = `${folder ? folder + '/' : ''}${safeTitle}_${label}.mp4`;
+        await saveBlobAs(mergedBlob, mergedPath);
+        notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
+        
+        // Delete raw files if setting enabled
+        if (deleteRaw) {
+          await deleteDownloadedFile(audioPath);
+          await deleteDownloadedFile(videoPath);
+          console.log('[B站下载助手] Raw files deleted:', audioPath, videoPath);
+        }
+      } catch(mergeErr) {
+        console.warn('[B站下载助手] Merge failed, keeping raw files:', mergeErr);
+      }
+      
+      notify('download_complete', { taskId });
+    } catch(e) {
+      notify('download_error', { taskId, error: e.message });
+    }
+  }
+
+  // ─── Batch download ───
+  async function downloadBatch(videoList, qualityIdx) {
+    for (const v of videoList) {
+      try {
+        await downloadSingleVideo(v, qualityIdx);
+        // Random delay between tasks
+        const delay = 3000 + Math.random() * 9000;
+        await new Promise(r => setTimeout(r, delay));
+      } catch(e) {
+        console.error('[B站下载助手] Batch error:', v.title, e);
+      }
+    }
+  }
+
+  // ─── UI ───
+  let currentVideoInfo = null;
+  let currentCollectionVideos = [];
+
+  function isVideoPage() {
+    return /\/video\/BV/.test(location.href) || /\/list\//.test(location.href) || /\/series\//.test(location.href);
+  }
+
+  function createUI() {
+    if (document.getElementById('bili-dl-root')) return;
+    
+    const root = document.createElement('div');
+    root.id = 'bili-dl-root';
+    root.innerHTML = `
+      <div id="bili-dl-btn" style="position:fixed;right:20px;bottom:100px;z-index:99999;background:linear-gradient(135deg,#00a1d6,#fb7299);color:#fff;padding:12px 20px;border-radius:24px;cursor:pointer;font-size:14px;box-shadow:0 4px 16px rgba(0,161,214,0.4);user-select:none;display:${isVideoPage() ? 'flex' : 'none'};align-items:center;gap:8px;transition:transform 0.2s;" onmouseenter="this.style.transform='scale(1.05)'" onmouseleave="this.style.transform='scale(1)'">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 16V4M12 16L8 12M12 16L16 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M4 20H20" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        下载
+      </div>
+      <div id="bili-dl-panel" style="display:none;visibility:hidden;position:fixed;right:20px;bottom:160px;z-index:99999;background:#fff;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.2);width:380px;max-height:80vh;font-size:14px;color:#333;overflow:hidden;display:flex;flex-direction:column;">
+        <div style="background:linear-gradient(135deg,#00a1d6,#fb7299);color:#fff;padding:14px 16px;display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-weight:600;">Bilibili 下载助手</span>
+          <span id="bili-dl-close" style="cursor:pointer;font-size:18px;opacity:0.8;">&times;</span>
+        </div>
+        <div id="bili-dl-tabs" style="display:flex;border-bottom:1px solid #f0f0f0;background:#fafafa;">
+          <button class="bili-dl-tab active" data-tab="video" style="flex:1;padding:10px 0;border:none;background:none;font-size:13px;font-weight:500;color:#999;cursor:pointer;border-bottom:2px solid transparent;transition:all 0.2s;">视频下载</button>
+          <button class="bili-dl-tab" data-tab="collection" style="flex:1;padding:10px 0;border:none;background:none;font-size:13px;font-weight:500;color:#999;cursor:pointer;border-bottom:2px solid transparent;transition:all 0.2s;">合集嗅探</button>
+        </div>
+        <div id="bili-dl-body" style="padding:16px;flex:1;overflow-y:auto;">
+          <div id="bili-dl-loading" style="text-align:center;color:#999;padding:20px;">加载中...</div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(root);
+    
+    // Events
+    document.getElementById('bili-dl-btn').addEventListener('click', togglePanel);
+    document.getElementById('bili-dl-close').addEventListener('click', hidePanel);
+    
+    // Click outside to close
+    document.addEventListener('click', (e) => {
+      const panel = document.getElementById('bili-dl-panel');
+      const btn = document.getElementById('bili-dl-btn');
+      if (!panel || panel.style.display === 'none') return;
+      if (!panel.contains(e.target) && !btn.contains(e.target)) {
+        hidePanel();
+      }
+    });
+    
+    root.querySelectorAll('.bili-dl-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        root.querySelectorAll('.bili-dl-tab').forEach(t => {
+          t.classList.remove('active');
+          t.style.color = '#999';
+          t.style.borderBottomColor = 'transparent';
+        });
+        tab.classList.add('active');
+        tab.style.color = '#00a1d6';
+        tab.style.borderBottomColor = '#00a1d6';
+        if (tab.dataset.tab === 'video') showVideoTab();
+        else showCollectionTab();
+      });
+    });
+  }
+
+  function togglePanel() {
+    const panel = document.getElementById('bili-dl-panel');
+    if (!panel) return;
+    if (panel.style.display === 'none' || panel.style.visibility === 'hidden') showPanel();
+    else hidePanel();
+  }
+
+  function hidePanel() {
+    const panel = document.getElementById('bili-dl-panel');
+    if (panel) {
+      panel.style.display = 'none';
+      panel.style.visibility = 'hidden';
+    }
+  }
+
+  async function showPanel() {
+    const panel = document.getElementById('bili-dl-panel');
+    if (!panel) return;
+    panel.style.visibility = 'visible';
+    panel.style.display = 'flex';
+    
+    // Set active tab style
+    const tabs = document.querySelectorAll('.bili-dl-tab');
+    tabs.forEach(t => {
+      t.style.color = '#999';
+      t.style.borderBottomColor = 'transparent';
+    });
+    const activeTab = document.querySelector('.bili-dl-tab.active');
+    if (activeTab) {
+      activeTab.style.color = '#00a1d6';
+      activeTab.style.borderBottomColor = '#00a1d6';
+    }
+    
+    showVideoTab();
+  }
+
+  async function showVideoTab() {
+    const body = document.getElementById('bili-dl-body');
+    
+    if (!isVideoPage()) {
+      body.innerHTML = '<div style="text-align:center;color:#999;padding:30px 20px;"><div style="font-size:32px;margin-bottom:12px;">📹</div><div style="font-size:15px;color:#333;margin-bottom:8px;">请在视频播放页面使用</div><div style="font-size:12px;color:#999;">打开一个Bilibili视频后，点击下载按钮</div></div>';
+      return;
+    }
+    
+    body.innerHTML = '<div id="bili-dl-loading" style="text-align:center;color:#999;padding:20px;">正在获取视频信息...</div>';
+    
+    try {
+      const info = await getVideoInfo();
+      if (!info) {
+        body.innerHTML = '<div style="text-align:center;color:#f44336;padding:20px;">无法获取视频信息</div>';
+        return;
+      }
+      currentVideoInfo = info;
+      
+      const data = await getPlayUrl(info.aid, info.bvid, info.cid, 80);
+      if (!data?.dash) {
+        body.innerHTML = '<div style="text-align:center;color:#f44336;padding:20px;">获取播放地址失败</div>';
+        return;
+      }
+      
+      const videoByQ = {};
+      data.dash.video.forEach(v => {
+        if (!videoByQ[v.id]) videoByQ[v.id] = [];
+        videoByQ[v.id].push(v);
+      });
+      
+      const options = Object.keys(videoByQ).map(Number).sort((a,b) => b-a).map(q => {
+        const streams = videoByQ[q].sort((a,b) => b.bandwidth - a.bandwidth);
+        return {
+          q, label: QMAP[q] || q+'P',
+          videoUrl: streams[0].baseUrl,
+          audioUrl: data.dash.audio[0].baseUrl,
+          videoSize: streams[0].size || 0,
+          audioSize: data.dash.audio[0].size || 0
+        };
+      });
+      
+      body.innerHTML = `
+        <div style="margin-bottom:12px;font-weight:500;color:#333;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${info.title}">${info.title}</div>
+        <div style="margin-bottom:12px;color:#666;font-size:12px;">
+          音频: ${fmtSize(options[0].audioSize)} | 视频: ${fmtSize(options[0].videoSize)}
+        </div>
+        <div style="margin-bottom:16px;">
+          ${options.map((o,i) => `
+            <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;padding:8px 12px;border-radius:8px;border:1px solid ${i===0?'#00a1d6':'#e0e0e0'};transition:all 0.2s;" 
+              onmouseenter="this.style.borderColor='#00a1d6'" onmouseleave="this.style.borderColor='${i===0?'#00a1d6':'#e0e0e0'}'">
+              <input type="radio" name="bili-dl-q" value="${i}" ${i===0?'checked':''} style="accent-color:#00a1d6;">
+              <span style="flex:1;">${o.label}</span>
+              <span style="color:#999;font-size:12px;">${fmtSize(o.videoSize)}</span>
+            </label>
+          `).join('')}
+        </div>
+        <button id="bili-dl-go" style="width:100%;padding:12px;background:linear-gradient(135deg,#00a1d6,#fb7299);color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;transition:opacity 0.2s;" onmouseenter="this.style.opacity='0.9'" onmouseleave="this.style.opacity='1'">开始下载</button>
+      `;
+      
+      document.getElementById('bili-dl-go').addEventListener('click', async () => {
+        const idx = parseInt(document.querySelector('input[name="bili-dl-q"]:checked')?.value || '0');
+        const opt = options[idx];
+        
+        hidePanel();
+        
+        try {
+          const taskId = 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
+          const label = opt.label;
+          const deleteRaw = await getDeleteRawSetting();
+          
+          notify('download_start', {
+            taskId, title: info.title, quality: opt.label, bvid: info.bvid,
+            videoUrl: opt.videoUrl, audioUrl: opt.audioUrl,
+            videoSize: opt.videoSize, audioSize: opt.audioSize
+          });
+          
+          // Download audio
+          notify('download_progress', { taskId, phase: 'audio', percent: 0, label: '音频' });
+          const audioBlob = await downloadBlob(opt.audioUrl, taskId, 'audio', '音频');
+          const safeTitle = sanitizeFilename(info.title);
+          const audioPath = `sources/${safeTitle}_${label}_音频.m4s`;
+          await saveBlobAs(audioBlob, audioPath);
+          
+          // Download video
+          notify('download_progress', { taskId, phase: 'video', percent: 0, label: '视频' });
+          const videoBlob = await downloadBlob(opt.videoUrl, taskId, 'video', '视频');
+          const videoPath = `sources/${safeTitle}_${label}_视频.m4s`;
+          await saveBlobAs(videoBlob, videoPath);
+          
+          notify('download_progress', { taskId, phase: 'audio', percent: 100, label: '音频' });
+          notify('download_progress', { taskId, phase: 'video', percent: 100, label: '视频' });
+          
+          // Merge
+          try {
+            notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '合并中' });
+            const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, info.title);
+            await saveBlobAs(mergedBlob, `${safeTitle}_${label}.mp4`);
+            notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
+            
+            // Delete raw files if setting enabled
+            if (deleteRaw) {
+              await deleteDownloadedFile(audioPath);
+              await deleteDownloadedFile(videoPath);
+            }
+          } catch(mergeErr) {
+            console.warn('[B站下载助手] Merge failed:', mergeErr);
+          }
+          
+          notify('download_complete', { taskId });
+        } catch(e) {
+          notify('download_error', { taskId, error: e.message });
+        }
+      });
+      
+    } catch(e) {
+      body.innerHTML = '<div style="text-align:center;color:#f44336;padding:20px;">加载失败: ' + e.message + '</div>';
+    }
+  }
+
+  async function showCollectionTab() {
+    const body = document.getElementById('bili-dl-body');
+    body.innerHTML = '<div style="text-align:center;color:#999;padding:20px;">正在嗅探合集视频...</div>';
+    
+    try {
+      const { videos, collectionName } = await sniffCollection();
+      currentCollectionVideos = videos;
+      
+      if (videos.length === 0) {
+        body.innerHTML = `<div style="text-align:center;color:#999;padding:20px;">
+          <div style="margin-bottom:8px;">未检测到合集/系列视频</div>
+          <div style="font-size:12px;color:#bbb;">提示：请在以下页面使用此功能</div>
+          <div style="font-size:12px;color:#bbb;">· UP主合集页面（视频右侧有合集列表）</div>
+          <div style="font-size:12px;color:#bbb;">· 系列视频页面</div>
+          <div style="font-size:12px;color:#bbb;">· 多P视频页面</div>
+        </div>`;
+        return;
+      }
+      
+      body.innerHTML = `
+        <div style="display:flex;flex-direction:column;height:100%;">
+        <div style="margin-bottom:12px;padding:8px 12px;background:#f5f5f5;border-radius:6px;font-size:12px;color:#666;flex-shrink:0;">
+          合集: <span style="color:#00a1d6;font-weight:500;">${collectionName}</span> (${videos.length}个视频)
+        </div>
+        <div style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;">
+          <span style="font-weight:500;">选择下载视频</span>
+          <label style="cursor:pointer;font-size:12px;color:#00a1d6;">
+            <input type="checkbox" id="bili-dl-select-all" checked> 全选
+          </label>
+        </div>
+        <div id="bili-dl-video-list" style="flex:1;overflow-y:auto;margin-bottom:0;">
+          ${videos.map((v, i) => `
+            <label style="display:flex;align-items:center;gap:8px;padding:8px;border-radius:6px;cursor:pointer;border:1px solid #e0e0e0;margin-bottom:4px;transition:border-color 0.2s;"
+              onmouseenter="this.style.borderColor='#00a1d6'" onmouseleave="this.style.borderColor='#e0e0e0'">
+              <input type="checkbox" class="bili-dl-video-check" value="${i}" checked style="accent-color:#00a1d6;">
+              <span style="flex:1;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${v.title}">${v.title}</span>
+            </label>
+          `).join('')}
+        </div>
+        </div>
+      `;
+      
+      // Append fixed button outside body scroll area
+      const btnWrap = document.createElement('div');
+      btnWrap.style.cssText = 'padding:12px 16px;border-top:1px solid #f0f0f0;background:#fff;flex-shrink:0;';
+      btnWrap.innerHTML = '<button id="bili-dl-batch-go" style="width:100%;padding:12px;background:linear-gradient(135deg,#00a1d6,#fb7299);color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;">批量下载选中视频</button>';
+      body.appendChild(btnWrap);
+      
+      document.getElementById('bili-dl-select-all').addEventListener('change', (e) => {
+        document.querySelectorAll('.bili-dl-video-check').forEach(cb => cb.checked = e.target.checked);
+      });
+      
+      document.getElementById('bili-dl-batch-go').addEventListener('click', async () => {
+        const checked = [...document.querySelectorAll('.bili-dl-video-check:checked')].map(cb => parseInt(cb.value));
+        const selected = checked.map(i => videos[i]).filter(Boolean);
+        
+        if (selected.length === 0) {
+          alert('请至少选择一个视频');
+          return;
+        }
+        
+        console.log('[B站下载助手] Batch starting, selected:', selected.length, 'collection:', collectionName);
+        hidePanel();
+        
+        // Step 1: Fetch all video infos
+        const taskInfos = [];
+        for (const v of selected) {
+          try {
+            let info;
+            if (v.aid && v.cid) {
+              info = { aid: v.aid, bvid: v.bvid, cid: v.cid, title: v.title };
+            } else if (v.bvid) {
+              info = await getVideoInfoByBvid(v.bvid);
+            }
+            if (info) {
+              const taskId = 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
+              taskInfos.push({ ...info, taskId });
+            } else {
+              console.warn('[B站下载助手] Could not get info for:', v.bvid);
+            }
+          } catch(e) {
+            console.error('[B站下载助手] Fetch info error:', v.title, e);
+          }
+        }
+        
+        if (taskInfos.length === 0) {
+          alert('无法获取任何视频信息');
+          return;
+        }
+        
+        // Step 2: Pre-create ALL tasks in sidebar (one by one with short delay)
+        for (const info of taskInfos) {
+          notify('task_precreate', { taskId: info.taskId, title: info.title, bvid: info.bvid });
+          await new Promise(r => setTimeout(r, 200));
+        }
+        
+        console.log('[B站下载助手] All', taskInfos.length, 'tasks pre-created');
+        
+        // Step 3: Download sequentially
+        for (let i = 0; i < taskInfos.length; i++) {
+          const info = taskInfos[i];
+          console.log(`[B站下载助手] Batch ${i+1}/${taskInfos.length}: ${info.title}`);
+          try {
+            await downloadSingleVideo(info, 0, info.taskId, collectionName);
+            console.log('[B站下载助手] Download complete:', info.title);
+          } catch(e) {
+            console.error('[B站下载助手] Batch error:', info.title, e);
+          }
+          // Random delay between downloads (skip after last)
+          if (i < taskInfos.length - 1) {
+            const delay = 3000 + Math.random() * 9000;
+            const sec = Math.round(delay / 1000);
+            console.log('[B站下载助手] Waiting', sec + 's before next...');
+            await new Promise(r => setTimeout(r, delay));
+          }
+        }
+        console.log('[B站下载助手] Batch finished');
+      });
+      
+    } catch(e) {
+      body.innerHTML = '<div style="text-align:center;color:#f44336;padding:20px;">嗅探失败: ' + e.message + '</div>';
+    }
+  }
+
+  // ─── Init ───
+  function waitAndInit() {
+    if (document.body) {
+      if (isVideoPage()) setTimeout(createUI, 3000);
+    } else {
+      document.addEventListener('DOMContentLoaded', () => {
+        if (isVideoPage()) setTimeout(createUI, 3000);
+      });
+    }
+    
+    const startObserver = () => {
+      if (!document.body) return;
+      let lastUrl = location.href;
+      new MutationObserver(() => {
+        if (location.href !== lastUrl) {
+          lastUrl = location.href;
+          const el = document.getElementById('bili-dl-root');
+          if (el) el.remove();
+          currentVideoInfo = null;
+          currentCollectionVideos = [];
+          if (isVideoPage()) {
+            setTimeout(createUI, 3000);
+          }
+        }
+      }).observe(document.body, {childList:true, subtree:true});
+    };
+    
+    if (document.body) {
+      startObserver();
+    } else {
+      document.addEventListener('DOMContentLoaded', startObserver);
+    }
+  }
+  
+  waitAndInit();
+
+  console.log('[B站下载助手] Page script loaded');
+})();
