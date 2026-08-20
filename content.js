@@ -12,8 +12,7 @@
   const files = [
     { path: 'lib/ffmpeg.js', mime: 'text/javascript', key: 'js' },
     { path: 'lib/ffmpeg-core.js', mime: 'text/javascript', key: 'core' },
-    { path: 'lib/ffmpeg-core.wasm', mime: 'application/wasm', key: 'wasm' },
-    { path: 'lib/ffmpeg-core.worker.js', mime: 'text/javascript', key: 'worker' }
+    { path: 'lib/ffmpeg-core.wasm', mime: 'application/wasm', key: 'wasm' }
   ];
 
   Promise.all(files.map(f =>

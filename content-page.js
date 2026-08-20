@@ -274,11 +274,12 @@
 
     const instance = new FFmpegClass();
 
-    await instance.load({
+    const loadOpts = {
       coreURL: ffmpegURLs.core,
-      wasmURL: ffmpegURLs.wasm,
-      workerURL: ffmpegURLs.worker
-    });
+      wasmURL: ffmpegURLs.wasm
+    };
+    if (ffmpegURLs.worker) loadOpts.workerURL = ffmpegURLs.worker;
+    await instance.load(loadOpts);
 
     ffmpegCache = { instance, blobURLs: Object.values(ffmpegURLs) };
     console.log('[B站下载助手] FFmpeg loaded once, cached for reuse');
