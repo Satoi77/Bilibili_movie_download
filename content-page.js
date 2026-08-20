@@ -304,6 +304,9 @@
 
   // ─── Single video download ───
   async function downloadSingleVideo(videoInfo, qualityIdx, existingTaskId, collectionName) {
+    const taskId = existingTaskId || ('task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6));
+    const title = videoInfo.title;
+    
     const data = await getPlayUrl(videoInfo.aid, videoInfo.bvid, videoInfo.cid, 80);
     if (!data?.dash) {
       console.error('[B站下载助手] getPlayUrl returned null or no dash:', data);
@@ -323,8 +326,6 @@
     const bestVideo = streams[0];
     const bestAudio = data.dash.audio[0];
     
-    const taskId = existingTaskId || ('task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6));
-    const title = videoInfo.title;
     const label = QMAP[q] || q + 'P';
     
     notify('download_start', {
@@ -355,7 +356,7 @@
       
       notify('download_complete', { taskId });
     } catch(e) {
-      notify('download_error', { taskId, error: e.message });
+      notify('download_error', { taskId: taskId || 'unknown', error: e.message });
     }
   }
 
@@ -568,7 +569,7 @@
           
           notify('download_complete', { taskId });
         } catch(e) {
-          notify('download_error', { taskId, error: e.message });
+          notify('download_error', { taskId: taskId || 'unknown', error: e.message });
         }
       });
       
