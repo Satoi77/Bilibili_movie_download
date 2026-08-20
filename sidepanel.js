@@ -80,13 +80,13 @@ function renderTasks() {
     dlList.innerHTML = '<div class="empty-state">暂无下载任务<br><span style="font-size:12px;color:#bbb;">在视频页面点击下载按钮开始</span></div>';
   } else {
     dlList.innerHTML = activeTasks.map(t => {
-      const audioP = t.progress?.audio || 0;
-      const videoP = t.progress?.video || 0;
+      const downloadP = t.progress?.download || 0;
       const mergeP = t.progress?.merge || 0;
       const overall = t.status === 'completed' ? 100 : 
                       t.status === 'failed' ? 0 : 
                       mergeP > 0 ? Math.round(90 + mergeP * 0.1) :
-                      Math.round((audioP + videoP) / 2 * 0.9);
+                      downloadP;
+      const phaseLabel = mergeP > 0 ? '合并中' : '下载中';
       
       return `
         <div class="task-card ${t.status}">
@@ -102,31 +102,9 @@ function renderTasks() {
           </div>
           <div class="task-progress-section">
             <div class="progress-row">
-              <span class="progress-label">音频</span>
+              <span class="progress-label">${phaseLabel}</span>
               <div class="progress-bar">
-                <div class="progress-fill audio" style="width:${audioP}%"></div>
-              </div>
-              <span class="progress-pct">${audioP}%</span>
-            </div>
-            <div class="progress-row">
-              <span class="progress-label">视频</span>
-              <div class="progress-bar">
-                <div class="progress-fill video" style="width:${videoP}%"></div>
-              </div>
-              <span class="progress-pct">${videoP}%</span>
-            </div>
-            ${mergeP > 0 ? `
-            <div class="progress-row">
-              <span class="progress-label">合并</span>
-              <div class="progress-bar">
-                <div class="progress-fill" style="width:${mergeP}%;background:#9c27b0"></div>
-              </div>
-              <span class="progress-pct">${mergeP}%</span>
-            </div>
-            ` : ''}
-            <div class="progress-overall">
-              <div class="progress-bar overall">
-                <div class="progress-fill overall" style="width:${overall}%;background:${getStatusColor(t)}"></div>
+                <div class="progress-fill" style="width:${overall}%;background:${getStatusColor(t)}"></div>
               </div>
               <span class="progress-pct">${overall}%</span>
             </div>

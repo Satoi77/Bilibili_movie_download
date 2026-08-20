@@ -335,17 +335,15 @@
     });
     
     try {
-      // Download audio + video in parallel
-      notify('download_progress', { taskId, phase: 'audio', percent: 0, label: '音频' });
-      notify('download_progress', { taskId, phase: 'video', percent: 0, label: '视频' });
+      // Download audio + video in memory
+      notify('download_progress', { taskId, phase: 'download', percent: 0, label: '下载中' });
       
       const [audioBlob, videoBlob] = await Promise.all([
         downloadBlob(bestAudio.baseUrl, taskId, 'audio', '音频'),
         downloadBlob(bestVideo.baseUrl, taskId, 'video', '视频')
       ]);
       
-      notify('download_progress', { taskId, phase: 'audio', percent: 100, label: '音频' });
-      notify('download_progress', { taskId, phase: 'video', percent: 100, label: '视频' });
+      notify('download_progress', { taskId, phase: 'download', percent: 100, label: '下载完成' });
       
       // Merge into single mp4
       notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '合并中' });
@@ -549,17 +547,15 @@
             videoSize: opt.videoSize, audioSize: opt.audioSize
           });
           
-          // Download audio + video in parallel
-          notify('download_progress', { taskId, phase: 'audio', percent: 0, label: '音频' });
-          notify('download_progress', { taskId, phase: 'video', percent: 0, label: '视频' });
+          // Download audio + video in memory
+          notify('download_progress', { taskId, phase: 'download', percent: 0, label: '下载中' });
           
           const [audioBlob, videoBlob] = await Promise.all([
             downloadBlob(opt.audioUrl, taskId, 'audio', '音频'),
             downloadBlob(opt.videoUrl, taskId, 'video', '视频')
           ]);
           
-          notify('download_progress', { taskId, phase: 'audio', percent: 100, label: '音频' });
-          notify('download_progress', { taskId, phase: 'video', percent: 100, label: '视频' });
+          notify('download_progress', { taskId, phase: 'download', percent: 100, label: '下载完成' });
           
           // Merge into single mp4
           notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '合并中' });
