@@ -230,29 +230,38 @@
   }
 
   // ─── FFmpeg (in page context, bypassing CSP via Blob URLs) ───
+  let ffmpegCache = null; // { instance, blobURLs }
+
   function createObjectURLFromExtension(path, mimeType) {
     return fetch(chrome.runtime.getURL(path))
       .then(r => r.arrayBuffer())
       .then(buf => URL.createObjectURL(new Blob([buf], { type: mimeType })));
   }
 
-  async function mergeWithFFmpeg(audioBlob, videoBlob, title) {
-    // Import ffmpeg.js via Blob URL to bypass CSP
-    const ffmpegBlobURL = await createObjectURLFromExtension('lib/ffmpeg.js', 'text/javascript');
-    const ffmpegModule = await import(ffmpegBlobURL);
+  async function getFFmpeg() {
+    if (ffmpegCache?.instance?.loaded) return ffmpegCache.instance;
+
+    const ffmpegModule = await import(await createObjectURLFromExtension('lib/ffmpeg.js', 'text/javascript'));
     const FFmpegClass = ffmpegModule.FFmpegWASM?.FFmpeg || ffmpegModule.FFmpegWASM;
     if (!FFmpegClass) throw new Error('FFmpeg class not found');
 
-    const ffmpeg = new FFmpegClass();
+    const instance = new FFmpegClass();
 
-    // Create blob URLs for WASM resources
     const [coreURL, wasmURL, workerURL] = await Promise.all([
       createObjectURLFromExtension('lib/ffmpeg-core.js', 'text/javascript'),
       createObjectURLFromExtension('lib/ffmpeg-core.wasm', 'application/wasm'),
       createObjectURLFromExtension('lib/ffmpeg-core.worker.js', 'text/javascript')
     ]);
 
-    await ffmpeg.load({ coreURL, wasmURL, workerURL });
+    await instance.load({ coreURL, wasmURL, workerURL });
+
+    ffmpegCache = { instance, blobURLs: [coreURL, wasmURL, workerURL] };
+    console.log('[B站下载助手] FFmpeg loaded once, cached for reuse');
+    return instance;
+  }
+
+  async function mergeWithFFmpeg(audioBlob, videoBlob, title) {
+    const ffmpeg = await getFFmpeg();
 
     const prefix = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
     const audioFile = prefix + '_audio.m4s';
@@ -271,6 +280,15 @@
 
     return new Blob([result.buffer], { type: 'video/mp4' });
   }
+
+  // Cleanup on page unload
+  window.addEventListener('beforeunload', () => {
+    if (ffmpegCache) {
+      ffmpegCache.blobURLs.forEach(url => URL.revokeObjectURL(url));
+      ffmpegCache.instance?.terminate?.();
+      ffmpegCache = null;
+    }
+  });
 
   // ─── Save file via <a download> ───
   function saveBlob(blob, filename) {
