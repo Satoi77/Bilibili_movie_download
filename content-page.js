@@ -231,10 +231,15 @@
 
   // ─── FFmpeg (in page context, bypassing CSP via Blob URLs) ───
   let ffmpegCache = null; // { instance, blobURLs }
+  let ffmpegURLs = {}; // received from content.js via postMessage
 
-  // Pre-fetched Blob URLs from content.js (avoids CSP blocking chrome-extension:// fetch)
-  const ffmpegURLs = window.__biliDL_ffmpegURLs || {};
-  delete window.__biliDL_ffmpegURLs; // cleanup
+  // Listen for pre-fetched FFmpeg URLs from content.js
+  window.addEventListener('message', (e) => {
+    if (e.data?.source === 'bilibili-downloader' && e.data.type === 'ffmpeg_urls') {
+      ffmpegURLs = e.data.data;
+      console.log('[B站下载助手] FFmpeg URLs received:', Object.keys(ffmpegURLs));
+    }
+  });
 
   function loadScript(url) {
     return new Promise((resolve, reject) => {
@@ -249,7 +254,18 @@
   async function getFFmpeg() {
     if (ffmpegCache?.instance?.loaded) return ffmpegCache.instance;
 
-    if (!ffmpegURLs.js) throw new Error('FFmpeg JS URL not pre-fetched by content script');
+    // Wait up to 10s for URLs to arrive
+    if (!ffmpegURLs.js) {
+      await new Promise((resolve) => {
+        let waited = 0;
+        const check = setInterval(() => {
+          waited += 100;
+          if (ffmpegURLs.js || waited >= 10000) { clearInterval(check); resolve(); }
+        }, 100);
+      });
+    }
+
+    if (!ffmpegURLs.js) throw new Error('FFmpeg 未能加载，请刷新页面重试');
 
     await loadScript(ffmpegURLs.js);
 

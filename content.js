@@ -1,40 +1,38 @@
 // content.js - Bridge between page context and extension
 (function() {
-  // Pre-fetch FFmpeg files from extension context (where chrome-extension:// is allowed)
-  // and expose them as Blob URLs for the page context
-  async function preFetchFFmpeg() {
-    const files = [
-      { path: 'lib/ffmpeg.js', mime: 'text/javascript', key: 'js' },
-      { path: 'lib/ffmpeg-core.js', mime: 'text/javascript', key: 'core' },
-      { path: 'lib/ffmpeg-core.wasm', mime: 'application/wasm', key: 'wasm' },
-      { path: 'lib/ffmpeg-core.worker.js', mime: 'text/javascript', key: 'worker' }
-    ];
-    const urls = {};
-    for (const f of files) {
-      const r = await fetch(chrome.runtime.getURL(f.path));
-      const buf = await r.arrayBuffer();
-      urls[f.key] = URL.createObjectURL(new Blob([buf], { type: f.mime }));
-    }
-    return urls;
+  // Always inject page script first (non-blocking)
+  if (!document.getElementById('bilibili-downloader-ext')) {
+    const s = document.createElement('script');
+    s.id = 'bilibili-downloader-ext';
+    s.src = chrome.runtime.getURL('content-page.js');
+    (document.head || document.documentElement).appendChild(s);
   }
 
-  // Inject page script after FFmpeg URLs are ready
-  preFetchFFmpeg().then(urls => {
-    // Expose URLs to page context via a global before injecting the main script
-    const setupScript = document.createElement('script');
-    setupScript.textContent = 'window.__biliDL_ffmpegURLs = ' + JSON.stringify(urls) + ';';
-    (document.head || document.documentElement).appendChild(setupScript);
-    setupScript.remove();
+  // Pre-fetch FFmpeg files asynchronously (non-blocking, best-effort)
+  const files = [
+    { path: 'lib/ffmpeg.js', mime: 'text/javascript', key: 'js' },
+    { path: 'lib/ffmpeg-core.js', mime: 'text/javascript', key: 'core' },
+    { path: 'lib/ffmpeg-core.wasm', mime: 'application/wasm', key: 'wasm' },
+    { path: 'lib/ffmpeg-core.worker.js', mime: 'text/javascript', key: 'worker' }
+  ];
 
-    // Now inject the page script
-    if (!document.getElementById('bilibili-downloader-ext')) {
-      const s = document.createElement('script');
-      s.id = 'bilibili-downloader-ext';
-      s.src = chrome.runtime.getURL('content-page.js');
-      (document.head || document.documentElement).appendChild(s);
+  Promise.all(files.map(f =>
+    fetch(chrome.runtime.getURL(f.path))
+      .then(r => r.arrayBuffer())
+      .then(buf => ({ key: f.key, url: URL.createObjectURL(new Blob([buf], { type: f.mime })) }))
+      .catch(e => {
+        console.warn('[B站下载助手] Pre-fetch failed for', f.path, e);
+        return null;
+      })
+  )).then(results => {
+    const urls = {};
+    results.filter(Boolean).forEach(r => urls[r.key] = r.url);
+    if (urls.js) {
+      window.postMessage({ source: 'bilibili-downloader', type: 'ffmpeg_urls', data: urls }, '*');
+      console.log('[B站下载助手] FFmpeg pre-fetched OK');
+    } else {
+      console.warn('[B站下载助手] FFmpeg pre-fetch incomplete, will retry on download');
     }
-  }).catch(e => {
-    console.error('[B站下载助手] Failed to pre-fetch FFmpeg:', e);
   });
 
   // Pending merge callbacks (taskId → callback)
