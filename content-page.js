@@ -245,8 +245,8 @@
     if (ffmpegCache?.instance?.loaded) return ffmpegCache.instance;
 
     const ffmpegModule = await import(await createObjectURLFromExtension('lib/ffmpeg.js', 'text/javascript'));
-    const FFmpegClass = ffmpegModule.FFmpegWASM?.FFmpeg || ffmpegModule.FFmpegWASM;
-    if (!FFmpegClass) throw new Error('FFmpeg class not found');
+    const FFmpegClass = ffmpegModule.FFmpeg || ffmpegModule.FFmpegWASM?.FFmpeg || ffmpegModule.default?.FFmpeg;
+    if (!FFmpegClass) throw new Error('FFmpeg class not found, exports: ' + Object.keys(ffmpegModule));
 
     const instance = new FFmpegClass();
 
