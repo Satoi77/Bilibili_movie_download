@@ -239,53 +239,73 @@
       };
       window.addEventListener('message', handler);
       window.postMessage({ source: 'bilibili-downloader', type: 'GET_SETTINGS' }, '*');
-      // Timeout fallback
       setTimeout(() => { window.removeEventListener('message', handler); resolve(false); }, 3000);
     });
   }
 
-  // ─── FFmpeg Merge (via offscreen document) ───
-  function mergeWithFFmpeg(audioBlob, videoBlob, title) {
-    return new Promise(async (resolve, reject) => {
-      const taskId = 'merge_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
-      
-      const timeout = setTimeout(() => reject(new Error('Merge timeout (60s)')), 60000);
-      
-      const handler = (event) => {
-        if (event.data?.source !== 'bilibili-downloader') return;
-        if (event.data.type !== 'merge_result') return;
-        if (event.data.data.taskId !== taskId) return;
-        
-        window.removeEventListener('message', handler);
-        clearTimeout(timeout);
-        
-        if (event.data.data.success) {
-          console.log('[B站下载助手] Merge succeeded');
-          resolve(new Blob([event.data.data.buffer], { type: 'video/mp4' }));
-        } else {
-          console.error('[B站下载助手] Merge failed:', event.data.data.error);
-          reject(new Error(event.data.data.error || 'Merge failed'));
-        }
-      };
-      
-      window.addEventListener('message', handler);
-      
-      try {
-        const audioBuf = await audioBlob.arrayBuffer();
-        const videoBuf = await videoBlob.arrayBuffer();
-        console.log('[B站下载助手] Sending merge request, audio:', audioBuf.byteLength, 'video:', videoBuf.byteLength);
-        
-        window.postMessage({
-          source: 'bilibili-downloader',
-          type: 'merge_request',
-          data: { taskId, audio: audioBuf, video: videoBuf }
-        }, '*');
-      } catch(e) {
-        window.removeEventListener('message', handler);
-        clearTimeout(timeout);
-        reject(e);
-      }
-    });
+  // ─── FFmpeg (in page context, bypassing CSP via Blob URLs) ───
+  function createObjectURLFromExtension(path, mimeType) {
+    return fetch(chrome.runtime.getURL(path))
+      .then(r => r.arrayBuffer())
+      .then(buf => URL.createObjectURL(new Blob([buf], { type: mimeType })));
+  }
+
+  async function mergeWithFFmpeg(audioBlob, videoBlob, title) {
+    // Import ffmpeg.js via Blob URL to bypass CSP
+    const ffmpegBlobURL = await createObjectURLFromExtension('lib/ffmpeg.js', 'text/javascript');
+    const ffmpegModule = await import(ffmpegBlobURL);
+    const FFmpegClass = ffmpegModule.FFmpegWASM?.FFmpeg || ffmpegModule.FFmpegWASM;
+    if (!FFmpegClass) throw new Error('FFmpeg class not found');
+
+    const ffmpeg = new FFmpegClass();
+
+    // Create blob URLs for WASM resources
+    const [coreURL, wasmURL, workerURL] = await Promise.all([
+      createObjectURLFromExtension('lib/ffmpeg-core.js', 'text/javascript'),
+      createObjectURLFromExtension('lib/ffmpeg-core.wasm', 'application/wasm'),
+      createObjectURLFromExtension('lib/ffmpeg-core.worker.js', 'text/javascript')
+    ]);
+
+    await ffmpeg.load({ coreURL, wasmURL, workerURL });
+
+    const prefix = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+    const audioFile = prefix + '_audio.m4s';
+    const videoFile = prefix + '_video.m4s';
+    const outputFile = prefix + '_output.mp4';
+
+    await ffmpeg.writeFile(audioFile, new Uint8Array(await audioBlob.arrayBuffer()));
+    await ffmpeg.writeFile(videoFile, new Uint8Array(await videoBlob.arrayBuffer()));
+
+    await ffmpeg.exec(['-i', videoFile, '-i', audioFile, '-c', 'copy', outputFile]);
+    const result = await ffmpeg.readFile(outputFile);
+
+    await ffmpeg.deleteFile(audioFile).catch(() => {});
+    await ffmpeg.deleteFile(videoFile).catch(() => {});
+    await ffmpeg.deleteFile(outputFile).catch(() => {});
+
+    return new Blob([result.buffer], { type: 'video/mp4' });
+  }
+
+  // ─── Save file via <a download> ───
+  function saveBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 5000);
+  }
+
+  async function saveBlobAs(blob, downloadPath) {
+    // Extract filename from path for <a download>
+    const filename = downloadPath.split('/').pop() || downloadPath;
+    saveBlob(blob, filename);
+  }
+
+  async function deleteDownloadedFile(downloadPath) {
+    console.log('[B站下载助手] Note: <a download> file cannot be auto-deleted:', downloadPath);
   }
 
   // ─── Single video download ───
