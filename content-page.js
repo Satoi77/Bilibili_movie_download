@@ -241,12 +241,25 @@
       .then(buf => URL.createObjectURL(new Blob([buf], { type: mimeType })));
   }
 
+  function loadScript(url) {
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = url;
+      script.onload = resolve;
+      script.onerror = reject;
+      document.head.appendChild(script);
+    });
+  }
+
   async function getFFmpeg() {
     if (ffmpegCache?.instance?.loaded) return ffmpegCache.instance;
 
-    const ffmpegModule = await import(await createObjectURLFromExtension('lib/ffmpeg.js', 'text/javascript'));
-    const FFmpegClass = ffmpegModule.FFmpeg || ffmpegModule.FFmpegWASM?.FFmpeg || ffmpegModule.default?.FFmpeg;
-    if (!FFmpegClass) throw new Error('FFmpeg class not found, exports: ' + Object.keys(ffmpegModule));
+    const jsURL = await createObjectURLFromExtension('lib/ffmpeg.js', 'text/javascript');
+    await loadScript(jsURL);
+    URL.revokeObjectURL(jsURL);
+
+    const FFmpegClass = self.FFmpegWASM?.FFmpeg || self.FFmpegWASM;
+    if (!FFmpegClass) throw new Error('FFmpeg class not found after script load');
 
     const instance = new FFmpegClass();
 
