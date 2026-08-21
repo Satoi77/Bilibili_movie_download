@@ -129,12 +129,13 @@ function renderTasks() {
     dlList.innerHTML = '<div class="empty-state">暂无下载任务<br><span style="font-size:12px;color:#bbb;">在视频页面点击下载按钮开始</span></div>';
   } else {
     dlList.innerHTML = activeTasks.map(t => {
-      const downloadP = t.progress?.download || 0;
+      const audioP = t.progress?.audio || 0;
+      const videoP = t.progress?.video || 0;
       const mergeP = t.progress?.merge || 0;
       const overall = t.status === 'completed' ? 100 : 
                       t.status === 'failed' ? 0 : 
                       mergeP > 0 ? Math.round(90 + mergeP * 0.1) :
-                      downloadP;
+                      Math.round((audioP + videoP) / 2);
       const phaseLabel = mergeP > 0 ? '合并中' : '下载中';
       
       return `
