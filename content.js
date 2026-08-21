@@ -184,7 +184,10 @@
           window.postMessage({ source: 'bilibili-downloader', type: 'save_raw_result', data: { requestId, success: false, error: chrome.runtime.lastError.message } }, '*');
           return;
         }
-        window.postMessage({ source: 'bilibili-downloader', type: 'save_raw_result', data: { requestId, success: true, results: result?.results } }, '*');
+        const results = result?.results || [];
+        const allOk = results.length > 0 && results.every(r => r.success);
+        const firstError = results.find(r => !r.success)?.error;
+        window.postMessage({ source: 'bilibili-downloader', type: 'save_raw_result', data: { requestId, success: allOk, results, error: firstError } }, '*');
       });
       return;
     }

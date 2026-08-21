@@ -256,8 +256,11 @@ chrome.storage.local.get('settings', (result) => {
     if (s.delayMin) document.getElementById('delay-min').value = s.delayMin;
     if (s.delayMax) document.getElementById('delay-max').value = s.delayMax;
     if (s.retryTimes) document.getElementById('retry-times').value = s.retryTimes;
-    if (s.deleteRawAfterMerge) document.getElementById('delete-raw-after-merge').checked = true;
-    if (s.saveRawFiles) document.getElementById('save-raw-files').checked = true;
+    if (s.saveRawFiles) {
+      document.getElementById('save-raw-files').checked = true;
+    } else if (s.deleteRawAfterMerge) {
+      document.getElementById('delete-raw-after-merge').checked = true;
+    }
   }
 });
 

@@ -222,9 +222,8 @@
    * @param {Blob} audioBlob - 音频数据
    * @param {Blob} videoBlob - 视频数据
    * @param {string} title - 视频标题（用于子目录名）
-   * @param {string} qualityLabel - 画质标签（用于文件名）
    */
-  async function saveRawToSubdir(audioBlob, videoBlob, title, qualityLabel) {
+  async function saveRawToSubdir(audioBlob, videoBlob, title) {
     const safeTitle = sanitizeFilename(title);
     const subdir = safeTitle;
     
@@ -561,7 +560,7 @@
       if (settings.saveRawFiles) {
         try {
           notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
-          await saveRawToSubdir(audioBlob, videoBlob, title, label);
+          await saveRawToSubdir(audioBlob, videoBlob, title);
           rawSaved = true;
         } catch(e) {
           console.warn('[B站下载助手] 保存原始文件失败:', e);
@@ -579,7 +578,7 @@
         // 合并失败且未保存过原始文件 → 兜底保存
         if (!rawSaved) {
           try {
-            await saveRawToSubdir(audioBlob, videoBlob, title, label);
+            await saveRawToSubdir(audioBlob, videoBlob, title);
           } catch(e) {
             console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
           }
@@ -815,7 +814,7 @@
           if (settings.saveRawFiles) {
             try {
               notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
-              await saveRawToSubdir(audioBlob, videoBlob, info.title, label);
+              await saveRawToSubdir(audioBlob, videoBlob, info.title);
               rawSaved = true;
             } catch(e) {
               console.warn('[B站下载助手] 保存原始文件失败:', e);
@@ -833,7 +832,7 @@
             // 合并失败且未保存过原始文件 → 兜底保存
             if (!rawSaved) {
               try {
-                await saveRawToSubdir(audioBlob, videoBlob, info.title, label);
+                await saveRawToSubdir(audioBlob, videoBlob, info.title);
               } catch(e) {
                 console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
               }
