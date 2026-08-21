@@ -240,14 +240,18 @@
       'pause'
     ].join('\r\n');
     
+    // 用 video/mp4 MIME type 包装，避免 Chrome 下载时篡改扩展名
+    const audioForSave = new Blob([await audioBlob.arrayBuffer()], { type: 'video/mp4' });
+    const videoForSave = new Blob([await videoBlob.arrayBuffer()], { type: 'video/mp4' });
+
     // 构造文件列表
     const files = [
       {
-        url: URL.createObjectURL(audioBlob),
+        url: URL.createObjectURL(audioForSave),
         path: `${subdir}/audio.m4s`
       },
       {
-        url: URL.createObjectURL(videoBlob),
+        url: URL.createObjectURL(videoForSave),
         path: `${subdir}/video.m4s`
       },
       {
