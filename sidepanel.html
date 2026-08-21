@@ -58,6 +58,14 @@
       <div class="settings-section">
         <h3>文件保存</h3>
         <div class="setting-item">
+          <label>下载目录</label>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input type="text" id="download-dir" placeholder="留空使用浏览器默认目录" style="flex:1;">
+            <button id="browse-dir" style="padding:6px 12px;background:#f5f5f5;border:1px solid #e0e0e0;border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap;">浏览</button>
+          </div>
+          <div class="setting-hint">自定义下载位置，留空则使用浏览器默认下载目录</div>
+        </div>
+        <div class="setting-item">
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
             <input type="checkbox" id="delete-raw-after-merge" style="accent-color:#00a1d6;">
             <span>合并成功后删除原始文件</span>
@@ -69,7 +77,7 @@
             <input type="checkbox" id="save-raw-files" style="accent-color:#00a1d6;">
             <span>保存原始音频和视频文件</span>
           </label>
-          <div class="setting-hint">在子目录中保存 audio.m4s、video.m4s 和合并.bat 脚本</div>
+          <div class="setting-hint">在子目录中保存 audio.m4s、video.m4s 和合并说明</div>
         </div>
       </div>
       <button class="btn-save" id="save-settings">保存设置</button>

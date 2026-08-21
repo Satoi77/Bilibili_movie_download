@@ -193,6 +193,100 @@
     setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
   }
 
+  // ─── Directory Handle (File System Access API) ───
+  const DIR_HANDLE_DB = 'BiliDirHandleDB';
+  const DIR_HANDLE_STORE = 'dirHandle';
+
+  function openDirDB() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(DIR_HANDLE_DB, 1);
+      req.onupgradeneeded = (e) => {
+        e.target.result.createObjectStore(DIR_HANDLE_STORE);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function saveDirHandle(handle) {
+    const db = await openDirDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(DIR_HANDLE_STORE, 'readwrite');
+      tx.objectStore(DIR_HANDLE_STORE).put(handle, 'current');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function getDirHandle() {
+    try {
+      const db = await openDirDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(DIR_HANDLE_STORE, 'readonly');
+        const req = tx.objectStore(DIR_HANDLE_STORE).get('current');
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error);
+      });
+    } catch(e) {
+      return null;
+    }
+  }
+
+  async function clearDirHandle() {
+    try {
+      const db = await openDirDB();
+      return new Promise((resolve) => {
+        const tx = db.transaction(DIR_HANDLE_STORE, 'readwrite');
+        tx.objectStore(DIR_HANDLE_STORE).delete('current');
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+      });
+    } catch(e) {}
+  }
+
+  // 使用 File System Access API 写文件到自定义目录
+  async function downloadViaFSAPI(blob, filename) {
+    const handle = await getDirHandle();
+    if (!handle) return false;
+
+    // 检查权限
+    const perm = await handle.requestPermission({ mode: 'readwrite' });
+    if (perm !== 'granted') return false;
+
+    const fileHandle = await handle.getFileHandle(filename, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+    return true;
+  }
+
+  // 下载文件：优先使用自定义目录，否则回退到浏览器默认
+  async function downloadFile(blob, filename) {
+    try {
+      const usedFS = await downloadViaFSAPI(blob, filename);
+      if (usedFS) return;
+    } catch(e) {
+      console.warn('[B站下载助手] FSAPI download failed, fallback:', e);
+    }
+    saveBlob(blob, filename);
+  }
+
+  // 处理 SHOW_DIR_PICKER 消息
+  window.addEventListener('message', async (event) => {
+    if (event.data?.source !== 'bilibili-downloader') return;
+    if (event.data.type !== 'SHOW_DIR_PICKER') return;
+
+    try {
+      const dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      await saveDirHandle(dirHandle);
+      console.log('[B站下载助手] 自定义下载目录已设置:', dirHandle.name);
+    } catch(e) {
+      if (e.name !== 'AbortError') {
+        console.error('[B站下载助手] 目录选择失败:', e);
+      }
+    }
+  });
+
   async function saveBlobAs(blob, downloadPath) {
     const arrayBuf = await blob.arrayBuffer();
     return new Promise((resolve, reject) => {
@@ -225,22 +319,38 @@
    */
   async function saveRawToSubdir(audioBlob, videoBlob, title) {
     const safeTitle = sanitizeFilename(title);
-    const subdir = safeTitle;
     
     // 用 video/mp4 MIME type 包装，避免 Chrome 下载时篡改扩展名
     const audioForSave = new Blob([await audioBlob.arrayBuffer()], { type: 'video/mp4' });
     const videoForSave = new Blob([await videoBlob.arrayBuffer()], { type: 'video/mp4' });
 
-    // 构造文件列表
-    const files = [
-      {
-        url: URL.createObjectURL(audioForSave),
-        path: `${subdir}/audio.m4s`
-      },
-      {
-        url: URL.createObjectURL(videoForSave),
-        path: `${subdir}/video.m4s`
+    // 尝试使用 File System Access API
+    const handle = await getDirHandle();
+    if (handle) {
+      try {
+        const perm = await handle.requestPermission({ mode: 'readwrite' });
+        if (perm === 'granted') {
+          // 在自定义目录下创建子目录
+          const subDirHandle = await handle.getDirectoryHandle(safeTitle, { create: true });
+          for (const [name, blob] of [['audio.m4s', audioForSave], ['video.m4s', videoForSave]]) {
+            const fh = await subDirHandle.getFileHandle(name, { create: true });
+            const writable = await fh.createWritable();
+            await writable.write(blob);
+            await writable.close();
+          }
+          console.log('[B站下载助手] 原始文件已通过 FSAPI 保存到:', safeTitle);
+          return;
+        }
+      } catch(e) {
+        console.warn('[B站下载助手] FSAPI save failed, fallback:', e);
       }
+    }
+
+    // 回退：通过 background.js chrome.downloads
+    const subdir = safeTitle;
+    const files = [
+      { url: URL.createObjectURL(audioForSave), path: `${subdir}/audio.m4s` },
+      { url: URL.createObjectURL(videoForSave), path: `${subdir}/video.m4s` }
     ];
     
     const requestId = 'raw_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
@@ -252,8 +362,6 @@
         if (event.data.data.requestId !== requestId) return;
         window.removeEventListener('message', handler);
         clearTimeout(timeout);
-        
-        // 清理 blob URL
         files.forEach(f => URL.revokeObjectURL(f.url));
         
         if (event.data.data.success) {
@@ -294,12 +402,29 @@
       '  （需要已安装 ffmpeg 并添加到 PATH 环境变量）'
     ].join('\r\n');
     
+    // 尝试使用 File System Access API
+    const handle = await getDirHandle();
+    if (handle) {
+      try {
+        const perm = await handle.requestPermission({ mode: 'readwrite' });
+        if (perm === 'granted') {
+          const subDirHandle = await handle.getDirectoryHandle(subdir, { create: true });
+          const fh = await subDirHandle.getFileHandle('merge.txt', { create: true });
+          const writable = await fh.createWritable();
+          await writable.write(txtContent);
+          await writable.close();
+          console.log('[B站下载助手] merge.txt 已通过 FSAPI 保存');
+          return;
+        }
+      } catch(e) {
+        console.warn('[B站下载助手] FSAPI save merge.txt failed:', e);
+      }
+    }
+
+    // 回退：通过 background.js
     const requestId = 'merge_txt_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
     const files = [
-      {
-        url: URL.createObjectURL(new Blob([txtContent], { type: 'text/plain' })),
-        path: `${subdir}/merge.txt`
-      }
+      { url: URL.createObjectURL(new Blob([txtContent], { type: 'text/plain' })), path: `${subdir}/merge.txt` }
     ];
     
     return new Promise((resolve) => {
@@ -602,7 +727,7 @@
       try {
         notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '合并中' });
         const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob);
-        saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`);
+        downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`);
         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
       } catch(mergeError) {
         console.error('[B站下载助手] FFmpeg 合并失败:', mergeError);
@@ -861,7 +986,7 @@
           try {
             notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '合并中' });
             const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob);
-            saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`);
+            downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`);
             notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
           } catch(mergeError) {
             console.error('[B站下载助手] FFmpeg 合并失败:', mergeError);

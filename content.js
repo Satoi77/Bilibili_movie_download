@@ -83,7 +83,7 @@
     });
   }
 
-  // Listen for merge results from background
+  // Listen for messages from background (including sidepanel via chrome.tabs.sendMessage)
   chrome.runtime.onMessage.addListener((message) => {
     if (message.type === 'offscreen_merge_result') {
       const { taskId, success, error } = message.data;
@@ -102,6 +102,11 @@
       } else {
         cb({ success: false, error });
       }
+    }
+
+    // 转发 SHOW_DIR_PICKER 到页面上下文
+    if (message.type === 'SHOW_DIR_PICKER') {
+      window.postMessage({ source: 'bilibili-downloader', type: 'SHOW_DIR_PICKER' }, '*');
     }
   });
 

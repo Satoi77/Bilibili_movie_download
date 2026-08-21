@@ -235,13 +235,23 @@ document.getElementById('delete-raw-after-merge')?.addEventListener('change', (e
   }
 });
 
+// 浏览按钮 - 触发 content-page 的 showDirectoryPicker
+document.getElementById('browse-dir')?.addEventListener('click', () => {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    if (tabs[0]) {
+      chrome.tabs.sendMessage(tabs[0].id, { type: 'SHOW_DIR_PICKER' });
+    }
+  });
+});
+
 document.getElementById('save-settings')?.addEventListener('click', () => {
   const settings = {
     delayMin: parseInt(document.getElementById('delay-min').value),
     delayMax: parseInt(document.getElementById('delay-max').value),
     retryTimes: parseInt(document.getElementById('retry-times').value),
     deleteRawAfterMerge: document.getElementById('delete-raw-after-merge').checked,
-    saveRawFiles: document.getElementById('save-raw-files').checked
+    saveRawFiles: document.getElementById('save-raw-files').checked,
+    downloadDir: document.getElementById('download-dir').value.trim()
   };
   chrome.storage.local.set({ settings }, () => {
     const btn = document.getElementById('save-settings');
@@ -256,6 +266,7 @@ chrome.storage.local.get('settings', (result) => {
     if (s.delayMin) document.getElementById('delay-min').value = s.delayMin;
     if (s.delayMax) document.getElementById('delay-max').value = s.delayMax;
     if (s.retryTimes) document.getElementById('retry-times').value = s.retryTimes;
+    if (s.downloadDir) document.getElementById('download-dir').value = s.downloadDir;
     if (s.saveRawFiles) {
       document.getElementById('save-raw-files').checked = true;
     } else if (s.deleteRawAfterMerge) {
