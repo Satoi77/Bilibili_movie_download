@@ -180,20 +180,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   
   if (type === 'CLEAR_COMPLETED') {
-    (async () => {
-      try {
-        const allTasks = await biliDB.getTasks();
-        for (const t of allTasks) {
-          if ((t.status === 'completed' || t.status === 'failed') && t.id) {
-            await biliDB.deleteTask(t.id);
+    const req = indexedDB.open('BiliDownloaderDB', 1);
+    req.onsuccess = (event) => {
+      const db = event.target.result;
+      const tx = db.transaction('tasks', 'readwrite');
+      const store = tx.objectStore('tasks');
+      const getAll = store.getAll();
+      getAll.onsuccess = () => {
+        for (const t of getAll.result) {
+          if (t.status === 'completed' || t.status === 'failed') {
+            store.delete(t.id);
           }
         }
-        sendResponse({ status: 'ok' });
-      } catch(e) {
-        console.error('[B站下载助手] CLEAR_COMPLETED error:', e);
-        sendResponse({ status: 'error', error: e.message });
-      }
-    })();
+        tx.oncomplete = () => { sendResponse({ status: 'ok' }); db.close(); };
+      };
+    };
     return true;
   }
 
