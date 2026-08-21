@@ -217,6 +217,81 @@
     });
   }
 
+  /**
+   * 保存原始音频/视频文件和 .bat 合并脚本到子目录
+   * @param {Blob} audioBlob - 音频数据
+   * @param {Blob} videoBlob - 视频数据
+   * @param {string} title - 视频标题（用于子目录名）
+   * @param {string} qualityLabel - 画质标签（用于文件名）
+   */
+  async function saveRawToSubdir(audioBlob, videoBlob, title, qualityLabel) {
+    const safeTitle = sanitizeFilename(title);
+    const subdir = safeTitle;
+    
+    // 生成 .bat 内容
+    const batContent = [
+      '@echo off',
+      'echo 合并中...',
+      'ffmpeg -i video.m4s -i audio.m4s -vcodec copy -acodec copy merged.mp4',
+      'if %errorlevel% equ 0 (',
+      '    echo 合并完成! 输出文件: merged.mp4',
+      ') else (',
+      '    echo 合并失败! 请确认已安装 ffmpeg 并添加到 PATH',
+      ')',
+      'pause'
+    ].join('\r\n');
+    
+    // 构造文件列表
+    const files = [
+      {
+        url: URL.createObjectURL(audioBlob),
+        path: `${subdir}/audio.m4s`
+      },
+      {
+        url: URL.createObjectURL(videoBlob),
+        path: `${subdir}/video.m4s`
+      },
+      {
+        url: URL.createObjectURL(new Blob([batContent], { type: 'application/x-bat' })),
+        path: `${subdir}/合并.bat`
+      }
+    ];
+    
+    const requestId = 'raw_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+    
+    return new Promise((resolve, reject) => {
+      const handler = (event) => {
+        if (event.data?.source !== 'bilibili-downloader') return;
+        if (event.data.type !== 'save_raw_result') return;
+        if (event.data.data.requestId !== requestId) return;
+        window.removeEventListener('message', handler);
+        clearTimeout(timeout);
+        
+        // 清理 blob URL
+        files.forEach(f => URL.revokeObjectURL(f.url));
+        
+        if (event.data.data.success) {
+          console.log('[B站下载助手] 原始文件已保存到子目录:', subdir);
+          resolve(event.data.data.results);
+        } else {
+          reject(new Error(event.data.data.error || '保存原始文件失败'));
+        }
+      };
+      window.addEventListener('message', handler);
+      const timeout = setTimeout(() => {
+        window.removeEventListener('message', handler);
+        files.forEach(f => URL.revokeObjectURL(f.url));
+        reject(new Error('保存原始文件超时'));
+      }, 60000);
+      
+      window.postMessage({
+        source: 'bilibili-downloader',
+        type: 'SAVE_RAW_FILES',
+        data: { requestId, files }
+      }, '*');
+    });
+  }
+
   async function deleteDownloadedFile(downloadPath) {
     window.postMessage({
       source: 'bilibili-downloader',
