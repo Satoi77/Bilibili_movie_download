@@ -1035,7 +1035,7 @@
         return;
       }
       
-      body.style.cssText = 'display:flex;flex-direction:column;height:100%;padding:0;margin:0;';
+      body.style.cssText = 'display:flex;flex-direction:column;flex:1;overflow:hidden;padding:0;margin:0;';
       body.innerHTML = `
         <div style="flex-shrink:0;padding:16px 16px 0 16px;">
         <div style="margin-bottom:12px;padding:8px 12px;background:#f5f5f5;border-radius:6px;font-size:12px;color:#666;">
