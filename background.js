@@ -17,6 +17,7 @@ let inFlightExecutor = null; // 'offscreen' | 'hostTab' | null
 let hostTabId = null;        // 宿主 B 站 tab id（兜底执行用）
 
 const STALL_TIMEOUT = 5 * 60 * 1000; // 任务超过 5 分钟无进度更新视为停滞
+const MAX_TASK_DURATION = 30 * 60 * 1000; // 单个任务执行超过 30 分钟强制重试（兜底心跳掩盖的卡死）
 
 async function loadQueueSettings() {
   const saved = await chrome.storage.local.get('settings');
@@ -121,22 +122,39 @@ async function maybeCloseHostTab() {
   }
 }
 
-// 停滞检测：长时间无进度的 downloading 任务标记为失败，并释放队列占用
+// 停滞自愈：①任务长时间无进度 ②任务总时长超限 ③offscreen 执行器假死（SW 休眠时被 Chrome 销毁/冻结）
+// 命中任一即把任务可重试地移到队尾，释放队列，让 pumpQueue 重新派发（会自动重建 offscreen 或走宿主 tab 兜底）
 async function checkStalledTasks() {
   const now = Date.now();
   const all = await biliDB.getTasks();
   let stalled = false;
   for (const t of all) {
-    if (t.status === 'downloading' && (now - (t.lastProgressAt || 0)) > STALL_TIMEOUT) {
-      t.status = 'failed';
-      t.error = '下载超时（长时间无进度）';
-      await notifyTask(t);
+    if (t.status !== 'downloading') continue;
+    const last = t.lastProgressAt || 0;
+    if ((now - last) > STALL_TIMEOUT) {
+      await failTask(t.id, '下载超时（长时间无进度）', true);
+      stalled = true;
+    } else if ((now - (t.startedAt || last)) > MAX_TASK_DURATION) {
+      await failTask(t.id, '下载超时（任务耗时过长）', true);
+      stalled = true;
+    }
+  }
+  // offscreen 假死探测：任务在执行中但 offscreen 无响应 → 立即重派发（无需等停滞超时）
+  if (inFlightExecutor === 'offscreen' && inFlightTaskId) {
+    let alive = false;
+    try {
+      const res = await chrome.runtime.sendMessage({ type: 'OFFSCREEN_PING' });
+      alive = res?.status === 'ok';
+    } catch (e) {}
+    if (!alive) {
+      await failTask(inFlightTaskId, '后台执行器不可用，重新派发', true);
       stalled = true;
     }
   }
   if (stalled && inFlightTaskId) {
     inFlightTaskId = null;
     queueBusy = false;
+    inFlightExecutor = null;
   }
   return stalled;
 }
@@ -155,6 +173,7 @@ async function pumpQueue() {
   const task = pending[0];
   task.status = 'downloading';
   task.lastProgressAt = Date.now();
+  if (!task.startedAt) task.startedAt = Date.now();
   await notifyTask(task);
 
   inFlightTaskId = task.id;
