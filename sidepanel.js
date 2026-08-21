@@ -222,13 +222,26 @@ document.getElementById('clear-failed')?.addEventListener('click', async () => {
   }
 });
 
-// Settings
+// Settings - 互斥逻辑
+document.getElementById('save-raw-files')?.addEventListener('change', (e) => {
+  if (e.target.checked) {
+    document.getElementById('delete-raw-after-merge').checked = false;
+  }
+});
+
+document.getElementById('delete-raw-after-merge')?.addEventListener('change', (e) => {
+  if (e.target.checked) {
+    document.getElementById('save-raw-files').checked = false;
+  }
+});
+
 document.getElementById('save-settings')?.addEventListener('click', () => {
   const settings = {
     delayMin: parseInt(document.getElementById('delay-min').value),
     delayMax: parseInt(document.getElementById('delay-max').value),
     retryTimes: parseInt(document.getElementById('retry-times').value),
-    deleteRawAfterMerge: document.getElementById('delete-raw-after-merge').checked
+    deleteRawAfterMerge: document.getElementById('delete-raw-after-merge').checked,
+    saveRawFiles: document.getElementById('save-raw-files').checked
   };
   chrome.storage.local.set({ settings }, () => {
     const btn = document.getElementById('save-settings');
@@ -244,6 +257,7 @@ chrome.storage.local.get('settings', (result) => {
     if (s.delayMax) document.getElementById('delay-max').value = s.delayMax;
     if (s.retryTimes) document.getElementById('retry-times').value = s.retryTimes;
     if (s.deleteRawAfterMerge) document.getElementById('delete-raw-after-merge').checked = true;
+    if (s.saveRawFiles) document.getElementById('save-raw-files').checked = true;
   }
 });
 
