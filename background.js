@@ -9,9 +9,90 @@ chrome.runtime.onInstalled.addListener(() => {
   console.log('[Bilibili Downloader] Extension installed');
 });
 
+// ─── Unified Storage Layer ───
+// 所有数据读写通过此 handler，其他上下文不直接访问存储
+
+const DIR_HANDLE_DB = 'BiliDirHandleDB';
+const DIR_HANDLE_STORE = 'dirHandle';
+
+function openDirHandleDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DIR_HANDLE_DB, 1);
+    req.onupgradeneeded = (e) => { e.target.result.createObjectStore(DIR_HANDLE_STORE); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const { type, data } = message;
-  
+
+  // ─── Settings ───
+  if (type === 'GET_SETTINGS') {
+    chrome.storage.local.get('settings', (result) => {
+      sendResponse(result.settings || {});
+    });
+    return true;
+  }
+
+  if (type === 'SAVE_SETTINGS') {
+    chrome.storage.local.set({ settings: data.settings }, () => {
+      sendResponse({ status: 'ok' });
+    });
+    return true;
+  }
+
+  // ─── Tasks ───
+  if (type === 'GET_TASKS') {
+    biliDB.getTasks().then(tasks => {
+      sendResponse({ tasks });
+    });
+    return true;
+  }
+
+  if (type === 'DELETE_TASK') {
+    if (!data.taskId) { sendResponse({ status: 'ok' }); return true; }
+    biliDB.deleteTask(data.taskId).then(() => {
+      notifySidePanel({ type: 'TASK_REMOVED', data: { taskId: data.taskId } });
+      sendResponse({ status: 'ok' });
+    });
+    return true;
+  }
+
+  if (type === 'CLEAR_COMPLETED') {
+    biliDB.getTasks().then(tasks => {
+      const toDelete = tasks.filter(t =>
+        (t.status === 'completed' || t.status === 'failed') && t.id
+      );
+      Promise.all(toDelete.map(t => biliDB.deleteTask(t.id))).then(() => {
+        sendResponse({ status: 'ok', deleted: toDelete.length });
+      });
+    });
+    return true;
+  }
+
+  // ─── Directory Handle ───
+  if (type === 'GET_DIR_HANDLE') {
+    openDirHandleDB().then(db => {
+      const tx = db.transaction(DIR_HANDLE_STORE, 'readonly');
+      const req = tx.objectStore(DIR_HANDLE_STORE).get('current');
+      req.onsuccess = () => { db.close(); sendResponse({ handle: req.result || null }); };
+      req.onerror = () => { db.close(); sendResponse({ handle: null }); };
+    }).catch(() => sendResponse({ handle: null }));
+    return true;
+  }
+
+  if (type === 'SAVE_DIR_HANDLE') {
+    openDirHandleDB().then(db => {
+      const tx = db.transaction(DIR_HANDLE_STORE, 'readwrite');
+      tx.objectStore(DIR_HANDLE_STORE).put(data.handle, 'current');
+      tx.oncomplete = () => { db.close(); sendResponse({ status: 'ok' }); };
+      tx.onerror = () => { db.close(); sendResponse({ status: 'error' }); };
+    }).catch(() => sendResponse({ status: 'error' }));
+    return true;
+  }
+
+  // ─── Download Lifecycle ───
   if (type === 'download_start') {
     const task = {
       id: data.taskId,
@@ -27,16 +108,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       delayMessage: '',
       createdAt: new Date().toISOString()
     };
-    
     biliDB.updateTask(task).then(() => {
       notifySidePanel({ type: 'TASK_UPDATED', data: task });
     });
-    
-    // Auto-open sidebar
     if (sender.tab) {
       chrome.sidePanel.open({ tabId: sender.tab.id }).catch(() => {});
     }
-    
     sendResponse({ status: 'ok' });
   }
 
@@ -54,18 +131,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       progress: { audio: 0, video: 0 },
       createdAt: new Date().toISOString()
     };
-    
     biliDB.updateTask(task).then(() => {
       notifySidePanel({ type: 'TASK_ADDED', data: task });
     });
-    
     if (sender.tab) {
       chrome.sidePanel.open({ tabId: sender.tab.id }).catch(() => {});
     }
-    
     sendResponse({ status: 'ok' });
   }
-  
+
   if (type === 'download_progress') {
     biliDB.getTask(data.taskId).then(task => {
       if (!task) return;
@@ -79,7 +153,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     sendResponse({ status: 'ok' });
   }
-  
+
   if (type === 'download_complete') {
     biliDB.getTask(data.taskId).then(task => {
       if (!task) return;
@@ -93,7 +167,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     sendResponse({ status: 'ok' });
   }
-  
+
   if (type === 'download_error') {
     biliDB.getTask(data.taskId).then(task => {
       if (!task) return;
@@ -105,55 +179,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     sendResponse({ status: 'ok' });
   }
-  
-  if (type === 'GET_DIR_HANDLE') {
-    const DIR_HANDLE_DB = 'BiliDirHandleDB';
-    const DIR_HANDLE_STORE = 'dirHandle';
-    const req = indexedDB.open(DIR_HANDLE_DB, 1);
-    req.onupgradeneeded = (e) => { e.target.result.createObjectStore(DIR_HANDLE_STORE); };
-    req.onsuccess = () => {
-      const db = req.result;
-      const tx = db.transaction(DIR_HANDLE_STORE, 'readonly');
-      const r = tx.objectStore(DIR_HANDLE_STORE).get('current');
-      r.onsuccess = () => {
-        db.close();
-        sendResponse({ handle: r.result || null });
-      };
-      r.onerror = () => { db.close(); sendResponse({ handle: null }); };
-    };
-    req.onerror = () => sendResponse({ handle: null });
-    return true;
-  }
 
-  if (type === 'SAVE_DIR_HANDLE') {
-    const DIR_HANDLE_DB = 'BiliDirHandleDB';
-    const DIR_HANDLE_STORE = 'dirHandle';
-    const req = indexedDB.open(DIR_HANDLE_DB, 1);
-    req.onupgradeneeded = (e) => { e.target.result.createObjectStore(DIR_HANDLE_STORE); };
-    req.onsuccess = () => {
-      const db = req.result;
-      const tx = db.transaction(DIR_HANDLE_STORE, 'readwrite');
-      tx.objectStore(DIR_HANDLE_STORE).put(data.handle, 'current');
-      tx.oncomplete = () => { db.close(); sendResponse({ status: 'ok' }); };
-      tx.onerror = () => { db.close(); sendResponse({ status: 'error' }); };
-    };
-    return true;
-  }
-
-  if (type === 'GET_TASKS') {
-    biliDB.getTasks().then(tasks => {
-      sendResponse({ tasks });
-    });
-    return true;
-  }
-  
-  if (type === 'GET_SETTINGS') {
-    chrome.storage.local.get('settings', (result) => {
-      sendResponse(result.settings || {});
-    });
-    return true;
-  }
-
+  // ─── File Operations ───
   if (type === 'SAVE_FILE') {
     const { url, path: filePath } = data;
     chrome.downloads.download({ url, filename: filePath, conflictAction: 'uniquify', saveAs: false }, (dlId) => {
@@ -167,7 +194,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (type === 'SAVE_RAW_FILES') {
-    const { files } = data;  // [{ url, path }, ...]
+    const { files } = data;
     (async () => {
       const results = [];
       for (const file of files) {
@@ -203,32 +230,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   }
-  
-  if (type === 'DELETE_TASK') {
-    if (!data.taskId) { sendResponse({ status: 'ok' }); return true; }
-    biliDB.deleteTask(data.taskId).then(() => {
-      notifySidePanel({ type: 'TASK_REMOVED', data: { taskId: data.taskId } });
-      sendResponse({ status: 'ok' });
-    });
-    return true;
-  }
-  
-  // Offscreen merge - only from content scripts (sender.tab exists)
+
+  // ─── Offscreen Merge ───
   if (type === 'offscreen_merge' && sender.tab) {
-    const mergeData = data;
     ensureOffscreen().then(() => {
-      // Forward to offscreen document
-      chrome.runtime.sendMessage({
-        type: 'offscreen_merge_request',
-        data: mergeData
-      });
+      chrome.runtime.sendMessage({ type: 'offscreen_merge_request', data: data });
     });
     return true;
   }
 
-  // Receive merge result from offscreen document
   if (type === 'offscreen_merge_result') {
-    // Forward result to content scripts
     chrome.tabs.query({}, (tabs) => {
       tabs.forEach(tab => {
         chrome.tabs.sendMessage(tab.id, { type: 'offscreen_merge_result', data }).catch(() => {});
@@ -237,7 +248,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ status: 'ok' });
     return true;
   }
-  
+
   return true;
 });
 
@@ -252,7 +263,6 @@ async function ensureOffscreen() {
     contextTypes: ['OFFSCREEN_DOCUMENT']
   });
   if (existingContexts.length > 0) return;
-  
   await chrome.offscreen.createDocument({
     url: 'offscreen.html',
     reasons: ['WORKERS'],

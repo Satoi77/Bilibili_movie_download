@@ -1,12 +1,24 @@
 // sidepanel.js
+// 所有数据读写通过 background.js 消息，不直接访问存储
+
 let tasks = [];
 
-// 监听目录选择结果
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === 'DIR_PICKER_RESULT' && message.data?.name) {
-    document.getElementById('download-dir').value = message.data.name;
-  }
-});
+// ─── Unified Messaging Helpers ───
+
+function msg(type, data = {}) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type, data }, (result) => {
+      if (chrome.runtime.lastError) {
+        console.error('[B站下载助手] 消息发送失败:', type, chrome.runtime.lastError);
+        resolve(null);
+      } else {
+        resolve(result);
+      }
+    });
+  });
+}
+
+// ─── Formatters ───
 
 function fmtSize(bytes) {
   if (!bytes || bytes <= 0) return '';
@@ -42,6 +54,8 @@ function getStatusColor(task) {
   }
 }
 
+// ─── Confirm Dialog ───
+
 function showConfirm(msg) {
   return new Promise(resolve => {
     const overlay = document.createElement('div');
@@ -62,56 +76,7 @@ function showConfirm(msg) {
   });
 }
 
-async function loadTasks() {
-  return new Promise((resolve) => {
-    const req = indexedDB.open('BiliDownloaderDB', 1);
-    req.onsuccess = (e) => {
-      const db = e.target.result;
-      const tx = db.transaction('tasks', 'readonly');
-      const getAll = tx.objectStore('tasks').getAll();
-      getAll.onsuccess = () => { tasks = getAll.result || []; db.close(); resolve(); };
-      getAll.onerror = () => { db.close(); resolve(); };
-    };
-    req.onerror = () => resolve();
-  });
-}
-
-async function deleteTaskFromDB(id) {
-  if (!id) return false;
-  return new Promise((resolve) => {
-    const req = indexedDB.open('BiliDownloaderDB', 1);
-    req.onsuccess = (e) => {
-      const db = e.target.result;
-      const tx = db.transaction('tasks', 'readwrite');
-      tx.objectStore('tasks').delete(id);
-      tx.oncomplete = () => { db.close(); resolve(true); };
-      tx.onerror = () => { db.close(); resolve(false); };
-    };
-    req.onerror = () => resolve(false);
-  });
-}
-
-async function clearCompletedFromDB() {
-  return new Promise((resolve) => {
-    const req = indexedDB.open('BiliDownloaderDB', 1);
-    req.onsuccess = (e) => {
-      const db = e.target.result;
-      const tx = db.transaction('tasks', 'readwrite');
-      const store = tx.objectStore('tasks');
-      const getAll = store.getAll();
-      getAll.onsuccess = () => {
-        for (const t of getAll.result) {
-          if ((t.status === 'completed' || t.status === 'failed') && t.id) {
-            store.delete(t.id);
-          }
-        }
-      };
-      tx.oncomplete = () => { db.close(); resolve(); };
-      tx.onerror = () => { db.close(); resolve(); };
-    };
-    req.onerror = () => resolve();
-  });
-}
+// ─── Render ───
 
 function renderTasks() {
   const downloading = tasks.filter(t => t.status === 'downloading');
@@ -168,9 +133,9 @@ function renderTasks() {
         e.stopPropagation();
         const id = btn.getAttribute('data-id');
         const task = tasks.find(t => t.id === id);
-        const msg = task ? `确定删除「${task.title}」的任务记录？` : '确定删除？';
-        if (await showConfirm(msg)) {
-          chrome.runtime.sendMessage({ type: 'DELETE_TASK', data: { taskId: id } });
+        const msgText = task ? `确定删除「${task.title}」的任务记录？` : '确定删除？';
+        if (await showConfirm(msgText)) {
+          await msg('DELETE_TASK', { taskId: id });
           tasks = tasks.filter(t => t.id !== id);
           renderTasks();
         }
@@ -200,8 +165,9 @@ function renderTasks() {
     
     document.getElementById('clear-completed')?.addEventListener('click', async () => {
       if (await showConfirm(`确定清空 ${completed.length} 个已完成任务的记录？`)) {
-        await clearCompletedFromDB();
-        await loadTasks();
+        await msg('CLEAR_COMPLETED');
+        const result = await msg('GET_TASKS');
+        tasks = result?.tasks || [];
         renderTasks();
       }
     });
@@ -211,10 +177,11 @@ function renderTasks() {
         e.stopPropagation();
         const id = btn.getAttribute('data-id');
         const task = tasks.find(t => t.id === id);
-        const msg = task ? `确定删除「${task.title}」的任务记录？` : '确定删除？';
-        if (await showConfirm(msg)) {
-          await deleteTaskFromDB(id);
-          await loadTasks();
+        const msgText = task ? `确定删除「${task.title}」的任务记录？` : '确定删除？';
+        if (await showConfirm(msgText)) {
+          await msg('DELETE_TASK', { taskId: id });
+          const result = await msg('GET_TASKS');
+          tasks = result?.tasks || [];
           renderTasks();
         }
       };
@@ -222,7 +189,8 @@ function renderTasks() {
   }
 }
 
-// Tabs
+// ─── Tabs ───
+
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -232,7 +200,8 @@ document.querySelectorAll('.tab').forEach(tab => {
   });
 });
 
-// Listen for real-time updates from background
+// ─── Real-time Updates from Background ───
+
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === 'TASK_ADDED') {
     if (!tasks.find(t => t.id === message.data.id)) {
@@ -257,20 +226,22 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 });
 
-// Clear failed tasks
+// ─── Clear Failed Tasks ───
+
 document.getElementById('clear-failed')?.addEventListener('click', async () => {
   const failedIds = tasks.filter(t => t.status === 'failed' && t.id).map(t => t.id);
   if (failedIds.length === 0) return;
   if (await showConfirm(`确定清理 ${failedIds.length} 个失败任务？`)) {
-    failedIds.forEach(id => {
-      chrome.runtime.sendMessage({ type: 'DELETE_TASK', data: { taskId: id } });
-    });
+    for (const id of failedIds) {
+      await msg('DELETE_TASK', { taskId: id });
+    }
     tasks = tasks.filter(t => t.status !== 'failed');
     renderTasks();
   }
 });
 
-// Settings - 互斥逻辑
+// ─── Settings: Mutual Exclusion ───
+
 document.getElementById('save-raw-files')?.addEventListener('change', (e) => {
   if (e.target.checked) {
     document.getElementById('delete-raw-after-merge').checked = false;
@@ -283,36 +254,21 @@ document.getElementById('delete-raw-after-merge')?.addEventListener('change', (e
   }
 });
 
-// 浏览按钮 - 直接在侧边栏调用 showDirectoryPicker
-const DIR_HANDLE_DB = 'BiliDirHandleDB';
-const DIR_HANDLE_STORE = 'dirHandle';
-
-function openDirDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DIR_HANDLE_DB, 1);
-    req.onupgradeneeded = (e) => { e.target.result.createObjectStore(DIR_HANDLE_STORE); };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
+// ─── Browse Directory Button ───
 
 document.getElementById('browse-dir')?.addEventListener('click', async () => {
   try {
     const dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
-    const db = await openDirDB();
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(DIR_HANDLE_STORE, 'readwrite');
-      tx.objectStore(DIR_HANDLE_STORE).put(dirHandle, 'current');
-      tx.oncomplete = () => { db.close(); resolve(); };
-      tx.onerror = () => { db.close(); reject(tx.error); };
-    });
+    await msg('SAVE_DIR_HANDLE', { handle: dirHandle });
     document.getElementById('download-dir').value = dirHandle.name;
   } catch(e) {
     if (e.name !== 'AbortError') console.error('[B站下载助手] 目录选择失败:', e);
   }
 });
 
-document.getElementById('save-settings')?.addEventListener('click', () => {
+// ─── Save Settings ───
+
+document.getElementById('save-settings')?.addEventListener('click', async () => {
   const settings = {
     delayMin: parseInt(document.getElementById('delay-min').value),
     delayMax: parseInt(document.getElementById('delay-max').value),
@@ -321,44 +277,36 @@ document.getElementById('save-settings')?.addEventListener('click', () => {
     saveRawFiles: document.getElementById('save-raw-files').checked,
     downloadDir: document.getElementById('download-dir').value.trim()
   };
-  chrome.storage.local.set({ settings }, () => {
-    const btn = document.getElementById('save-settings');
-    btn.textContent = '已保存!';
-    setTimeout(() => btn.textContent = '保存设置', 2000);
-  });
+  await msg('SAVE_SETTINGS', { settings });
+  const btn = document.getElementById('save-settings');
+  btn.textContent = '已保存!';
+  setTimeout(() => btn.textContent = '保存设置', 2000);
 });
 
-chrome.storage.local.get('settings', (result) => {
-  if (result.settings) {
-    const s = result.settings;
-    if (s.delayMin) document.getElementById('delay-min').value = s.delayMin;
-    if (s.delayMax) document.getElementById('delay-max').value = s.delayMax;
-    if (s.retryTimes) document.getElementById('retry-times').value = s.retryTimes;
-    if (s.downloadDir) document.getElementById('download-dir').value = s.downloadDir;
-    if (s.saveRawFiles) {
+// ─── Init ───
+
+(async () => {
+  // Load tasks
+  const result = await msg('GET_TASKS');
+  tasks = result?.tasks || [];
+  renderTasks();
+
+  // Load settings
+  const settings = await msg('GET_SETTINGS');
+  if (settings) {
+    if (settings.delayMin) document.getElementById('delay-min').value = settings.delayMin;
+    if (settings.delayMax) document.getElementById('delay-max').value = settings.delayMax;
+    if (settings.retryTimes) document.getElementById('retry-times').value = settings.retryTimes;
+    if (settings.saveRawFiles) {
       document.getElementById('save-raw-files').checked = true;
-    } else if (s.deleteRawAfterMerge) {
+    } else if (settings.deleteRawAfterMerge) {
       document.getElementById('delete-raw-after-merge').checked = true;
     }
   }
-});
 
-// Init
-loadTasks().then(renderTasks);
-
-// 加载已选目录名
-(async () => {
-  try {
-    const db = await openDirDB();
-    const handle = await new Promise((resolve) => {
-      const tx = db.transaction(DIR_HANDLE_STORE, 'readonly');
-      const req = tx.objectStore(DIR_HANDLE_STORE).get('current');
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => resolve(null);
-      db.close();
-    });
-    if (handle) {
-      document.getElementById('download-dir').value = handle.name;
-    }
-  } catch(e) {}
+  // Load directory handle name
+  const dirResult = await msg('GET_DIR_HANDLE');
+  if (dirResult?.handle) {
+    document.getElementById('download-dir').value = dirResult.handle.name;
+  }
 })();
