@@ -3,3 +3,7 @@ node_modules/
 *.log
 .DS_Store
 Thumbs.db
+source_url.txt
+test-download.js
+test-merge.html
+test-merge.js
