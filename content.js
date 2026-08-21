@@ -197,6 +197,14 @@
       return;
     }
 
+    // Handle GET_DIR_HANDLE - 从 background 获取目录句柄
+    if (type === 'GET_DIR_HANDLE') {
+      chrome.runtime.sendMessage({ type: 'GET_DIR_HANDLE' }, (result) => {
+        window.postMessage({ source: 'bili-ext', type: 'GET_DIR_HANDLE_RESULT', handle: result?.handle || null }, '*');
+      });
+      return;
+    }
+
     // Handle DELETE_FILE
     if (type === 'DELETE_FILE') {
       chrome.runtime.sendMessage({ type: 'DELETE_FILE', data }, () => {});

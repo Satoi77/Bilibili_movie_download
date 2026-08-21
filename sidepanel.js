@@ -283,13 +283,33 @@ document.getElementById('delete-raw-after-merge')?.addEventListener('change', (e
   }
 });
 
-// 浏览按钮 - 触发 content-page 的 showDirectoryPicker
-document.getElementById('browse-dir')?.addEventListener('click', () => {
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-    if (tabs[0]) {
-      chrome.tabs.sendMessage(tabs[0].id, { type: 'SHOW_DIR_PICKER' });
-    }
+// 浏览按钮 - 直接在侧边栏调用 showDirectoryPicker
+const DIR_HANDLE_DB = 'BiliDirHandleDB';
+const DIR_HANDLE_STORE = 'dirHandle';
+
+function openDirDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DIR_HANDLE_DB, 1);
+    req.onupgradeneeded = (e) => { e.target.result.createObjectStore(DIR_HANDLE_STORE); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
   });
+}
+
+document.getElementById('browse-dir')?.addEventListener('click', async () => {
+  try {
+    const dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+    const db = await openDirDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(DIR_HANDLE_STORE, 'readwrite');
+      tx.objectStore(DIR_HANDLE_STORE).put(dirHandle, 'current');
+      tx.oncomplete = () => { db.close(); resolve(); };
+      tx.onerror = () => { db.close(); reject(tx.error); };
+    });
+    document.getElementById('download-dir').value = dirHandle.name;
+  } catch(e) {
+    if (e.name !== 'AbortError') console.error('[B站下载助手] 目录选择失败:', e);
+  }
 });
 
 document.getElementById('save-settings')?.addEventListener('click', () => {
@@ -325,3 +345,20 @@ chrome.storage.local.get('settings', (result) => {
 
 // Init
 loadTasks().then(renderTasks);
+
+// 加载已选目录名
+(async () => {
+  try {
+    const db = await openDirDB();
+    const handle = await new Promise((resolve) => {
+      const tx = db.transaction(DIR_HANDLE_STORE, 'readonly');
+      const req = tx.objectStore(DIR_HANDLE_STORE).get('current');
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+      db.close();
+    });
+    if (handle) {
+      document.getElementById('download-dir').value = handle.name;
+    }
+  } catch(e) {}
+})();

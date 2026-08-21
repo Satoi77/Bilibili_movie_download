@@ -220,12 +220,16 @@
 
   async function getDirHandle() {
     try {
-      const db = await openDirDB();
-      return new Promise((resolve, reject) => {
-        const tx = db.transaction(DIR_HANDLE_STORE, 'readonly');
-        const req = tx.objectStore(DIR_HANDLE_STORE).get('current');
-        req.onsuccess = () => resolve(req.result || null);
-        req.onerror = () => reject(req.error);
+      return new Promise((resolve) => {
+        window.postMessage({ source: 'bili-ext', type: 'GET_DIR_HANDLE' }, '*');
+        const listener = (e) => {
+          if (e.data?.source === 'bili-ext' && e.data?.type === 'GET_DIR_HANDLE_RESULT') {
+            window.removeEventListener('message', listener);
+            resolve(e.data.handle || null);
+          }
+        };
+        window.addEventListener('message', listener);
+        setTimeout(() => { window.removeEventListener('message', listener); resolve(null); }, 3000);
       });
     } catch(e) {
       return null;
