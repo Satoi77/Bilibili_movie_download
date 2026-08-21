@@ -132,6 +132,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (type === 'SAVE_RAW_FILES') {
+    const { files } = data;  // [{ url, path }, ...]
+    (async () => {
+      const results = [];
+      for (const file of files) {
+        try {
+          const dlId = await new Promise((resolve, reject) => {
+            chrome.downloads.download({
+              url: file.url,
+              filename: file.path,
+              conflictAction: 'uniquify',
+              saveAs: false
+            }, (id) => {
+              if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+              else resolve(id);
+            });
+          });
+          results.push({ path: file.path, success: true, downloadId: dlId });
+        } catch (e) {
+          results.push({ path: file.path, success: false, error: e.message });
+        }
+      }
+      sendResponse({ results });
+    })();
+    return true;
+  }
+
   if (type === 'DELETE_FILE') {
     chrome.downloads.search({ filenameQuery: data.path, limit: 1 }, (results) => {
       if (results && results.length > 0) {
