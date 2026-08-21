@@ -180,14 +180,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   
   if (type === 'CLEAR_COMPLETED') {
-    biliDB.getTasks().then(async (tasks) => {
-      for (const t of tasks) {
-        if ((t.status === 'completed' || t.status === 'failed') && t.id) {
-          await biliDB.deleteTask(t.id);
+    (async () => {
+      try {
+        const allTasks = await biliDB.getTasks();
+        for (const t of allTasks) {
+          if ((t.status === 'completed' || t.status === 'failed') && t.id) {
+            await biliDB.deleteTask(t.id);
+          }
         }
+        sendResponse({ status: 'ok' });
+      } catch(e) {
+        console.error('[B站下载助手] CLEAR_COMPLETED error:', e);
+        sendResponse({ status: 'error', error: e.message });
       }
-      sendResponse({ status: 'ok' });
-    });
+    })();
     return true;
   }
 

@@ -161,6 +161,9 @@ function renderTasks() {
           await loadTasks();
           renderTasks();
         });
+        // 先清空本地列表，不等响应
+        tasks = tasks.filter(t => t.status !== 'completed' && t.status !== 'failed');
+        renderTasks();
       }
     });
     
