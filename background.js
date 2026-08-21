@@ -180,21 +180,42 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   
   if (type === 'CLEAR_COMPLETED') {
+    console.log('[B站下载助手] CLEAR_RECEIVED');
+    const log = (msg) => {
+      console.log('[B站下载助手]', msg);
+      const req = indexedDB.open('BiliDebugLog', 1);
+      req.onupgradeneeded = (e) => { e.target.result.createObjectStore('logs', { autoIncrement: true }); };
+      req.onsuccess = (e) => {
+        const db = e.target.result;
+        const tx = db.transaction('logs', 'readwrite');
+        tx.objectStore('logs').add({ time: new Date().toISOString(), msg });
+        tx.oncomplete = () => db.close();
+      };
+    };
+    log('CLEAR_STARTED');
     const req = indexedDB.open('BiliDownloaderDB', 1);
     req.onsuccess = (event) => {
+      log('DB_OPENED');
       const db = event.target.result;
       const tx = db.transaction('tasks', 'readwrite');
       const store = tx.objectStore('tasks');
       const getAll = store.getAll();
       getAll.onsuccess = () => {
+        log('TASKS_COUNT:' + getAll.result.length);
+        let deleted = 0;
         for (const t of getAll.result) {
           if (t.status === 'completed' || t.status === 'failed') {
             store.delete(t.id);
+            deleted++;
           }
         }
-        tx.oncomplete = () => { sendResponse({ status: 'ok' }); db.close(); };
+        log('DELETED:' + deleted);
+        tx.oncomplete = () => { log('TX_COMPLETE'); sendResponse({ status: 'ok' }); db.close(); };
+        tx.onerror = (e) => { log('TX_ERROR:' + e.target.error); };
       };
+      getAll.onerror = (e) => { log('GETALL_ERROR:' + e.target.error); };
     };
+    req.onerror = (e) => { log('DB_ERROR:' + e.target.error); };
     return true;
   }
 

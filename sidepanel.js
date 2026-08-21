@@ -157,8 +157,11 @@ function renderTasks() {
     
     document.getElementById('clear-completed')?.addEventListener('click', async () => {
       if (await showConfirm(`确定清空 ${completed.length} 个已完成任务的记录？`)) {
-        chrome.runtime.sendMessage({ type: 'CLEAR_COMPLETED' }, async () => {
+        console.log('[B站下载助手] Sidepanel: sending CLEAR_COMPLETED');
+        chrome.runtime.sendMessage({ type: 'CLEAR_COMPLETED' }, async (resp) => {
+          console.log('[B站下载助手] Sidepanel: response:', resp);
           await loadTasks();
+          console.log('[B站下载助手] Sidepanel: tasks after reload:', tasks.length);
           renderTasks();
         });
       }
