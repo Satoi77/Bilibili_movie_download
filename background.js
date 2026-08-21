@@ -133,14 +133,14 @@ async function checkStalledTasks() {
     if (t.status !== 'downloading') continue;
     const last = t.lastProgressAt || 0;
     if ((now - last) > STALL_TIMEOUT) {
-      await failTask(t.id, '下载超时（长时间无进度）', true);
+      await requeueTask(t.id, '下载超时（长时间无进度），原位重启');
       stalled = true;
     } else if ((now - (t.startedAt || last)) > MAX_TASK_DURATION) {
-      await failTask(t.id, '下载超时（任务耗时过长）', true);
+      await requeueTask(t.id, '下载超时（任务耗时过长），原位重启');
       stalled = true;
     }
   }
-  // offscreen 假死探测：任务在执行中但 offscreen 无响应 → 立即重派发（无需等停滞超时）
+  // offscreen 假死探测：任务在执行中但 offscreen 无响应 → 立即原位重启（无需等停滞超时）
   if (inFlightExecutor === 'offscreen' && inFlightTaskId) {
     let alive = false;
     try {
@@ -148,7 +148,7 @@ async function checkStalledTasks() {
       alive = res?.status === 'ok';
     } catch (e) {}
     if (!alive) {
-      await failTask(inFlightTaskId, '后台执行器不可用，重新派发', true);
+      await requeueTask(inFlightTaskId, '后台执行器不可用，原位重启');
       stalled = true;
     }
   }
@@ -156,6 +156,7 @@ async function checkStalledTasks() {
     inFlightTaskId = null;
     queueBusy = false;
     inFlightExecutor = null;
+    nextDispatchAt = 0; // 立即重新派发重启的任务，不再等待队列延时
   }
   return stalled;
 }
@@ -202,9 +203,30 @@ async function failTask(taskId, error, retryable) {
   t.retryCount = (t.retryCount || 0) + 1;
   t.lastError = error;
   if (retryable && t.retryCount <= settings.retryTimes) {
-    // 移到队列末尾重试
+    // 移到队列末尾重试（执行失败/暂时性错误的延迟重试，给其他任务让路）
     t.status = 'pending';
     t.createdAt = new Date().toISOString();
+    t.progress = { audio: 0, video: 0, merge: 0 };
+    t.lastProgressAt = 0;
+    await notifyTask(t);
+    return;
+  }
+  t.status = 'failed';
+  t.error = error;
+  await notifyTask(t);
+}
+
+// 停滞/执行器中断后的"原位重启"：保持原 createdAt（队列最前位置），中断的任务优先恢复
+// 而不是跳到下一个任务。与 failTask(retryable) 的区别：后者移到队尾延迟重试。
+async function requeueTask(taskId, error) {
+  const settings = await loadQueueSettings();
+  const t = await biliDB.getTask(taskId);
+  if (!t) return;
+  if (t.status !== 'downloading' && t.status !== 'pending') return;
+  t.retryCount = (t.retryCount || 0) + 1;
+  t.lastError = error;
+  if (t.retryCount <= settings.retryTimes) {
+    t.status = 'pending';
     t.progress = { audio: 0, video: 0, merge: 0 };
     t.lastProgressAt = 0;
     await notifyTask(t);
