@@ -218,7 +218,7 @@
   }
 
   /**
-   * 保存原始音频/视频文件和 .bat 合并脚本到子目录
+   * 保存原始音频/视频文件到子目录
    * @param {Blob} audioBlob - 音频数据
    * @param {Blob} videoBlob - 视频数据
    * @param {string} title - 视频标题（用于子目录名）
@@ -226,19 +226,6 @@
   async function saveRawToSubdir(audioBlob, videoBlob, title) {
     const safeTitle = sanitizeFilename(title);
     const subdir = safeTitle;
-    
-    // 生成 .bat 内容
-    const batContent = [
-      '@echo off',
-      'echo 合并中...',
-      'ffmpeg -i video.m4s -i audio.m4s -vcodec copy -acodec copy merged.mp4',
-      'if %errorlevel% equ 0 (',
-      '    echo 合并完成! 输出文件: merged.mp4',
-      ') else (',
-      '    echo 合并失败! 请确认已安装 ffmpeg 并添加到 PATH',
-      ')',
-      'pause'
-    ].join('\r\n');
     
     // 用 video/mp4 MIME type 包装，避免 Chrome 下载时篡改扩展名
     const audioForSave = new Blob([await audioBlob.arrayBuffer()], { type: 'video/mp4' });
@@ -253,10 +240,6 @@
       {
         url: URL.createObjectURL(videoForSave),
         path: `${subdir}/video.m4s`
-      },
-      {
-        url: URL.createObjectURL(new Blob([batContent], { type: 'application/x-bat' })),
-        path: `${subdir}/合并.bat`
       }
     ];
     
@@ -286,6 +269,50 @@
         files.forEach(f => URL.revokeObjectURL(f.url));
         reject(new Error('保存原始文件超时'));
       }, 60000);
+      
+      window.postMessage({
+        source: 'bilibili-downloader',
+        type: 'SAVE_RAW_FILES',
+        data: { requestId, files }
+      }, '*');
+    });
+  }
+
+  /**
+   * 保存 merge.txt 合并说明到子目录（仅在 FFmpeg 合并失败时调用）
+   * @param {string} title - 视频标题
+   */
+  async function saveMergeTxt(title) {
+    const subdir = sanitizeFilename(title);
+    const txtContent = [
+      '将此目录下的 audio.m4s 和 video.m4s 合并为 mp4 文件。',
+      '',
+      '方法一：使用 ffmpeg 命令行',
+      '  ffmpeg -i video.m4s -i audio.m4s -vcodec copy -acodec copy merged.mp4',
+      '',
+      '方法二：将本文件重命名为 merge.bat，双击运行',
+      '  （需要已安装 ffmpeg 并添加到 PATH 环境变量）'
+    ].join('\r\n');
+    
+    const requestId = 'merge_txt_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+    const files = [
+      {
+        url: URL.createObjectURL(new Blob([txtContent], { type: 'text/plain' })),
+        path: `${subdir}/merge.txt`
+      }
+    ];
+    
+    return new Promise((resolve) => {
+      const handler = (event) => {
+        if (event.data?.source !== 'bilibili-downloader') return;
+        if (event.data.type !== 'save_raw_result') return;
+        if (event.data.data.requestId !== requestId) return;
+        window.removeEventListener('message', handler);
+        files.forEach(f => URL.revokeObjectURL(f.url));
+        resolve();
+      };
+      window.addEventListener('message', handler);
+      setTimeout(() => { window.removeEventListener('message', handler); files.forEach(f => URL.revokeObjectURL(f.url)); }, 10000);
       
       window.postMessage({
         source: 'bilibili-downloader',
@@ -587,6 +614,8 @@
             console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
           }
         }
+        // 生成 merge.txt 合并说明
+        try { await saveMergeTxt(title); } catch(e) {}
         throw new Error('合并失败: ' + mergeError.message);
       }
       
@@ -707,7 +736,10 @@
       activeTab.style.borderBottomColor = '#00a1d6';
     }
     
-    showVideoTab();
+    // 根据当前激活的 tab 显示对应内容
+    const activeTabName = activeTab?.dataset?.tab || 'video';
+    if (activeTabName === 'collection') showCollectionTab();
+    else showVideoTab();
   }
 
   async function showVideoTab() {
@@ -841,6 +873,8 @@
                 console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
               }
             }
+            // 生成 merge.txt 合并说明
+            try { await saveMergeTxt(info.title); } catch(e) {}
             throw new Error('合并失败: ' + mergeError.message);
           }
           
