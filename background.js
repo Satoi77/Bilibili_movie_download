@@ -125,6 +125,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (type === 'SAVE_DIR_HANDLE') {
+    const DIR_HANDLE_DB = 'BiliDirHandleDB';
+    const DIR_HANDLE_STORE = 'dirHandle';
+    const req = indexedDB.open(DIR_HANDLE_DB, 1);
+    req.onupgradeneeded = (e) => { e.target.result.createObjectStore(DIR_HANDLE_STORE); };
+    req.onsuccess = () => {
+      const db = req.result;
+      const tx = db.transaction(DIR_HANDLE_STORE, 'readwrite');
+      tx.objectStore(DIR_HANDLE_STORE).put(data.handle, 'current');
+      tx.oncomplete = () => { db.close(); sendResponse({ status: 'ok' }); };
+      tx.onerror = () => { db.close(); sendResponse({ status: 'error' }); };
+    };
+    return true;
+  }
+
   if (type === 'GET_TASKS') {
     biliDB.getTasks().then(tasks => {
       sendResponse({ tasks });

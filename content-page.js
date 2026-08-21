@@ -193,30 +193,7 @@
     setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
   }
 
-  // ─── Directory Handle (File System Access API) ───
-  const DIR_HANDLE_DB = 'BiliDirHandleDB';
-  const DIR_HANDLE_STORE = 'dirHandle';
-
-  function openDirDB() {
-    return new Promise((resolve, reject) => {
-      const req = indexedDB.open(DIR_HANDLE_DB, 1);
-      req.onupgradeneeded = (e) => {
-        e.target.result.createObjectStore(DIR_HANDLE_STORE);
-      };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
-
-  async function saveDirHandle(handle) {
-    const db = await openDirDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(DIR_HANDLE_STORE, 'readwrite');
-      tx.objectStore(DIR_HANDLE_STORE).put(handle, 'current');
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
-  }
+  // ─── Directory Handle (通过 background.js 获取，不直接读页面 IndexedDB) ───
 
   async function getDirHandle() {
     try {
@@ -234,18 +211,6 @@
     } catch(e) {
       return null;
     }
-  }
-
-  async function clearDirHandle() {
-    try {
-      const db = await openDirDB();
-      return new Promise((resolve) => {
-        const tx = db.transaction(DIR_HANDLE_STORE, 'readwrite');
-        tx.objectStore(DIR_HANDLE_STORE).delete('current');
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => resolve();
-      });
-    } catch(e) {}
   }
 
   // 使用 File System Access API 写文件到自定义目录
@@ -275,16 +240,15 @@
     saveBlob(blob, filename);
   }
 
-  // 处理 SHOW_DIR_PICKER 消息
+  // 处理 SHOW_DIR_PICKER 消息（已废弃，保留兼容）
   window.addEventListener('message', async (event) => {
     if (event.data?.source !== 'bilibili-downloader') return;
     if (event.data.type !== 'SHOW_DIR_PICKER') return;
 
     try {
       const dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
-      await saveDirHandle(dirHandle);
-      console.log('[B站下载助手] 自定义下载目录已设置:', dirHandle.name);
-      // 回传目录名给侧边栏（通过 postMessage 桥接）
+      // 通过 background 保存句柄
+      window.postMessage({ source: 'bili-ext', type: 'SAVE_DIR_HANDLE', handle: dirHandle }, '*');
       window.postMessage({ source: 'bilibili-downloader', type: 'DIR_PICKER_RESULT', data: { name: dirHandle.name } }, '*');
     } catch(e) {
       if (e.name !== 'AbortError') {

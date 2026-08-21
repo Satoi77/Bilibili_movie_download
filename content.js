@@ -205,6 +205,12 @@
       return;
     }
 
+    // Handle SAVE_DIR_HANDLE - 保存目录句柄到 background
+    if (type === 'SAVE_DIR_HANDLE') {
+      chrome.runtime.sendMessage({ type: 'SAVE_DIR_HANDLE', data: { handle: data.handle } });
+      return;
+    }
+
     // Handle DELETE_FILE
     if (type === 'DELETE_FILE') {
       chrome.runtime.sendMessage({ type: 'DELETE_FILE', data }, () => {});
