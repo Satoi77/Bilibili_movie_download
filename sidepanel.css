@@ -173,7 +173,8 @@ body {
 
 .task-size { color: #999; font-size: 11px; }
 
-.task-note {
+.task-note,
+.task-warn {
   margin-top: 6px;
   font-size: 11px;
   line-height: 1.4;

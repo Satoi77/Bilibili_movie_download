@@ -50,6 +50,10 @@ function getStatusText(task) {
   }
 }
 
+// 与 lib/download-core.js 的 MERGE_THRESHOLD 一致：超过此大小跳过 FFmpeg 自动合并，
+// 保存分离音视频 + merge.txt，故提前在卡片上提醒用户
+const MERGE_SIZE_WARN = 600 * 1024 * 1024;
+
 // 任务总体积：优先用执行期上报的 totalSize，回退到入队时携带的音视频分项
 function getTaskSize(task) {
   return task.totalSize || ((task.videoSize || 0) + (task.audioSize || 0)) || 0;
@@ -149,6 +153,7 @@ function renderTasks() {
       const isStop = t.status === 'downloading';
       const controlIcon = isStop ? ICON_PAUSE : ICON_PLAY;
       const sizeText = fmtSize(getTaskSize(t));
+      const sizeWarn = getTaskSize(t) > MERGE_SIZE_WARN;
 
       return `
         <div class="task-card ${t.status}">
@@ -172,6 +177,7 @@ function renderTasks() {
               <span class="progress-pct">${overall}%</span>
             </div>
             ${t.note ? `<div class="task-note" title="${t.note}">${t.note}</div>` : ''}
+            ${sizeWarn ? '<div class="task-warn" title="超过600MB的文件合并时可能内存不足，将保存分离音视频">⚠ 超过600MB，可能无法自动合并为单一视频，完成后需按 merge.txt 手动合并</div>' : ''}
           </div>
         </div>
       `;
