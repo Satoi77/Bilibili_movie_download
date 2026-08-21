@@ -157,13 +157,10 @@ function renderTasks() {
     
     document.getElementById('clear-completed')?.addEventListener('click', async () => {
       if (await showConfirm(`确定清空 ${completed.length} 个已完成任务的记录？`)) {
-        for (const t of completed) {
-          const id = t.id;
-          if (!id) continue;
-          chrome.runtime.sendMessage({ type: 'DELETE_TASK', data: { taskId: id } });
-          tasks = tasks.filter(task => task.id !== id);
-        }
-        renderTasks();
+        chrome.runtime.sendMessage({ type: 'CLEAR_COMPLETED' }, async () => {
+          await loadTasks();
+          renderTasks();
+        });
       }
     });
     
