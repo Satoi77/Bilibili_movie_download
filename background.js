@@ -673,7 +673,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (type === 'offscreen_merge' && sender.tab) {
     ensureOffscreen().then(() => {
       chrome.runtime.sendMessage({ type: 'offscreen_merge_request', data: data });
-    });
+    }).catch(() => {});
     return true;
   }
 

@@ -131,6 +131,13 @@ class FFmpegBridge {
   constructor(worker) {
     this.#worker = worker;
     this.#attachReceiver();
+    this.#worker.onerror = (e) => {
+      const err = new Error('FFmpeg worker 错误: ' + (e && e.message ? e.message : 'unknown'));
+      const pending = this.#pending;
+      this.#pending = {};
+      Object.values(pending).forEach(p => p.reject(err));
+      this.ready = false;
+    };
   }
 
   #attachReceiver() {
