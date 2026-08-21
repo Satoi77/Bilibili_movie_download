@@ -16,6 +16,9 @@
     "*://*.bilibili.com/*",
     "*://*.bilivideo.com/*"
   ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' blob: 'wasm-unsafe-eval'; worker-src 'self' blob:; object-src 'self'"
+  },
   "background": {
     "service_worker": "background.js",
     "type": "module"

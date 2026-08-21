@@ -187,8 +187,9 @@
       return;
     }
 
-    // Forward other messages to background
+    // Forward other messages to background（跳过 OFFSCREEN_*，防 chrome.runtime.sendMessage 广播回声）
     try {
+      if (type.startsWith('OFFSCREEN_')) return;
       chrome.runtime.sendMessage({ type, data }, () => {
         if (chrome.runtime.lastError) {}
       });
