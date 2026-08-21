@@ -203,6 +203,12 @@
       return;
     }
 
+    // 转发 DIR_PICKER_RESULT 到侧边栏
+    if (type === 'DIR_PICKER_RESULT') {
+      chrome.runtime.sendMessage({ type, data });
+      return;
+    }
+
     // Forward other messages to background
     try {
       chrome.runtime.sendMessage({ type, data }, () => {
