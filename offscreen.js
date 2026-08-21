@@ -265,6 +265,12 @@ async function saveBlob(blob, filename, subdir) {
 async function runOffscreenTask(taskId, videoInfo, qualityIdx) {
   const controller = new AbortController();
   activeTaskControllers.set(taskId, controller);
+  // 保活心跳：任务执行期间每 15s 唤醒 SW，防止 SW 因无活动休眠而连带销毁 offscreen document
+  // （offscreen 与 SW 生命周期绑定，SW 终止则 offscreen 关闭，正在执行的任务会中断且无回报）。
+  // 心跳不更新 lastProgressAt，与停滞检测解耦——任务真卡住时仍会被 5 分钟停滞检测兜底。
+  const keepalive = setInterval(() => {
+    chrome.runtime.sendMessage({ type: 'OFFSCREEN_HEARTBEAT', data: { taskId } }).catch(() => {});
+  }, 15000);
   try {
     await executeTask(taskId, videoInfo, qualityIdx, {
       getSettings,
@@ -284,6 +290,7 @@ async function runOffscreenTask(taskId, videoInfo, qualityIdx) {
       sendToBg({ type: 'OFFSCREEN_TASK_ERROR', data: { taskId, error: e.message } });
     }
   } finally {
+    clearInterval(keepalive);
     activeTaskControllers.delete(taskId);
   }
 }

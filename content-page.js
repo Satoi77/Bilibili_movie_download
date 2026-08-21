@@ -1005,5 +1005,8 @@
   
   waitAndInit();
 
+  // 通知隔离世界的 content.js 本页面已就绪（RUN_TASK 可安全派发，避免宿主 tab 兜底丢消息）
+  window.postMessage({ source: 'bilibili-downloader', type: 'PAGE_READY' }, '*');
+
   console.log('[B站下载助手] Page script loaded');
 })();

@@ -81,8 +81,9 @@ async function waitHostTabReady(tabId) {
       const tab = await chrome.tabs.get(tabId);
       if (tab?.status === 'complete') {
         try {
-          await chrome.tabs.sendMessage(tabId, { type: 'HOST_PING' });
-          return;
+          // 仅当 content.js 响应 status:'ok'（即页面世界 content-page.js 已就绪）才算就绪
+          const res = await chrome.tabs.sendMessage(tabId, { type: 'HOST_PING' });
+          if (res?.status === 'ok') return;
         } catch (e) {}
       }
     } catch (e) {
@@ -234,8 +235,7 @@ async function advanceQueue(taskId) {
 chrome.alarms?.create('queue-pump', { periodInMinutes: 0.5 });
 chrome.alarms?.onAlarm.addListener((alarm) => {
   if (alarm.name === 'queue-pump') {
-    checkStalledTasks();
-    pumpQueue();
+    checkStalledTasks().then(() => pumpQueue());
   }
 });
 
@@ -251,6 +251,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // ─── Offscreen 后台下载 ───
   if (type === 'OFFSCREEN_PING') {
+    sendResponse({ status: 'ok' });
+    return true;
+  }
+
+  // offscreen 任务执行期保活心跳：仅唤醒 SW（不写 DB、不更新 lastProgressAt），
+  // 防止 SW 无活动休眠连带销毁 offscreen document
+  if (type === 'OFFSCREEN_HEARTBEAT') {
     sendResponse({ status: 'ok' });
     return true;
   }

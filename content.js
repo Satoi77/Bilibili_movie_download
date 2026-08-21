@@ -1,5 +1,7 @@
 // content.js - Bridge between page context and extension
 (function() {
+  let pageReady = false; // 页面世界的 content-page.js 是否已加载（宿主 tab 就绪判据）
+
   // Always inject page script first (non-blocking)
   if (!document.getElementById('bilibili-downloader-ext')) {
     const s = document.createElement('script');
@@ -84,7 +86,13 @@
   }
 
   // Listen for messages from background (including sidepanel via chrome.tabs.sendMessage)
-  chrome.runtime.onMessage.addListener((message) => {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    // 宿主 tab 就绪探测：仅当页面世界的 content-page.js 已加载（PAGE_READY）才算就绪，
+    // 否则 RUN_TASK 会在 content-page.js 注册监听前送达而丢失
+    if (message.type === 'HOST_PING') {
+      sendResponse(pageReady ? { status: 'ok' } : { status: 'pending' });
+      return;
+    }
     // Forward queue control messages to page context
     if (message.type === 'RUN_TASK' || message.type === 'ABORT_TASK') {
       window.postMessage({ source: 'bilibili-downloader', type: message.type, data: message.data || {} }, '*');
@@ -116,6 +124,12 @@
     if (event.data?.source !== 'bilibili-downloader') return;
 
     const { type, data } = event.data;
+
+    // content-page.js 加载完成信号：标记宿主 tab 就绪（RUN_TASK 可安全派发）
+    if (type === 'PAGE_READY') {
+      pageReady = true;
+      return;
+    }
 
     // Handle merge request - store blobs in IndexedDB, then request merge
     if (type === 'merge_request') {
