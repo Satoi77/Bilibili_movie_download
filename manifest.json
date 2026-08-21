@@ -9,7 +9,8 @@
     "sidePanel",
     "activeTab",
     "scripting",
-    "offscreen"
+    "offscreen",
+    "alarms"
   ],
   "host_permissions": [
     "*://*.bilibili.com/*",

@@ -49,9 +49,9 @@
     }
   }
 
-  async function getPlayUrl(avid, bvid, cid, qn = 80) {
+  async function getPlayUrl(avid, bvid, cid, qn = 80, signal) {
     const url = `https://api.bilibili.com/x/player/wbi/playurl?qn=${qn}&fnver=0&fnval=4048&fourk=1&avid=${avid}&bvid=${bvid}&cid=${cid}`;
-    const r = await fetch(url, {credentials:'include'});
+    const r = await fetchWithTimeout(url, {credentials:'include'}, 30000, signal);
     const d = await r.json();
     if (d.code !== 0) return null;
     return d.data;
@@ -155,30 +155,102 @@
     return bytes+'B';
   }
 
+  // ─── Timeout / abort helpers ───
+
+  async function fetchWithTimeout(url, options, ms, signal) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    const onOuterAbort = () => ctrl.abort();
+    if (signal) signal.addEventListener('abort', onOuterAbort, { once: true });
+    try {
+      return await fetch(url, { ...(options || {}), signal: ctrl.signal });
+    } catch (e) {
+      if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+      if (e && e.name === 'AbortError') throw new Error('请求超时');
+      throw e;
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onOuterAbort);
+    }
+  }
+
+  function readWithTimeout(reader, ms, signal) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('读取超时')), ms);
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(new DOMException('aborted', 'AbortError'));
+      };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      reader.read().then(
+        (v) => {
+          clearTimeout(timer);
+          if (signal) signal.removeEventListener('abort', onAbort);
+          resolve(v);
+        },
+        (e) => {
+          clearTimeout(timer);
+          if (signal) signal.removeEventListener('abort', onAbort);
+          if (signal?.aborted) reject(new DOMException('aborted', 'AbortError'));
+          else reject(e);
+        }
+      );
+    });
+  }
+
+  async function fetchSettings() {
+    try {
+      return await new Promise((resolve) => {
+        notify('GET_SETTINGS');
+        const handler = (e) => {
+          if (e.data?.source === 'bilibili-downloader' && e.data.type === 'settings_result') {
+            window.removeEventListener('message', handler);
+            resolve(e.data.data || {});
+          }
+        };
+        window.addEventListener('message', handler);
+        setTimeout(() => { window.removeEventListener('message', handler); resolve({}); }, 3000);
+      });
+    } catch (e) { return {}; }
+  }
+
   // ─── Download with progress ───
-  async function downloadBlob(url, taskId, phase, label) {
-    const r = await fetch(url);
+  // 进度消息按 1% 粒度节流，避免刷爆后台/侧栏
+  async function downloadBlob(url, taskId, phase, label, signal) {
+    const r = await fetchWithTimeout(url, {}, 60000, signal);
     if (!r.ok) throw new Error(`${label} HTTP ${r.status}`);
     
     const total = parseInt(r.headers.get('content-length') || '0');
     const reader = r.body.getReader();
     const chunks = [];
     let received = 0;
+    let lastSent = -1;
     
     while (true) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      received += value.length;
+      if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+      let res;
+      try {
+        res = await readWithTimeout(reader, 30000, signal);
+      } catch (e) {
+        if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+        throw e;
+      }
+      if (res.done) break;
+      chunks.push(res.value);
+      received += res.value.length;
       
       const percent = total > 0 ? Math.round(received / total * 100) : -1;
-      notify('download_progress', {
-        taskId, phase, percent,
-        received, total,
-        label
-      });
+      if (percent !== lastSent) {
+        lastSent = percent;
+        notify('download_progress', {
+          taskId, phase, percent,
+          received, total,
+          label
+        });
+      }
     }
     
+    if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
     return new Blob(chunks);
   }
 
@@ -437,7 +509,7 @@
     return ffmpegBridge;
   }
 
-  async function mergeWithFFmpeg(audioBlob, videoBlob) {
+  async function mergeWithFFmpeg(audioBlob, videoBlob, taskId) {
     const ffmpeg = await getFFmpeg();
 
     const tag = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
@@ -449,8 +521,17 @@
     await ffmpeg.writeFile(audioPath, new Uint8Array(await audioBlob.arrayBuffer()));
     await ffmpeg.writeFile(videoPath, new Uint8Array(await videoBlob.arrayBuffer()));
 
+    // 合并期间发送心跳，避免后台停滞检测误判
+    const heartbeat = setInterval(() => {
+      notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '合并中' });
+    }, 20000);
+
     // 合并（直接 copy 流，无重编码）
-    await ffmpeg.run(['-i', videoPath, '-i', audioPath, '-vcodec', 'copy', '-acodec', 'copy', outputPath]);
+    try {
+      await ffmpeg.run(['-i', videoPath, '-i', audioPath, '-vcodec', 'copy', '-acodec', 'copy', outputPath]);
+    } finally {
+      clearInterval(heartbeat);
+    }
     const merged = await ffmpeg.readFile(outputPath);
 
     // 清理临时文件
@@ -469,28 +550,55 @@
     }
   }, true);
 
-  // ─── Single video download ───
-  async function downloadSingleVideo(videoInfo, qualityIdx, existingTaskId, collectionName) {
-    const taskId = existingTaskId || ('task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6));
-    const title = videoInfo.title;
-    
-    // 获取设置
-    let settings = {};
+  // ─── Queue-mode task execution ───
+  // 后台队列把 RUN_TASK 派发给本页面执行；本页面按 taskId 独立跑下载，
+  // 结束后回报 TASK_DONE / TASK_ERROR / TASK_ABORTED。
+
+  const activeTaskControllers = new Map();
+
+  window.addEventListener('message', (e) => {
+    if (e.data?.source !== 'bilibili-downloader') return;
+    if (e.data.type === 'RUN_TASK') {
+      const { taskId, videoInfo, qualityIdx } = e.data.data || {};
+      if (taskId && videoInfo) runQueuedTask(taskId, videoInfo, qualityIdx || 0);
+    } else if (e.data.type === 'ABORT_TASK') {
+      abortTask((e.data.data || {}).taskId);
+    }
+  });
+
+  function abortTask(taskId) {
+    const c = activeTaskControllers.get(taskId);
+    if (c) { try { c.abort(); } catch (e) {} }
+  }
+
+  async function runQueuedTask(taskId, videoInfo, qualityIdx) {
+    const controller = new AbortController();
+    activeTaskControllers.set(taskId, controller);
     try {
-      settings = await new Promise((resolve) => {
-        notify('GET_SETTINGS');
-        const handler = (e) => {
-          if (e.data?.source === 'bilibili-downloader' && e.data.type === 'settings_result') {
-            window.removeEventListener('message', handler);
-            resolve(e.data.data || {});
-          }
-        };
-        window.addEventListener('message', handler);
-        setTimeout(() => { window.removeEventListener('message', handler); resolve({}); }, 3000);
-      });
-    } catch(e) {}
+      await executeDownload(taskId, videoInfo, qualityIdx || 0, controller.signal);
+      if (controller.signal.aborted) {
+        notify('TASK_ABORTED', { taskId });
+      } else {
+        notify('TASK_DONE', { taskId });
+      }
+    } catch (e) {
+      if (controller.signal.aborted) {
+        notify('TASK_ABORTED', { taskId });
+      } else {
+        console.error('[B站下载助手] Task failed:', taskId, e);
+        notify('TASK_ERROR', { taskId, error: e.message });
+      }
+    } finally {
+      activeTaskControllers.delete(taskId);
+    }
+  }
+
+  // ─── Execute a single download ───
+  async function executeDownload(taskId, videoInfo, qualityIdx, signal) {
+    const title = videoInfo.title;
+    const settings = await fetchSettings();
     
-    const data = await getPlayUrl(videoInfo.aid, videoInfo.bvid, videoInfo.cid, 80);
+    const data = await getPlayUrl(videoInfo.aid, videoInfo.bvid, videoInfo.cid, 80, signal);
     if (!data?.dash) {
       console.error('[B站下载助手] getPlayUrl returned null or no dash:', data);
       throw new Error('获取播放地址失败');
@@ -510,77 +618,58 @@
     const bestAudio = data.dash.audio[0];
     
     const label = QMAP[q] || q + 'P';
+    notify('download_progress', { taskId, phase: 'quality', percent: 0, label });
     
-    notify('download_start', {
-      taskId, title, quality: label, bvid: videoInfo.bvid,
-      videoUrl: bestVideo.baseUrl, audioUrl: bestAudio.baseUrl,
-      videoSize: bestVideo.size || 0, audioSize: bestAudio.size || 0
-    });
+    if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
     
-    try {
-      // Download audio + video in memory
-      notify('download_progress', { taskId, phase: 'download', percent: 0, label: '下载中' });
-      
-      const [audioBlob, videoBlob] = await Promise.all([
-        downloadBlob(bestAudio.baseUrl, taskId, 'audio', '音频'),
-        downloadBlob(bestVideo.baseUrl, taskId, 'video', '视频')
-      ]);
-      
-      notify('download_progress', { taskId, phase: 'download', percent: 100, label: '下载完成' });
-      
-      const safeTitle = sanitizeFilename(title);
-      const baseSubdir = DOWNLOAD_BASE;
-      let rawSaved = false;
-      
-      // 如果开启了保存原始文件，先保存
-      if (settings.saveRawFiles) {
-        try {
-          notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
-          await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
-          rawSaved = true;
-        } catch(e) {
-          console.warn('[B站下载助手] 保存原始文件失败:', e);
-        }
-      }
-      
-      // 尝试 FFmpeg 合并
+    // Download audio + video in memory
+    notify('download_progress', { taskId, phase: 'download', percent: 0, label: '下载中' });
+    
+    const [audioBlob, videoBlob] = await Promise.all([
+      downloadBlob(bestAudio.baseUrl, taskId, 'audio', '音频', signal),
+      downloadBlob(bestVideo.baseUrl, taskId, 'video', '视频', signal)
+    ]);
+    
+    if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+    
+    notify('download_progress', { taskId, phase: 'download', percent: 100, label: '下载完成' });
+    
+    const safeTitle = sanitizeFilename(title);
+    const baseSubdir = DOWNLOAD_BASE;
+    let rawSaved = false;
+    
+    // 如果开启了保存原始文件，先保存
+    if (settings.saveRawFiles) {
       try {
-        notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '合并中' });
-        const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob);
-        downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`, baseSubdir);
-        notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
-      } catch(mergeError) {
-        console.error('[B站下载助手] FFmpeg 合并失败:', mergeError);
-        // 合并失败且未保存过原始文件 → 兜底保存
-        if (!rawSaved) {
-          try {
-            await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
-          } catch(e) {
-            console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
-          }
-        }
-        // 生成 merge.txt 合并说明
-        try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
-        throw new Error('合并失败: ' + mergeError.message);
-      }
-      
-      notify('download_complete', { taskId });
-    } catch(e) {
-      notify('download_error', { taskId: taskId || 'unknown', error: e.message });
-    }
-  }
-
-  // ─── Batch download ───
-  async function downloadBatch(videoList, qualityIdx) {
-    for (const v of videoList) {
-      try {
-        await downloadSingleVideo(v, qualityIdx);
-        // Random delay between tasks
-        const delay = 3000 + Math.random() * 9000;
-        await new Promise(r => setTimeout(r, delay));
+        notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
+        await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
+        rawSaved = true;
       } catch(e) {
-        console.error('[B站下载助手] Batch error:', v.title, e);
+        console.warn('[B站下载助手] 保存原始文件失败:', e);
       }
+    }
+    
+    // 尝试 FFmpeg 合并
+    try {
+      notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '合并中' });
+      const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, taskId);
+      if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+      await downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`, baseSubdir);
+      notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
+    } catch(mergeError) {
+      console.error('[B站下载助手] FFmpeg 合并失败:', mergeError);
+      if (signal?.aborted) throw mergeError;
+      // 合并失败且未保存过原始文件 → 兜底保存
+      if (!rawSaved) {
+        try {
+          await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
+        } catch(e) {
+          console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
+        }
+      }
+      // 生成 merge.txt 合并说明
+      try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
+      throw new Error('合并失败: ' + mergeError.message);
     }
   }
 
@@ -753,81 +842,17 @@
         hidePanel();
         
         const taskId = 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
-        const label = opt.label;
-        
-        // 获取设置
-        let settings = {};
-        try {
-          settings = await new Promise((resolve) => {
-            notify('GET_SETTINGS');
-            const handler = (e) => {
-              if (e.data?.source === 'bilibili-downloader' && e.data.type === 'settings_result') {
-                window.removeEventListener('message', handler);
-                resolve(e.data.data || {});
-              }
-            };
-            window.addEventListener('message', handler);
-            setTimeout(() => { window.removeEventListener('message', handler); resolve({}); }, 3000);
-          });
-        } catch(e) {}
-        
-        try {
-          notify('download_start', {
-            taskId, title: info.title, quality: opt.label, bvid: info.bvid,
-            videoUrl: opt.videoUrl, audioUrl: opt.audioUrl,
-            videoSize: opt.videoSize, audioSize: opt.audioSize
-          });
-          
-          // Download audio + video in memory
-          notify('download_progress', { taskId, phase: 'download', percent: 0, label: '下载中' });
-          
-          const [audioBlob, videoBlob] = await Promise.all([
-            downloadBlob(opt.audioUrl, taskId, 'audio', '音频'),
-            downloadBlob(opt.videoUrl, taskId, 'video', '视频')
-          ]);
-          
-          notify('download_progress', { taskId, phase: 'download', percent: 100, label: '下载完成' });
-          
-          const safeTitle = sanitizeFilename(info.title);
-          const baseSubdir = DOWNLOAD_BASE;
-          let rawSaved = false;
-          
-          // 如果开启了保存原始文件，先保存
-          if (settings.saveRawFiles) {
-            try {
-              notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
-              await saveRawToSubdir(audioBlob, videoBlob, info.title, baseSubdir);
-              rawSaved = true;
-            } catch(e) {
-              console.warn('[B站下载助手] 保存原始文件失败:', e);
-            }
+        notify('ENQUEUE_TASK', {
+          task: {
+            taskId,
+            title: info.title,
+            bvid: info.bvid,
+            aid: info.aid,
+            cid: info.cid,
+            quality: opt.label,
+            qualityIdx: idx
           }
-          
-          // 尝试 FFmpeg 合并
-          try {
-            notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '合并中' });
-            const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob);
-            downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`, baseSubdir);
-            notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
-          } catch(mergeError) {
-            console.error('[B站下载助手] FFmpeg 合并失败:', mergeError);
-            // 合并失败且未保存过原始文件 → 兜底保存
-            if (!rawSaved) {
-              try {
-                await saveRawToSubdir(audioBlob, videoBlob, info.title, baseSubdir);
-              } catch(e) {
-                console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
-              }
-            }
-            // 生成 merge.txt 合并说明
-            try { await saveMergeTxt(info.title, baseSubdir); } catch(e) {}
-            throw new Error('合并失败: ' + mergeError.message);
-          }
-          
-          notify('download_complete', { taskId });
-        } catch(e) {
-          notify('download_error', { taskId: taskId || 'unknown', error: e.message });
-        }
+        });
       });
       
     } catch(e) {
@@ -924,33 +949,19 @@
           return;
         }
         
-        // Step 2: Pre-create ALL tasks in sidebar (one by one with short delay)
-        for (const info of taskInfos) {
-          notify('task_precreate', { taskId: info.taskId, title: info.title, bvid: info.bvid });
-          await new Promise(r => setTimeout(r, 200));
-        }
-        
-        console.log('[B站下载助手] All', taskInfos.length, 'tasks pre-created');
-        
-        // Step 3: Download sequentially
-        for (let i = 0; i < taskInfos.length; i++) {
-          const info = taskInfos[i];
-          console.log(`[B站下载助手] Batch ${i+1}/${taskInfos.length}: ${info.title}`);
-          try {
-            await downloadSingleVideo(info, 0, info.taskId, collectionName);
-            console.log('[B站下载助手] Download complete:', info.title);
-          } catch(e) {
-            console.error('[B站下载助手] Batch error:', info.title, e);
-          }
-          // Random delay between downloads (skip after last)
-          if (i < taskInfos.length - 1) {
-            const delay = 3000 + Math.random() * 9000;
-            const sec = Math.round(delay / 1000);
-            console.log('[B站下载助手] Waiting', sec + 's before next...');
-            await new Promise(r => setTimeout(r, delay));
-          }
-        }
-        console.log('[B站下载助手] Batch finished');
+        // Step 2: Enqueue all tasks to background queue (background dispatches one by one)
+        notify('ENQUEUE_TASKS', {
+          tasks: taskInfos.map(info => ({
+            taskId: info.taskId,
+            title: info.title,
+            bvid: info.bvid,
+            aid: info.aid,
+            cid: info.cid,
+            quality: '等待中',
+            qualityIdx: 0
+          }))
+        });
+        console.log('[B站下载助手] Enqueued', taskInfos.length, 'tasks to background queue');
       });
       
     } catch(e) {

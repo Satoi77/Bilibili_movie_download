@@ -3,6 +3,11 @@
 
 let tasks = [];
 
+// ─── Icons ───
+
+const ICON_PLAY = '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
+const ICON_PAUSE = '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>';
+
 // ─── Unified Messaging Helpers ───
 
 function msg(type, data = {}) {
@@ -37,6 +42,7 @@ function fmtTime(iso) {
 function getStatusText(task) {
   switch(task.status) {
     case 'downloading': return '下载中';
+    case 'pending': return '等待中';
     case 'completed': return '已完成';
     case 'failed': return '失败';
     case 'paused': return '已暂停';
@@ -47,6 +53,7 @@ function getStatusText(task) {
 function getStatusColor(task) {
   switch(task.status) {
     case 'downloading': return '#00a1d6';
+    case 'pending': return '#9e9e9e';
     case 'completed': return '#4caf50';
     case 'failed': return '#f44336';
     case 'paused': return '#ff9800';
@@ -78,22 +85,49 @@ function showConfirm(msg) {
 
 // ─── Render ───
 
+// 进度更新很频繁，合并 50ms 内的多次渲染请求
+let renderTimer = null;
+function scheduleRender() {
+  if (renderTimer) return;
+  renderTimer = setTimeout(() => { renderTimer = null; renderTasks(); }, 50);
+}
+
 function renderTasks() {
   const downloading = tasks.filter(t => t.status === 'downloading');
+  const active = tasks.filter(t => ['pending', 'downloading', 'paused', 'failed'].includes(t.status));
   const completed = tasks.filter(t => t.status === 'completed').sort((a, b) => (b.completedAt || b.createdAt || '').localeCompare(a.completedAt || a.createdAt || ''));
   const failed = tasks.filter(t => t.status === 'failed');
   
-  document.getElementById('downloading-count').textContent = downloading.length + failed.length;
+  document.getElementById('downloading-count').textContent = active.length;
   document.getElementById('completed-count').textContent = completed.length;
   
-  // Downloading/failed list
-  const dlList = document.getElementById('downloading-list');
-  const activeTasks = [...downloading, ...failed];
+  // 全部停止/继续按钮状态
+  const toggleBtn = document.getElementById('toggle-all');
+  if (toggleBtn) {
+    const hasRunning = downloading.length > 0 || tasks.some(t => t.status === 'pending');
+    const hasPaused = tasks.some(t => t.status === 'paused');
+    if (hasRunning) {
+      toggleBtn.textContent = '全部停止';
+      toggleBtn.dataset.action = 'stop';
+      toggleBtn.disabled = false;
+    } else if (hasPaused) {
+      toggleBtn.textContent = '全部继续';
+      toggleBtn.dataset.action = 'start';
+      toggleBtn.disabled = false;
+    } else {
+      toggleBtn.textContent = '全部停止';
+      toggleBtn.dataset.action = 'stop';
+      toggleBtn.disabled = true;
+    }
+  }
   
-  if (activeTasks.length === 0) {
+  // Downloading/pending/paused/failed list
+  const dlList = document.getElementById('downloading-list');
+  
+  if (active.length === 0) {
     dlList.innerHTML = '<div class="empty-state">暂无下载任务<br><span style="font-size:12px;color:#bbb;">在视频页面点击下载按钮开始</span></div>';
   } else {
-    dlList.innerHTML = activeTasks.map(t => {
+    dlList.innerHTML = active.map(t => {
       const audioP = t.progress?.audio || 0;
       const videoP = t.progress?.video || 0;
       const mergeP = t.progress?.merge || 0;
@@ -101,18 +135,25 @@ function renderTasks() {
                       t.status === 'failed' ? 0 : 
                       mergeP > 0 ? Math.round(90 + mergeP * 0.1) :
                       Math.round((audioP + videoP) / 2);
-      const phaseLabel = mergeP > 0 ? '合并中' : '下载中';
+      let phaseLabel = '下载中';
+      if (t.status === 'pending') phaseLabel = '等待中';
+      else if (t.status === 'paused') phaseLabel = '已暂停';
+      else if (t.status === 'failed') phaseLabel = '—';
+      else if (mergeP > 0) phaseLabel = '合并中';
+      
+      const isStop = t.status === 'downloading';
+      const controlIcon = isStop ? ICON_PAUSE : ICON_PLAY;
       
       return `
         <div class="task-card ${t.status}">
           <div class="task-header-row">
             <div class="task-title" title="${t.title}">${t.title}</div>
+            <button class="btn-task-control ${isStop ? 'stop' : 'start'}" data-id="${t.id}" data-action="${isStop ? 'stop' : 'start'}" title="${isStop ? '停止' : '开始'}">${controlIcon}</button>
             <button class="btn-delete-task" data-id="${t.id}" title="删除">&times;</button>
           </div>
           <div class="task-meta">
             <span class="task-quality">${t.quality || ''}</span>
             <span class="task-status" style="color:${getStatusColor(t)}">${getStatusText(t)}</span>
-            ${t.delayMessage ? `<span class="task-delay" style="color:#ff9800;margin-left:8px;font-size:12px;">${t.delayMessage}</span>` : ''}
             ${t.error ? `<span class="task-error" title="${t.error}">(${t.error})</span>` : ''}
           </div>
           <div class="task-progress-section">
@@ -127,6 +168,19 @@ function renderTasks() {
         </div>
       `;
     }).join('');
+    
+    dlList.querySelectorAll('.btn-task-control').forEach(btn => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        const id = btn.getAttribute('data-id');
+        const action = btn.getAttribute('data-action');
+        if (action === 'stop') {
+          await msg('STOP_TASK', { taskId: id });
+        } else {
+          await msg('RESUME_TASK', { taskId: id });
+        }
+      };
+    });
     
     dlList.querySelectorAll('.btn-delete-task').forEach(btn => {
       btn.onclick = async (e) => {
@@ -207,7 +261,7 @@ chrome.runtime.onMessage.addListener((message) => {
     if (!tasks.find(t => t.id === message.data.id)) {
       tasks.push(message.data);
     }
-    renderTasks();
+    scheduleRender();
   }
   
   if (message.type === 'TASK_UPDATED') {
@@ -217,11 +271,36 @@ chrome.runtime.onMessage.addListener((message) => {
     } else {
       tasks.push(message.data);
     }
-    renderTasks();
+    scheduleRender();
   }
   
   if (message.type === 'TASK_REMOVED') {
     tasks = tasks.filter(t => t.id !== message.data.taskId);
+    scheduleRender();
+  }
+});
+
+// ─── Batch Controls ───
+
+document.getElementById('toggle-all')?.addEventListener('click', async () => {
+  const btn = document.getElementById('toggle-all');
+  const action = btn?.dataset.action;
+  if (action === 'stop') {
+    await msg('STOP_ALL');
+  } else {
+    await msg('RESUME_ALL');
+  }
+  const result = await msg('GET_TASKS');
+  tasks = result?.tasks || [];
+  renderTasks();
+});
+
+document.getElementById('delete-all')?.addEventListener('click', async () => {
+  if (tasks.length === 0) return;
+  if (await showConfirm(`确定删除全部 ${tasks.length} 个任务？此操作不可撤销。`)) {
+    await msg('DELETE_ALL');
+    const result = await msg('GET_TASKS');
+    tasks = result?.tasks || [];
     renderTasks();
   }
 });

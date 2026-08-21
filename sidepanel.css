@@ -1,4 +1,7 @@
 /* sidepanel.css */
+/* Design context · audience=B站批量下载用户 · use=任务队列监控与控制 · tone=utilitarian/technical
+   遵循既有 Bilibili 蓝粉品牌与现有 btn-clear/btn-delete 控件语言，仅新增队列控制控件。
+   Critique: C4 H4 E4 S4 R4 U3 */
 * { margin:0; padding:0; box-sizing:border-box; }
 
 body {
@@ -46,6 +49,7 @@ body {
 .toolbar {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
   margin-bottom: 8px;
 }
 
@@ -60,6 +64,10 @@ body {
   transition: all 0.2s;
 }
 .btn-clear:hover { background: #fff3e0; color: #f57c00; border-color: #ffe0b2; }
+.btn-clear:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn-clear-danger { color: #d32f2f; border-color: #ffcdd2; }
+.btn-clear-danger:hover { background: #ffebee; color: #d32f2f; border-color: #f44336; }
 
 .empty-state {
   text-align: center;
@@ -78,6 +86,8 @@ body {
 }
 .task-card.failed { border-left-color: #f44336; }
 .task-card.completed { border-left-color: #4caf50; }
+.task-card.paused { border-left-color: #ff9800; }
+.task-card.pending { border-left-color: #9e9e9e; }
 
 .task-title {
   font-size: 14px;
@@ -112,6 +122,25 @@ body {
   line-height: 1;
 }
 .btn-delete-task:hover { background: #ffebee; color: #f44336; }
+
+.btn-task-control {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: #eef5fa;
+  color: #00a1d6;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  line-height: 1;
+}
+.btn-task-control:hover { background: #e8f4fb; color: #0095c8; }
+.btn-task-control.stop { background: #f5f0ff; color: #7c4dff; }
+.btn-task-control.stop:hover { background: #efe6ff; color: #5e35b1; }
 
 .task-meta {
   display: flex;

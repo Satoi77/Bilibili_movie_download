@@ -85,6 +85,11 @@
 
   // Listen for messages from background (including sidepanel via chrome.tabs.sendMessage)
   chrome.runtime.onMessage.addListener((message) => {
+    // Forward queue control messages to page context
+    if (message.type === 'RUN_TASK' || message.type === 'ABORT_TASK') {
+      window.postMessage({ source: 'bilibili-downloader', type: message.type, data: message.data || {} }, '*');
+      return;
+    }
     if (message.type === 'offscreen_merge_result') {
       const { taskId, success, error } = message.data;
       const cb = pendingMerges.get(taskId);
