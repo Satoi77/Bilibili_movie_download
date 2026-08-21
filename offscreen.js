@@ -1,4 +1,7 @@
-// offscreen.js - FFmpeg merge in offscreen document (MV3)
+// offscreen.js - 后台下载执行（主）+ FFmpeg 合并（保留）
+import { executeTask } from './lib/download-core.js';
+
+// ─── FFmpeg 合并（原有，依赖 lib/ffmpeg.js + FFmpegWASM 全局）───
 let ffmpegInstance = null;
 let loadPromise = null;
 
@@ -101,14 +104,207 @@ async function mergeWithFFmpeg(taskId) {
   await ffmpeg.deleteFile('video.m4s');
   await ffmpeg.deleteFile('output.mp4');
 
-  // Cleanup source blobs from DB
   await deleteBlobFromDB(taskId + '_audio');
   await deleteBlobFromDB(taskId + '_video');
 
   return result.buffer;
 }
 
+// ─── 下载执行引擎（FFmpegBridge，Blob URL Worker）───
+const Op = {
+  LOAD: 'LOAD', EXEC: 'EXEC',
+  WRITE_FILE: 'WRITE_FILE', READ_FILE: 'READ_FILE',
+  DELETE_FILE: 'DELETE_FILE',
+  ERROR: 'ERROR', LOG: 'LOG', PROGRESS: 'PROGRESS'
+};
+const RESULT_OPS = new Set([Op.LOAD, Op.EXEC, Op.WRITE_FILE, Op.READ_FILE, Op.DELETE_FILE]);
+
+let nextMsgId = 0;
+
+class FFmpegBridge {
+  #worker = null;
+  #pending = {};
+  #logHandlers = [];
+  #progressHandlers = [];
+  ready = false;
+
+  constructor(worker) {
+    this.#worker = worker;
+    this.#attachReceiver();
+  }
+
+  #attachReceiver() {
+    this.#worker.onmessage = ({ data: { id, type, data } }) => {
+      if (type === Op.LOG) {
+        this.#logHandlers.forEach(fn => fn(data));
+        return;
+      }
+      if (type === Op.PROGRESS) {
+        this.#progressHandlers.forEach(fn => fn(data));
+        return;
+      }
+      const p = this.#pending[id];
+      if (!p) return;
+      delete this.#pending[id];
+      if (type === Op.ERROR) {
+        p.reject(new Error(data));
+      } else if (RESULT_OPS.has(type)) {
+        if (type === Op.LOAD) this.ready = true;
+        p.resolve(data);
+      }
+    };
+  }
+
+  #send(type, payload, transferable) {
+    return new Promise((resolve, reject) => {
+      const id = nextMsgId++;
+      this.#pending[id] = { resolve, reject };
+      this.#worker.postMessage({ id, type, data: payload }, transferable || []);
+    });
+  }
+
+  on(event, handler) {
+    if (event === 'log') this.#logHandlers.push(handler);
+    else if (event === 'progress') this.#progressHandlers.push(handler);
+  }
+
+  load(opts) {
+    return this.#send(Op.LOAD, opts);
+  }
+
+  run(args, timeout) {
+    return this.#send(Op.EXEC, { args, timeout: timeout ?? -1 });
+  }
+
+  writeFile(path, data) {
+    const xfer = data instanceof Uint8Array ? [data.buffer] : [];
+    return this.#send(Op.WRITE_FILE, { path, data }, xfer);
+  }
+
+  readFile(path, encoding) {
+    return this.#send(Op.READ_FILE, { path, encoding });
+  }
+
+  deleteFile(path) {
+    return this.#send(Op.DELETE_FILE, { path });
+  }
+
+  destroy() {
+    if (this.#worker) {
+      this.#worker.terminate();
+      this.#worker = null;
+      this.ready = false;
+    }
+  }
+}
+
+let ffmpegBridge = null;
+
+async function toBlobURL(resourceURL, mimeType) {
+  const res = await fetch(resourceURL);
+  if (!res.ok) throw new Error('fetch 失败: ' + resourceURL + ' HTTP ' + res.status);
+  const buf = await res.arrayBuffer();
+  return URL.createObjectURL(new Blob([buf], { type: mimeType }));
+}
+
+async function createFFmpeg() {
+  if (ffmpegBridge?.ready) return ffmpegBridge;
+
+  const workerBlobURL = await toBlobURL(chrome.runtime.getURL('lib/ffmpeg.worker.js'), 'text/javascript');
+  const worker = new Worker(workerBlobURL);
+  ffmpegBridge = new FFmpegBridge(worker);
+
+  ffmpegBridge.on('log', ({ message }) => {
+    if (message) console.log('[FFmpeg Offscreen]', message);
+  });
+
+  await ffmpegBridge.load({
+    coreURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.js'), 'text/javascript'),
+    wasmURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.wasm'), 'application/wasm'),
+    workerURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.worker.js'), 'text/javascript')
+  });
+
+  console.log('[B站下载助手] offscreen FFmpeg WASM 初始化完成');
+  return ffmpegBridge;
+}
+
+// ─── 后台任务执行 ───
+const activeTaskControllers = new Map();
+
+function sendToBg(message) {
+  chrome.runtime.sendMessage(message).catch(() => {});
+}
+
+function notify(taskId, payload) {
+  sendToBg({ type: 'OFFSCREEN_PROGRESS', data: { taskId, ...payload } });
+}
+
+async function getSettings() {
+  try {
+    return (await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' })) || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+async function saveBlob(blob, filename, subdir) {
+  const buffer = await blob.arrayBuffer();
+  const blobUrl = URL.createObjectURL(new Blob([buffer], { type: blob.type || 'application/octet-stream' }));
+  try {
+    const result = await chrome.runtime.sendMessage({
+      type: 'SAVE_FILE',
+      data: { url: blobUrl, path: subdir ? subdir + '/' + filename : filename }
+    });
+    if (!result?.success) throw new Error(result?.error || '保存失败');
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+  }
+}
+
+async function runOffscreenTask(taskId, videoInfo, qualityIdx) {
+  const controller = new AbortController();
+  activeTaskControllers.set(taskId, controller);
+  try {
+    await executeTask(taskId, videoInfo, qualityIdx, {
+      getSettings,
+      getFFmpeg: createFFmpeg,
+      notify: (payload) => notify(taskId, payload),
+      saveBlob,
+      signal: controller.signal
+    });
+    sendToBg({ type: 'OFFSCREEN_TASK_DONE', data: { taskId } });
+  } catch (e) {
+    if (controller.signal.aborted) {
+      sendToBg({ type: 'OFFSCREEN_TASK_ABORTED', data: { taskId } });
+    } else if (e.code === 'NEEDS_PAGE') {
+      sendToBg({ type: 'OFFSCREEN_NEEDS_PAGE', data: { taskId } });
+    } else {
+      console.error('[B站下载助手] Offscreen task failed:', taskId, e);
+      sendToBg({ type: 'OFFSCREEN_TASK_ERROR', data: { taskId, error: e.message } });
+    }
+  } finally {
+    activeTaskControllers.delete(taskId);
+  }
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'OFFSCREEN_PING') {
+    sendResponse({ status: 'ok' });
+    return false;
+  }
+
+  if (message.type === 'OFFSCREEN_RUN_TASK') {
+    const { taskId, videoInfo, qualityIdx } = message.data || {};
+    if (taskId && videoInfo) runOffscreenTask(taskId, videoInfo, qualityIdx || 0);
+    return false;
+  }
+
+  if (message.type === 'OFFSCREEN_ABORT_TASK') {
+    const c = activeTaskControllers.get((message.data || {}).taskId);
+    if (c) { try { c.abort(); } catch (e) {} }
+    return false;
+  }
+
   if (message.type === 'offscreen_merge_request') {
     const { taskId } = message.data;
 
@@ -132,4 +328,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     return false;
   }
+
+  return false;
 });
