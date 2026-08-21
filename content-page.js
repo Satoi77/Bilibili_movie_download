@@ -500,6 +500,22 @@
     const taskId = existingTaskId || ('task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6));
     const title = videoInfo.title;
     
+    // 获取设置
+    let settings = {};
+    try {
+      settings = await new Promise((resolve) => {
+        notify('GET_SETTINGS');
+        const handler = (e) => {
+          if (e.data?.source === 'bilibili-downloader' && e.data.type === 'settings_result') {
+            window.removeEventListener('message', handler);
+            resolve(e.data.data || {});
+          }
+        };
+        window.addEventListener('message', handler);
+        setTimeout(() => { window.removeEventListener('message', handler); resolve({}); }, 3000);
+      });
+    } catch(e) {}
+    
     const data = await getPlayUrl(videoInfo.aid, videoInfo.bvid, videoInfo.cid, 80);
     if (!data?.dash) {
       console.error('[B站下载助手] getPlayUrl returned null or no dash:', data);
@@ -538,12 +554,38 @@
       
       notify('download_progress', { taskId, phase: 'download', percent: 100, label: '下载完成' });
       
-      // Merge into single mp4
-      notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '合并中' });
-      const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob);
       const safeTitle = sanitizeFilename(title);
-      saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`);
-      notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
+      let rawSaved = false;
+      
+      // 如果开启了保存原始文件，先保存
+      if (settings.saveRawFiles) {
+        try {
+          notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
+          await saveRawToSubdir(audioBlob, videoBlob, title, label);
+          rawSaved = true;
+        } catch(e) {
+          console.warn('[B站下载助手] 保存原始文件失败:', e);
+        }
+      }
+      
+      // 尝试 FFmpeg 合并
+      try {
+        notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '合并中' });
+        const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob);
+        saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`);
+        notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
+      } catch(mergeError) {
+        console.error('[B站下载助手] FFmpeg 合并失败:', mergeError);
+        // 合并失败且未保存过原始文件 → 兜底保存
+        if (!rawSaved) {
+          try {
+            await saveRawToSubdir(audioBlob, videoBlob, title, label);
+          } catch(e) {
+            console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
+          }
+        }
+        throw new Error('合并失败: ' + mergeError.message);
+      }
       
       notify('download_complete', { taskId });
     } catch(e) {
@@ -733,6 +775,22 @@
         const taskId = 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
         const label = opt.label;
         
+        // 获取设置
+        let settings = {};
+        try {
+          settings = await new Promise((resolve) => {
+            notify('GET_SETTINGS');
+            const handler = (e) => {
+              if (e.data?.source === 'bilibili-downloader' && e.data.type === 'settings_result') {
+                window.removeEventListener('message', handler);
+                resolve(e.data.data || {});
+              }
+            };
+            window.addEventListener('message', handler);
+            setTimeout(() => { window.removeEventListener('message', handler); resolve({}); }, 3000);
+          });
+        } catch(e) {}
+        
         try {
           notify('download_start', {
             taskId, title: info.title, quality: opt.label, bvid: info.bvid,
@@ -750,12 +808,38 @@
           
           notify('download_progress', { taskId, phase: 'download', percent: 100, label: '下载完成' });
           
-          // Merge into single mp4
-          notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '合并中' });
-          const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob);
           const safeTitle = sanitizeFilename(info.title);
-          saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`);
-          notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
+          let rawSaved = false;
+          
+          // 如果开启了保存原始文件，先保存
+          if (settings.saveRawFiles) {
+            try {
+              notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
+              await saveRawToSubdir(audioBlob, videoBlob, info.title, label);
+              rawSaved = true;
+            } catch(e) {
+              console.warn('[B站下载助手] 保存原始文件失败:', e);
+            }
+          }
+          
+          // 尝试 FFmpeg 合并
+          try {
+            notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '合并中' });
+            const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob);
+            saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`);
+            notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
+          } catch(mergeError) {
+            console.error('[B站下载助手] FFmpeg 合并失败:', mergeError);
+            // 合并失败且未保存过原始文件 → 兜底保存
+            if (!rawSaved) {
+              try {
+                await saveRawToSubdir(audioBlob, videoBlob, info.title, label);
+              } catch(e) {
+                console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
+              }
+            }
+            throw new Error('合并失败: ' + mergeError.message);
+          }
           
           notify('download_complete', { taskId });
         } catch(e) {
