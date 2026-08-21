@@ -176,6 +176,19 @@
       return;
     }
 
+    // Handle SAVE_RAW_FILES - batch save multiple files
+    if (type === 'SAVE_RAW_FILES') {
+      const { requestId, files } = data;
+      chrome.runtime.sendMessage({ type: 'SAVE_RAW_FILES', data: { files } }, (result) => {
+        if (chrome.runtime.lastError) {
+          window.postMessage({ source: 'bilibili-downloader', type: 'save_raw_result', data: { requestId, success: false, error: chrome.runtime.lastError.message } }, '*');
+          return;
+        }
+        window.postMessage({ source: 'bilibili-downloader', type: 'save_raw_result', data: { requestId, success: true, results: result?.results } }, '*');
+      });
+      return;
+    }
+
     // Handle DELETE_FILE
     if (type === 'DELETE_FILE') {
       chrome.runtime.sendMessage({ type: 'DELETE_FILE', data }, () => {});
