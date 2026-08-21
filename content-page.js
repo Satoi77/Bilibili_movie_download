@@ -229,11 +229,12 @@
     return name.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').substring(0, 200);
   }
 
-  // ─── FFmpeg (in page context, bypassing CSP via Blob URLs) ───
-  let ffmpegCache = null; // { instance, blobURLs }
-  let ffmpegURLs = {}; // received from content.js via postMessage
+  // ─── FFmpeg WASM 桥接 ───
+  // 在页面上下文运行，通过 postMessage 与 lib/ffmpeg.worker.js Worker 通信
 
-  // Listen for pre-fetched FFmpeg URLs from content.js
+  let ffmpegBridge = null;   // FFmpegBridge 单例
+  let ffmpegURLs = {};       // content.js 预取的 Blob URL
+
   window.addEventListener('message', (e) => {
     if (e.data?.source === 'bilibili-downloader' && e.data.type === 'ffmpeg_urls') {
       ffmpegURLs = e.data.data;
@@ -241,92 +242,183 @@
     }
   });
 
-  function loadScript(url) {
-    return new Promise((resolve, reject) => {
-      const script = document.createElement('script');
-      script.src = url;
-      script.onload = resolve;
-      script.onerror = reject;
-      document.head.appendChild(script);
-    });
-  }
+  // Worker 消息类型
+  const Op = {
+    LOAD: 'LOAD', EXEC: 'EXEC',
+    WRITE_FILE: 'WRITE_FILE', READ_FILE: 'READ_FILE',
+    DELETE_FILE: 'DELETE_FILE', RENAME: 'RENAME',
+    CREATE_DIR: 'CREATE_DIR', LIST_DIR: 'LIST_DIR',
+    DELETE_DIR: 'DELETE_DIR',
+    ERROR: 'ERROR', LOG: 'LOG', PROGRESS: 'PROGRESS'
+  };
 
-  async function getFFmpeg() {
-    if (ffmpegCache?.instance?.loaded) return ffmpegCache.instance;
+  // 操作结果类型集合（用于 resolve 判断）
+  const RESULT_OPS = new Set([
+    Op.LOAD, Op.EXEC, Op.WRITE_FILE, Op.READ_FILE,
+    Op.DELETE_FILE, Op.RENAME, Op.CREATE_DIR, Op.LIST_DIR, Op.DELETE_DIR
+  ]);
 
-    // Wait up to 10s for URLs to arrive
-    if (!ffmpegURLs.js) {
-      await new Promise((resolve) => {
-        let waited = 0;
-        const check = setInterval(() => {
-          waited += 100;
-          if (ffmpegURLs.js || waited >= 10000) { clearInterval(check); resolve(); }
-        }, 100);
+  let nextMsgId = 0;
+
+  /**
+   * FFmpegBridge - 页面端与 Worker 通信的封装
+   */
+  class FFmpegBridge {
+    #worker = null;
+    #pending = {};           // msgId → { resolve, reject }
+    #logHandlers = [];
+    #progressHandlers = [];
+    ready = false;
+
+    constructor(worker) {
+      this.#worker = worker;
+      this.#attachReceiver();
+    }
+
+    #attachReceiver() {
+      this.#worker.onmessage = ({ data: { id, type, data } }) => {
+        if (type === Op.LOG) {
+          this.#logHandlers.forEach(fn => fn(data));
+          return;
+        }
+        if (type === Op.PROGRESS) {
+          this.#progressHandlers.forEach(fn => fn(data));
+          return;
+        }
+
+        const p = this.#pending[id];
+        if (!p) return;
+        delete this.#pending[id];
+
+        if (type === Op.ERROR) {
+          p.reject(new Error(data));
+        } else if (RESULT_OPS.has(type)) {
+          if (type === Op.LOAD) this.ready = true;
+          p.resolve(data);
+        }
+      };
+    }
+
+    #send(type, payload, transferable) {
+      return new Promise((resolve, reject) => {
+        const id = nextMsgId++;
+        this.#pending[id] = { resolve, reject };
+        this.#worker.postMessage({ id, type, data: payload }, transferable || []);
       });
     }
 
-    if (!ffmpegURLs.js) throw new Error('FFmpeg 未能加载，请刷新页面重试');
+    on(event, handler) {
+      if (event === 'log') this.#logHandlers.push(handler);
+      else if (event === 'progress') this.#progressHandlers.push(handler);
+    }
 
-    await loadScript(ffmpegURLs.js);
+    load(opts) {
+      return this.#send(Op.LOAD, opts);
+    }
 
-    const FFmpegClass = self.FFmpegWASM?.FFmpeg || self.FFmpegWASM;
-    if (!FFmpegClass) throw new Error('FFmpeg class not found after script load');
+    run(args, timeout) {
+      return this.#send(Op.EXEC, { args, timeout: timeout ?? -1 });
+    }
 
-    const instance = new FFmpegClass();
+    writeFile(path, data) {
+      const xfer = data instanceof Uint8Array ? [data.buffer] : [];
+      return this.#send(Op.WRITE_FILE, { path, data }, xfer);
+    }
 
-    const loadOpts = {
-      coreURL: ffmpegURLs.core,
-      wasmURL: ffmpegURLs.wasm
-    };
-    if (ffmpegURLs.worker) loadOpts.workerURL = ffmpegURLs.worker;
-    await instance.load(loadOpts);
+    readFile(path, encoding) {
+      return this.#send(Op.READ_FILE, { path, encoding });
+    }
 
-    ffmpegCache = { instance, blobURLs: Object.values(ffmpegURLs) };
-    console.log('[B站下载助手] FFmpeg loaded once, cached for reuse');
-    return instance;
+    deleteFile(path) {
+      return this.#send(Op.DELETE_FILE, { path });
+    }
+
+    destroy() {
+      if (this.#worker) {
+        this.#worker.terminate();
+        this.#worker = null;
+        this.ready = false;
+      }
+    }
   }
 
-  async function mergeWithFFmpeg(audioBlob, videoBlob, title) {
+  // fetch → Blob URL（绕过 CSP）
+  async function toBlobURL(resourceURL, mimeType) {
+    const res = await fetch(resourceURL);
+    if (!res.ok) throw new Error('fetch 失败: ' + resourceURL + ' HTTP ' + res.status);
+    const buf = await res.arrayBuffer();
+    return URL.createObjectURL(new Blob([buf], { type: mimeType }));
+  }
+
+  /**
+   * 获取或初始化 FFmpegBridge 单例
+   */
+  async function getFFmpeg() {
+    if (ffmpegBridge?.ready) return ffmpegBridge;
+
+    if (!ffmpegURLs.workerJS) {
+      // 等待 content.js 预取完成（最多 10 秒）
+      await new Promise(resolve => {
+        let elapsed = 0;
+        const tick = setInterval(() => {
+          elapsed += 100;
+          if (ffmpegURLs.workerJS || elapsed >= 10000) { clearInterval(tick); resolve(); }
+        }, 100);
+      });
+    }
+    if (!ffmpegURLs.workerJS) throw new Error('FFmpeg 资源未就绪，请刷新页面重试');
+
+    // 从 Blob URL 创建 Worker
+    const workerBlobURL = await toBlobURL(ffmpegURLs.workerJS, 'text/javascript');
+    const worker = new Worker(workerBlobURL);
+    ffmpegBridge = new FFmpegBridge(worker);
+
+    ffmpegBridge.on('log', ({ message }) => {
+      if (message) console.log('[FFmpeg]', message);
+    });
+
+    // 初始化 WASM Core
+    await ffmpegBridge.load({
+      coreURL: ffmpegURLs.core,
+      wasmURL: ffmpegURLs.wasm,
+      workerURL: ffmpegURLs.coreWorker
+    });
+
+    console.log('[B站下载助手] FFmpeg WASM 初始化完成');
+    return ffmpegBridge;
+  }
+
+  async function mergeWithFFmpeg(audioBlob, videoBlob) {
     const ffmpeg = await getFFmpeg();
 
-    const prefix = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
-    const audioFile = prefix + '_audio.m4s';
-    const videoFile = prefix + '_video.m4s';
-    const outputFile = prefix + '_output.mp4';
+    const tag = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+    const audioPath = tag + '_audio.m4s';
+    const videoPath = tag + '_video.m4s';
+    const outputPath = tag + '_merged.mp4';
 
-    await ffmpeg.writeFile(audioFile, new Uint8Array(await audioBlob.arrayBuffer()));
-    await ffmpeg.writeFile(videoFile, new Uint8Array(await videoBlob.arrayBuffer()));
+    // 写入虚拟文件系统
+    await ffmpeg.writeFile(audioPath, new Uint8Array(await audioBlob.arrayBuffer()));
+    await ffmpeg.writeFile(videoPath, new Uint8Array(await videoBlob.arrayBuffer()));
 
-    await ffmpeg.exec(['-i', videoFile, '-i', audioFile, '-c', 'copy', outputFile]);
-    const result = await ffmpeg.readFile(outputFile);
+    // 合并（直接 copy 流，无重编码）
+    await ffmpeg.run(['-i', videoPath, '-i', audioPath, '-vcodec', 'copy', '-acodec', 'copy', outputPath]);
+    const merged = await ffmpeg.readFile(outputPath);
 
-    await ffmpeg.deleteFile(audioFile).catch(() => {});
-    await ffmpeg.deleteFile(videoFile).catch(() => {});
-    await ffmpeg.deleteFile(outputFile).catch(() => {});
+    // 清理临时文件
+    ffmpeg.deleteFile(audioPath).catch(() => {});
+    ffmpeg.deleteFile(videoPath).catch(() => {});
+    ffmpeg.deleteFile(outputPath).catch(() => {});
 
-    return new Blob([result.buffer], { type: 'video/mp4' });
+    return new Blob([merged.buffer], { type: 'video/mp4' });
   }
 
-  // Cleanup on page unload
+  // 页面卸载时清理资源
   window.addEventListener('beforeunload', () => {
-    if (ffmpegCache) {
-      ffmpegCache.blobURLs.forEach(url => URL.revokeObjectURL(url));
-      ffmpegCache.instance?.terminate?.();
-      ffmpegCache = null;
+    if (ffmpegBridge) {
+      ffmpegBridge.destroy();
+      ffmpegBridge = null;
     }
-  });
-
-  // ─── Save file via <a download> ───
-  function saveBlob(blob, filename) {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 5000);
-  }
+  }, true);
 
   // ─── Single video download ───
   async function downloadSingleVideo(videoInfo, qualityIdx, existingTaskId, collectionName) {
@@ -373,7 +465,7 @@
       
       // Merge into single mp4
       notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '合并中' });
-      const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, title);
+      const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob);
       const safeTitle = sanitizeFilename(title);
       saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`);
       notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
@@ -585,7 +677,7 @@
           
           // Merge into single mp4
           notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '合并中' });
-          const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, info.title);
+          const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob);
           const safeTitle = sanitizeFilename(info.title);
           saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`);
           notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });

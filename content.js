@@ -10,9 +10,10 @@
 
   // Pre-fetch FFmpeg files asynchronously (non-blocking, best-effort)
   const files = [
-    { path: 'lib/ffmpeg.js', mime: 'text/javascript', key: 'js' },
+    { path: 'lib/ffmpeg.worker.js', mime: 'text/javascript', key: 'workerJS' },
     { path: 'lib/ffmpeg-core.js', mime: 'text/javascript', key: 'core' },
-    { path: 'lib/ffmpeg-core.wasm', mime: 'application/wasm', key: 'wasm' }
+    { path: 'lib/ffmpeg-core.wasm', mime: 'application/wasm', key: 'wasm' },
+    { path: 'lib/ffmpeg-core.worker.js', mime: 'text/javascript', key: 'coreWorker' }
   ];
 
   Promise.all(files.map(f =>
@@ -26,11 +27,11 @@
   )).then(results => {
     const urls = {};
     results.filter(Boolean).forEach(r => urls[r.key] = r.url);
-    if (urls.js) {
+    if (urls.workerJS) {
       window.postMessage({ source: 'bilibili-downloader', type: 'ffmpeg_urls', data: urls }, '*');
-      console.log('[B站下载助手] FFmpeg pre-fetched OK');
+      console.log('[B站下载助手] FFmpeg pre-fetched OK:', Object.keys(urls).join(', '));
     } else {
-      console.warn('[B站下载助手] FFmpeg pre-fetch incomplete, will retry on download');
+      console.warn('[B站下载助手] FFmpeg pre-fetch incomplete');
     }
   });
 
