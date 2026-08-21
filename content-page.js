@@ -267,6 +267,15 @@
 
   // 固定下载根目录：浏览器默认下载目录下的 bilibili_download 子目录
   const DOWNLOAD_BASE = 'bilibili_download';
+  // wasm32 的 FFmpeg WASM 堆有约 2GB 硬上限：合并需同时容纳 输入+输出 ≈ 2×总大小，
+  // 超过该阈值必然 OOM 中止。大文件直接走“分离保存 + 本地合并脚本”。
+  const MERGE_THRESHOLD = 600 * 1024 * 1024;
+
+  function fmtBytesText(n) {
+    if (n >= 1073741824) return (n / 1073741824).toFixed(2) + 'GB';
+    if (n >= 1048576) return Math.round(n / 1048576) + 'MB';
+    return n + 'B';
+  }
 
   // 通过 background.js 的 chrome.downloads.download 保存（可靠，支持子目录）
   async function saveBlobViaDownloads(blob, filename, subdir) {
@@ -575,11 +584,11 @@
     const controller = new AbortController();
     activeTaskControllers.set(taskId, controller);
     try {
-      await executeDownload(taskId, videoInfo, qualityIdx || 0, controller.signal);
+      const result = await executeDownload(taskId, videoInfo, qualityIdx || 0, controller.signal);
       if (controller.signal.aborted) {
         notify('TASK_ABORTED', { taskId });
       } else {
-        notify('TASK_DONE', { taskId });
+        notify('TASK_DONE', { taskId, note: result?.note || '' });
       }
     } catch (e) {
       if (controller.signal.aborted) {
@@ -618,7 +627,9 @@
     const bestAudio = data.dash.audio[0];
     
     const label = QMAP[q] || q + 'P';
-    notify('download_progress', { taskId, phase: 'quality', percent: 0, label });
+    // B 站 playurl 的 dash 条目带精确字节数，上报给任务卡片展示
+    const totalSize = (bestVideo.size || 0) + (bestAudio.size || 0);
+    notify('download_progress', { taskId, phase: 'quality', percent: 0, label, totalSize });
     
     if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
     
@@ -637,7 +648,7 @@
     const safeTitle = sanitizeFilename(title);
     const baseSubdir = DOWNLOAD_BASE;
     let rawSaved = false;
-    
+
     // 如果开启了保存原始文件，先保存
     if (settings.saveRawFiles) {
       try {
@@ -648,7 +659,27 @@
         console.warn('[B站下载助手] 保存原始文件失败:', e);
       }
     }
-    
+
+    // 超过内存安全阈值的文件直接跳过 FFmpeg 合并（必然 OOM），走分离保存
+    const skipMerge = audioBlob.size + videoBlob.size > MERGE_THRESHOLD;
+    let note = '';
+
+    if (skipMerge) {
+      if (!rawSaved) {
+        try {
+          notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
+          await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
+          rawSaved = true;
+        } catch(e) {
+          console.error('[B站下载助手] 分离文件保存失败:', e);
+        }
+      }
+      try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
+      if (!rawSaved) throw new Error(`分离文件保存失败（文件 ${fmtBytesText(audioBlob.size + videoBlob.size)}）`);
+      notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
+      return { note: `文件较大（${fmtBytesText(audioBlob.size + videoBlob.size)}），已保存分离音视频，请按 merge.txt 说明本地合并` };
+    }
+
     // 尝试 FFmpeg 合并
     try {
       notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '合并中' });
@@ -659,18 +690,21 @@
     } catch(mergeError) {
       console.error('[B站下载助手] FFmpeg 合并失败:', mergeError);
       if (signal?.aborted) throw mergeError;
-      // 合并失败且未保存过原始文件 → 兜底保存
+      // 合并执行失败（大文件多为 OOM，重试无法解决）：降级为分离保存，任务正常完成
       if (!rawSaved) {
         try {
           await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
+          rawSaved = true;
         } catch(e) {
           console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
         }
       }
-      // 生成 merge.txt 合并说明
       try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
-      throw new Error('合并失败: ' + mergeError.message);
+      if (!rawSaved) throw new Error('合并失败且分离文件保存失败: ' + mergeError.message);
+      notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
+      note = `合并失败（${mergeError.message}），已保存分离音视频，请按 merge.txt 说明本地合并`;
     }
+    return { note };
   }
 
   // ─── UI ───
@@ -850,7 +884,9 @@
             aid: info.aid,
             cid: info.cid,
             quality: opt.label,
-            qualityIdx: idx
+            qualityIdx: idx,
+            videoSize: opt.videoSize || 0,
+            audioSize: opt.audioSize || 0
           }
         });
       });

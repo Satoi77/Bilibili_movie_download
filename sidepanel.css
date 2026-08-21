@@ -171,6 +171,18 @@ body {
 
 .task-time { color: #999; margin-left: auto; }
 
+.task-size { color: #999; font-size: 11px; }
+
+.task-note {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #ff9800;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Progress section */
 .task-progress-section { display: flex; flex-direction: column; gap: 4px; }
 

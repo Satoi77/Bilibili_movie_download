@@ -50,6 +50,11 @@ function getStatusText(task) {
   }
 }
 
+// 任务总体积：优先用执行期上报的 totalSize，回退到入队时携带的音视频分项
+function getTaskSize(task) {
+  return task.totalSize || ((task.videoSize || 0) + (task.audioSize || 0)) || 0;
+}
+
 function getStatusColor(task) {
   switch(task.status) {
     case 'downloading': return '#00a1d6';
@@ -143,7 +148,8 @@ function renderTasks() {
       
       const isStop = t.status === 'downloading';
       const controlIcon = isStop ? ICON_PAUSE : ICON_PLAY;
-      
+      const sizeText = fmtSize(getTaskSize(t));
+
       return `
         <div class="task-card ${t.status}">
           <div class="task-header-row">
@@ -153,6 +159,7 @@ function renderTasks() {
           </div>
           <div class="task-meta">
             <span class="task-quality">${t.quality || ''}</span>
+            ${sizeText ? `<span class="task-size">${sizeText}</span>` : ''}
             <span class="task-status" style="color:${getStatusColor(t)}">${getStatusText(t)}</span>
             ${t.error ? `<span class="task-error" title="${t.error}">(${t.error})</span>` : ''}
           </div>
@@ -164,6 +171,7 @@ function renderTasks() {
               </div>
               <span class="progress-pct">${overall}%</span>
             </div>
+            ${t.note ? `<div class="task-note" title="${t.note}">${t.note}</div>` : ''}
           </div>
         </div>
       `;
@@ -204,18 +212,22 @@ function renderTasks() {
   } else {
     cmList.innerHTML = `<div class="clear-all-btn" id="clear-completed" style="text-align:right;margin-bottom:8px;">
       <button class="btn-delete" style="background:transparent;border:1px solid #ff6699;color:#ff6699;padding:3px 12px;border-radius:4px;cursor:pointer;font-size:12px;">清空已完成</button>
-    </div>` + completed.map(t => `
+    </div>` + completed.map(t => {
+      const sizeText = fmtSize(getTaskSize(t));
+      return `
       <div class="task-card completed">
         <div class="task-title" title="${t.title}">${t.title}</div>
         <div class="task-meta">
           <span class="task-quality">${t.quality || ''}</span>
+          ${sizeText ? `<span class="task-size">${sizeText}</span>` : ''}
           <span class="task-time">${fmtTime(t.completedAt)}</span>
         </div>
+        ${t.note ? `<div class="task-note" title="${t.note}">${t.note}</div>` : ''}
         <div class="task-actions">
           <button class="btn-delete" data-id="${t.id}">删除</button>
         </div>
       </div>
-    `).join('');
+    `; }).join('');
     
     document.getElementById('clear-completed')?.addEventListener('click', async () => {
       if (await showConfirm(`确定清空 ${completed.length} 个已完成任务的记录？`)) {

@@ -17,7 +17,15 @@ let inFlightExecutor = null; // 'offscreen' | 'hostTab' | null
 let hostTabId = null;        // 宿主 B 站 tab id（兜底执行用）
 
 const STALL_TIMEOUT = 5 * 60 * 1000; // 任务超过 5 分钟无进度更新视为停滞
-const MAX_TASK_DURATION = 30 * 60 * 1000; // 单个任务执行超过 30 分钟强制重试（兜底心跳掩盖的卡死）
+const MAX_TASK_DURATION = 30 * 60 * 1000; // 单个任务基础时长上限（大文件按体积自动放宽，见 taskDurationLimit）
+
+// 大文件在慢速网络下下载时间远超 30 分钟：按 256KB/s 最差速率×2 余量估算 + 15 分钟合并缓冲，
+// 避免把合法的长耗时下载误判为卡死而反复重启
+function taskDurationLimit(task) {
+  if (!task?.totalSize) return MAX_TASK_DURATION;
+  const estimated = Math.round((task.totalSize / 256000) * 2 * 1000) + 15 * 60 * 1000;
+  return Math.max(MAX_TASK_DURATION, estimated);
+}
 
 async function loadQueueSettings() {
   const saved = await chrome.storage.local.get('settings');
@@ -135,7 +143,7 @@ async function checkStalledTasks() {
     if ((now - last) > STALL_TIMEOUT) {
       await requeueTask(t.id, '下载超时（长时间无进度），原位重启');
       stalled = true;
-    } else if ((now - (t.startedAt || last)) > MAX_TASK_DURATION) {
+    } else if ((now - (t.startedAt || last)) > taskDurationLimit(t)) {
       await requeueTask(t.id, '下载超时（任务耗时过长），原位重启');
       stalled = true;
     }
@@ -292,6 +300,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (data.phase === 'merge') task.progress.merge = data.percent;
       if (data.phase === 'delay') task.delayMessage = data.label;
       if (data.phase === 'quality' && data.label) task.quality = data.label;
+      if (data.phase === 'quality' && data.totalSize) task.totalSize = data.totalSize;
       task.lastProgressAt = Date.now();
       biliDB.updateTask(task).then(() => {
         notifySidePanel({ type: 'TASK_UPDATED', data: task });
@@ -307,6 +316,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (t && t.status === 'downloading') {
         t.status = 'completed';
         t.progress = { audio: 100, video: 100, merge: 100 };
+        if (data.note) t.note = data.note;
         t.completedAt = new Date().toISOString();
         await notifyTask(t);
       }
@@ -465,6 +475,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (data.phase === 'merge') task.progress.merge = data.percent;
       if (data.phase === 'delay') task.delayMessage = data.label;
       if (data.phase === 'quality' && data.label) task.quality = data.label;
+      if (data.phase === 'quality' && data.totalSize) task.totalSize = data.totalSize;
       task.lastProgressAt = Date.now();
       biliDB.updateTask(task).then(() => {
         notifySidePanel({ type: 'TASK_UPDATED', data: task });
@@ -517,6 +528,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           bvid: it.bvid || '',
           videoInfo: { aid: it.aid, bvid: it.bvid, cid: it.cid, title: it.title || '' },
           qualityIdx: it.qualityIdx || 0,
+          totalSize: (it.videoSize || 0) + (it.audioSize || 0) || 0,
           status: 'pending',
           progress: { audio: 0, video: 0, merge: 0 },
           retryCount: 0,
@@ -547,6 +559,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         bvid: it.bvid || '',
         videoInfo: { aid: it.aid, bvid: it.bvid, cid: it.cid, title: it.title || '' },
         qualityIdx: it.qualityIdx || 0,
+        totalSize: (it.videoSize || 0) + (it.audioSize || 0) || 0,
         status: 'pending',
         progress: { audio: 0, video: 0, merge: 0 },
         retryCount: 0,
@@ -659,6 +672,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (t && t.status === 'downloading') {
         t.status = 'completed';
         t.progress = { audio: 100, video: 100, merge: 100 };
+        if (data.note) t.note = data.note;
         t.completedAt = new Date().toISOString();
         await notifyTask(t);
       }

@@ -249,8 +249,8 @@ async function getSettings() {
 }
 
 async function saveBlob(blob, filename, subdir) {
-  const buffer = await blob.arrayBuffer();
-  const blobUrl = URL.createObjectURL(new Blob([buffer], { type: blob.type || 'application/octet-stream' }));
+  // 直接对 Blob/File 建 URL：不再 arrayBuffer() 整份拷入内存（大文件会 OOM）
+  const blobUrl = URL.createObjectURL(blob);
   try {
     const result = await chrome.runtime.sendMessage({
       type: 'SAVE_FILE',
@@ -278,8 +278,9 @@ async function runOffscreenTask(taskId, videoInfo, qualityIdx) {
       notify: (payload) => notify(taskId, payload),
       saveBlob,
       signal: controller.signal
+    }).then((result) => {
+      sendToBg({ type: 'OFFSCREEN_TASK_DONE', data: { taskId, note: result?.note || '' } });
     });
-    sendToBg({ type: 'OFFSCREEN_TASK_DONE', data: { taskId } });
   } catch (e) {
     if (controller.signal.aborted) {
       sendToBg({ type: 'OFFSCREEN_TASK_ABORTED', data: { taskId } });
