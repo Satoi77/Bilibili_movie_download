@@ -171,6 +171,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   
   if (type === 'DELETE_TASK') {
+    if (!data.taskId) { sendResponse({ status: 'ok' }); return true; }
     biliDB.deleteTask(data.taskId).then(() => {
       notifySidePanel({ type: 'TASK_REMOVED', data: { taskId: data.taskId } });
       sendResponse({ status: 'ok' });
@@ -181,7 +182,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (type === 'CLEAR_COMPLETED') {
     biliDB.getTasks().then(async (tasks) => {
       for (const t of tasks) {
-        if (t.status === 'completed' || t.status === 'failed') {
+        if ((t.status === 'completed' || t.status === 'failed') && t.id) {
           await biliDB.deleteTask(t.id);
         }
       }
