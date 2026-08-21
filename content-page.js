@@ -908,18 +908,20 @@
         return;
       }
       
+      body.style.cssText = 'display:flex;flex-direction:column;height:100%;padding:0;margin:0;';
       body.innerHTML = `
-        <div style="display:flex;flex-direction:column;height:100%;">
-        <div style="margin-bottom:12px;padding:8px 12px;background:#f5f5f5;border-radius:6px;font-size:12px;color:#666;flex-shrink:0;">
+        <div style="flex-shrink:0;padding:16px 16px 0 16px;">
+        <div style="margin-bottom:12px;padding:8px 12px;background:#f5f5f5;border-radius:6px;font-size:12px;color:#666;">
           合集: <span style="color:#00a1d6;font-weight:500;">${collectionName}</span> (${videos.length}个视频)
         </div>
-        <div style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;">
+        <div style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;">
           <span style="font-weight:500;">选择下载视频</span>
           <label style="cursor:pointer;font-size:12px;color:#00a1d6;">
             <input type="checkbox" id="bili-dl-select-all" checked> 全选
           </label>
         </div>
-        <div id="bili-dl-video-list" style="flex:1;overflow-y:auto;margin-bottom:0;">
+        </div>
+        <div id="bili-dl-video-list" style="flex:1;overflow-y:auto;padding:0 16px;">
           ${videos.map((v, i) => `
             <label style="display:flex;align-items:center;gap:8px;padding:8px;border-radius:6px;cursor:pointer;border:1px solid #e0e0e0;margin-bottom:4px;transition:border-color 0.2s;"
               onmouseenter="this.style.borderColor='#00a1d6'" onmouseleave="this.style.borderColor='#e0e0e0'">
@@ -928,14 +930,11 @@
             </label>
           `).join('')}
         </div>
+        <div style="flex-shrink:0;padding:12px 16px;border-top:1px solid #f0f0f0;background:#fff;">
+          <button id="bili-dl-batch-go" style="width:100%;padding:12px;background:linear-gradient(135deg,#00a1d6,#fb7299);color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;">批量下载选中视频</button>
         </div>
       `;
       
-      // Append fixed button outside body scroll area
-      const btnWrap = document.createElement('div');
-      btnWrap.style.cssText = 'padding:12px 16px;border-top:1px solid #f0f0f0;background:#fff;flex-shrink:0;';
-      btnWrap.innerHTML = '<button id="bili-dl-batch-go" style="width:100%;padding:12px;background:linear-gradient(135deg,#00a1d6,#fb7299);color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;">批量下载选中视频</button>';
-      body.appendChild(btnWrap);
       
       document.getElementById('bili-dl-select-all').addEventListener('change', (e) => {
         document.querySelectorAll('.bili-dl-video-check').forEach(cb => cb.checked = e.target.checked);
