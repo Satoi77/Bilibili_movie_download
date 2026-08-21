@@ -73,7 +73,7 @@ async function loadTasks() {
 
 function renderTasks() {
   const downloading = tasks.filter(t => t.status === 'downloading');
-  const completed = tasks.filter(t => t.status === 'completed');
+  const completed = tasks.filter(t => t.status === 'completed').sort((a, b) => (b.completedAt || b.createdAt || '').localeCompare(a.completedAt || a.createdAt || ''));
   const failed = tasks.filter(t => t.status === 'failed');
   
   document.getElementById('downloading-count').textContent = downloading.length + failed.length;
