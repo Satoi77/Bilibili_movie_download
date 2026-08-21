@@ -12,18 +12,6 @@ chrome.runtime.onInstalled.addListener(() => {
 // ─── Unified Storage Layer ───
 // 所有数据读写通过此 handler，其他上下文不直接访问存储
 
-const DIR_HANDLE_DB = 'BiliDirHandleDB';
-const DIR_HANDLE_STORE = 'dirHandle';
-
-function openDirHandleDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DIR_HANDLE_DB, 1);
-    req.onupgradeneeded = (e) => { e.target.result.createObjectStore(DIR_HANDLE_STORE); };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const { type, data } = message;
 
@@ -68,27 +56,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ status: 'ok', deleted: toDelete.length });
       });
     });
-    return true;
-  }
-
-  // ─── Directory Handle ───
-  if (type === 'GET_DIR_HANDLE') {
-    openDirHandleDB().then(db => {
-      const tx = db.transaction(DIR_HANDLE_STORE, 'readonly');
-      const req = tx.objectStore(DIR_HANDLE_STORE).get('current');
-      req.onsuccess = () => { db.close(); sendResponse({ handle: req.result || null }); };
-      req.onerror = () => { db.close(); sendResponse({ handle: null }); };
-    }).catch(() => sendResponse({ handle: null }));
-    return true;
-  }
-
-  if (type === 'SAVE_DIR_HANDLE') {
-    openDirHandleDB().then(db => {
-      const tx = db.transaction(DIR_HANDLE_STORE, 'readwrite');
-      tx.objectStore(DIR_HANDLE_STORE).put(data.handle, 'current');
-      tx.oncomplete = () => { db.close(); sendResponse({ status: 'ok' }); };
-      tx.onerror = () => { db.close(); sendResponse({ status: 'error' }); };
-    }).catch(() => sendResponse({ status: 'error' }));
     return true;
   }
 
@@ -190,33 +157,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true, downloadId: dlId });
       }
     });
-    return true;
-  }
-
-  if (type === 'SAVE_RAW_FILES') {
-    const { files } = data;
-    (async () => {
-      const results = [];
-      for (const file of files) {
-        try {
-          const dlId = await new Promise((resolve, reject) => {
-            chrome.downloads.download({
-              url: file.url,
-              filename: file.path,
-              conflictAction: 'uniquify',
-              saveAs: false
-            }, (id) => {
-              if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-              else resolve(id);
-            });
-          });
-          results.push({ path: file.path, success: true, downloadId: dlId });
-        } catch (e) {
-          results.push({ path: file.path, success: false, error: e.message });
-        }
-      }
-      sendResponse({ results });
-    })();
     return true;
   }
 

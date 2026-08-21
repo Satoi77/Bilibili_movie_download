@@ -254,18 +254,6 @@ document.getElementById('delete-raw-after-merge')?.addEventListener('change', (e
   }
 });
 
-// ─── Browse Directory Button ───
-
-document.getElementById('browse-dir')?.addEventListener('click', async () => {
-  try {
-    const dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
-    await msg('SAVE_DIR_HANDLE', { handle: dirHandle });
-    document.getElementById('download-dir').value = dirHandle.name;
-  } catch(e) {
-    if (e.name !== 'AbortError') console.error('[B站下载助手] 目录选择失败:', e);
-  }
-});
-
 // ─── Save Settings ───
 
 document.getElementById('save-settings')?.addEventListener('click', async () => {
@@ -274,8 +262,7 @@ document.getElementById('save-settings')?.addEventListener('click', async () => 
     delayMax: parseInt(document.getElementById('delay-max').value),
     retryTimes: parseInt(document.getElementById('retry-times').value),
     deleteRawAfterMerge: document.getElementById('delete-raw-after-merge').checked,
-    saveRawFiles: document.getElementById('save-raw-files').checked,
-    downloadDir: document.getElementById('download-dir').value.trim()
+    saveRawFiles: document.getElementById('save-raw-files').checked
   };
   await msg('SAVE_SETTINGS', { settings });
   const btn = document.getElementById('save-settings');
@@ -302,11 +289,5 @@ document.getElementById('save-settings')?.addEventListener('click', async () => 
     } else if (settings.deleteRawAfterMerge) {
       document.getElementById('delete-raw-after-merge').checked = true;
     }
-  }
-
-  // Load directory handle name
-  const dirResult = await msg('GET_DIR_HANDLE');
-  if (dirResult?.handle) {
-    document.getElementById('download-dir').value = dirResult.handle.name;
   }
 })();

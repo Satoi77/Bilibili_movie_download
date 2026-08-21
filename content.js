@@ -103,11 +103,6 @@
         cb({ success: false, error });
       }
     }
-
-    // 转发 SHOW_DIR_PICKER 到页面上下文
-    if (message.type === 'SHOW_DIR_PICKER') {
-      window.postMessage({ source: 'bilibili-downloader', type: 'SHOW_DIR_PICKER' }, '*');
-    }
   });
 
   // Listen for messages from page context
@@ -164,62 +159,26 @@
       return;
     }
 
-    // Handle SAVE_FILE - receives ArrayBuffer, creates blob URL in extension context
-    if (type === 'SAVE_FILE') {
-      const { requestId, buffer, path: filePath, mime } = data;
+    // Handle SAVE_BLOB - 在扩展上下文创建 blob URL 并调用 chrome.downloads.download
+    if (type === 'SAVE_BLOB') {
+      const { requestId, buffer, filename, subdir, mime } = data;
+      const filePath = subdir ? subdir + '/' + filename : filename;
       const blob = new Blob([buffer], { type: mime || 'application/octet-stream' });
       const extUrl = URL.createObjectURL(blob);
-      
       chrome.runtime.sendMessage({ type: 'SAVE_FILE', data: { url: extUrl, path: filePath } }, (result) => {
         setTimeout(() => URL.revokeObjectURL(extUrl), 5000);
         if (chrome.runtime.lastError) {
-          window.postMessage({ source: 'bilibili-downloader', type: 'save_result', data: { requestId, success: false, error: chrome.runtime.lastError.message } }, '*');
+          window.postMessage({ source: 'bilibili-downloader', type: 'save_blob_result', data: { requestId, success: false, error: chrome.runtime.lastError.message } }, '*');
           return;
         }
-        window.postMessage({ source: 'bilibili-downloader', type: 'save_result', data: { requestId, success: result?.success, error: result?.error } }, '*');
+        window.postMessage({ source: 'bilibili-downloader', type: 'save_blob_result', data: { requestId, success: result?.success, error: result?.error } }, '*');
       });
-      return;
-    }
-
-    // Handle SAVE_RAW_FILES - batch save multiple files
-    if (type === 'SAVE_RAW_FILES') {
-      const { requestId, files } = data;
-      chrome.runtime.sendMessage({ type: 'SAVE_RAW_FILES', data: { files } }, (result) => {
-        if (chrome.runtime.lastError) {
-          window.postMessage({ source: 'bilibili-downloader', type: 'save_raw_result', data: { requestId, success: false, error: chrome.runtime.lastError.message } }, '*');
-          return;
-        }
-        const results = result?.results || [];
-        const allOk = results.length > 0 && results.every(r => r.success);
-        const firstError = results.find(r => !r.success)?.error;
-        window.postMessage({ source: 'bilibili-downloader', type: 'save_raw_result', data: { requestId, success: allOk, results, error: firstError } }, '*');
-      });
-      return;
-    }
-
-    // Handle GET_DIR_HANDLE - 从 background 获取目录句柄
-    if (type === 'GET_DIR_HANDLE') {
-      chrome.runtime.sendMessage({ type: 'GET_DIR_HANDLE' }, (result) => {
-        window.postMessage({ source: 'bili-ext', type: 'GET_DIR_HANDLE_RESULT', handle: result?.handle || null }, '*');
-      });
-      return;
-    }
-
-    // Handle SAVE_DIR_HANDLE - 保存目录句柄到 background
-    if (type === 'SAVE_DIR_HANDLE') {
-      chrome.runtime.sendMessage({ type: 'SAVE_DIR_HANDLE', data: { handle: data.handle } });
       return;
     }
 
     // Handle DELETE_FILE
     if (type === 'DELETE_FILE') {
       chrome.runtime.sendMessage({ type: 'DELETE_FILE', data }, () => {});
-      return;
-    }
-
-    // 转发 DIR_PICKER_RESULT 到侧边栏
-    if (type === 'DIR_PICKER_RESULT') {
-      chrome.runtime.sendMessage({ type, data });
       return;
     }
 
