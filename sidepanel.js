@@ -77,6 +77,7 @@ async function loadTasks() {
 }
 
 async function deleteTaskFromDB(id) {
+  if (!id) return false;
   return new Promise((resolve) => {
     const req = indexedDB.open('BiliDownloaderDB', 1);
     req.onsuccess = (e) => {
@@ -100,7 +101,7 @@ async function clearCompletedFromDB() {
       const getAll = store.getAll();
       getAll.onsuccess = () => {
         for (const t of getAll.result) {
-          if (t.status === 'completed' || t.status === 'failed') {
+          if ((t.status === 'completed' || t.status === 'failed') && t.id) {
             store.delete(t.id);
           }
         }
@@ -204,7 +205,7 @@ function renderTasks() {
       }
     });
     
-    cmList.querySelectorAll('.btn-delete').forEach(btn => {
+    cmList.querySelectorAll('.btn-delete[data-id]').forEach(btn => {
       btn.onclick = async (e) => {
         e.stopPropagation();
         const id = btn.getAttribute('data-id');
