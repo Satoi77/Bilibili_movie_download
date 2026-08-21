@@ -1,6 +1,13 @@
 // sidepanel.js
 let tasks = [];
 
+// 监听目录选择结果
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === 'DIR_PICKER_RESULT' && message.data?.name) {
+    document.getElementById('download-dir').value = message.data.name;
+  }
+});
+
 function fmtSize(bytes) {
   if (!bytes || bytes <= 0) return '';
   if (bytes > 1073741824) return (bytes/1073741824).toFixed(2)+'GB';

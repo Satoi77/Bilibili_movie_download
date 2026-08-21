@@ -280,6 +280,8 @@
       const dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
       await saveDirHandle(dirHandle);
       console.log('[B站下载助手] 自定义下载目录已设置:', dirHandle.name);
+      // 回传目录名给侧边栏
+      chrome.runtime.sendMessage({ type: 'DIR_PICKER_RESULT', data: { name: dirHandle.name } });
     } catch(e) {
       if (e.name !== 'AbortError') {
         console.error('[B站下载助手] 目录选择失败:', e);
