@@ -64,10 +64,36 @@ function showConfirm(msg) {
 
 async function loadTasks() {
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type: 'GET_TASKS' }, (response) => {
-      if (response?.tasks) tasks = response.tasks;
-      resolve();
-    });
+    const req = indexedDB.open('BiliDownloaderDB', 1);
+    req.onsuccess = (e) => {
+      const db = e.target.result;
+      const tx = db.transaction('tasks', 'readonly');
+      const getAll = tx.objectStore('tasks').getAll();
+      getAll.onsuccess = () => { tasks = getAll.result || []; db.close(); resolve(); };
+      getAll.onerror = () => { db.close(); resolve(); };
+    };
+    req.onerror = () => resolve();
+  });
+}
+
+async function clearCompletedTasks() {
+  return new Promise((resolve) => {
+    const req = indexedDB.open('BiliDownloaderDB', 1);
+    req.onsuccess = (e) => {
+      const db = e.target.result;
+      const tx = db.transaction('tasks', 'readwrite');
+      const store = tx.objectStore('tasks');
+      const getAll = store.getAll();
+      getAll.onsuccess = () => {
+        for (const t of getAll.result) {
+          if (t.status === 'completed' || t.status === 'failed') {
+            store.delete(t.id);
+          }
+        }
+        tx.oncomplete = () => { db.close(); resolve(); };
+      };
+    };
+    req.onerror = () => resolve();
   });
 }
 
@@ -157,13 +183,9 @@ function renderTasks() {
     
     document.getElementById('clear-completed')?.addEventListener('click', async () => {
       if (await showConfirm(`确定清空 ${completed.length} 个已完成任务的记录？`)) {
-        console.log('[B站下载助手] Sidepanel: sending CLEAR_COMPLETED');
-        chrome.runtime.sendMessage({ type: 'CLEAR_COMPLETED' }, async (resp) => {
-          console.log('[B站下载助手] Sidepanel: response:', resp);
-          await loadTasks();
-          console.log('[B站下载助手] Sidepanel: tasks after reload:', tasks.length);
-          renderTasks();
-        });
+        await clearCompletedTasks();
+        await loadTasks();
+        renderTasks();
       }
     });
     
