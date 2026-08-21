@@ -7,11 +7,11 @@
 - **单视频下载**：在 B站播放页弹出画质选择，一键下载合并后的 MP4
 - **合集/系列批量下载**：自动识别合集，逐条带随机延时下载，避免触发风控
 - **后台下载，不依赖页面**：下载在扩展后台（offscreen）执行，切换/关闭 B 站页面、甚至关掉所有页面，下载照常完成
-- **原始文件保存**（可选）：在子目录中保存 `audio.m4s`、`video.m4s` 及合并说明 `merge.txt`
+- **原始文件保存**（可选）：在子目录中保存 `audio.mp4`、`video.mp4` 及合并说明 `merge.txt`
 - **实时进度**：侧边栏展示下载 / 合并进度与已完成任务列表
 - **固定下载目录**：所有文件保存到浏览器默认下载目录下的 `bilibili_download` 子目录
   - 合并后：`bilibili_download/<标题>_<画质>.mp4`
-  - 原始文件：`bilibili_download/<标题>/audio.m4s`、`video.m4s`、`merge.txt`
+  - 原始文件：`bilibili_download/<标题>/audio.mp4`、`video.mp4`、`merge.txt`
 
 ## 技术架构
 

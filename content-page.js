@@ -315,13 +315,14 @@
    */
   async function saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir) {
     const safeTitle = sanitizeFilename(title);
-    // 用 video/mp4 MIME type 包装，避免 Chrome 下载时篡改扩展名
+    // MIME 用 video/mp4 且文件名用 .mp4：B 站 dash 流本身是 fMP4 容器，
+    // 若命名为 .m4s，Chrome 会按内容类型把扩展名改写成 .mp4
     const audioForSave = new Blob([await audioBlob.arrayBuffer()], { type: 'video/mp4' });
     const videoForSave = new Blob([await videoBlob.arrayBuffer()], { type: 'video/mp4' });
 
     const subdir = baseSubdir ? baseSubdir + '/' + safeTitle : safeTitle;
-    await saveBlobViaDownloads(audioForSave, 'audio.m4s', subdir);
-    await saveBlobViaDownloads(videoForSave, 'video.m4s', subdir);
+    await saveBlobViaDownloads(audioForSave, 'audio.mp4', subdir);
+    await saveBlobViaDownloads(videoForSave, 'video.mp4', subdir);
     console.log('[B站下载助手] 原始文件已保存到子目录:', subdir);
   }
 
@@ -334,10 +335,10 @@
     const safeTitle = sanitizeFilename(title);
     const subdir = baseSubdir ? baseSubdir + '/' + safeTitle : safeTitle;
     const txtContent = [
-      '将此目录下的 audio.m4s 和 video.m4s 合并为 mp4 文件。',
+      '将此目录下的 audio.mp4 和 video.mp4 合并为 mp4 文件。',
       '',
       '方法一：使用 ffmpeg 命令行',
-      '  ffmpeg -i video.m4s -i audio.m4s -vcodec copy -acodec copy merged.mp4',
+      '  ffmpeg -i video.mp4 -i audio.mp4 -vcodec copy -acodec copy merged.mp4',
       '',
       '方法二：将本文件重命名为 merge.bat，双击运行',
       '  （需要已安装 ffmpeg 并添加到 PATH 环境变量）'
