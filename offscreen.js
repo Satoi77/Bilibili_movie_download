@@ -207,18 +207,12 @@ class FFmpegBridge {
 
 let ffmpegBridge = null;
 
-async function toBlobURL(resourceURL, mimeType) {
-  const res = await fetch(resourceURL);
-  if (!res.ok) throw new Error('fetch 失败: ' + resourceURL + ' HTTP ' + res.status);
-  const buf = await res.arrayBuffer();
-  return URL.createObjectURL(new Blob([buf], { type: mimeType }));
-}
-
+// offscreen 是扩展上下文（origin 为 chrome-extension://），可直接用扩展 URL 创建 Worker
+// 与加载 ffmpeg-core（同源，'self' 即允许），无需 blob: URL（MV3 CSP 禁止 blob: worker）
 async function createFFmpeg() {
   if (ffmpegBridge?.ready) return ffmpegBridge;
 
-  const workerBlobURL = await toBlobURL(chrome.runtime.getURL('lib/ffmpeg.worker.js'), 'text/javascript');
-  const worker = new Worker(workerBlobURL);
+  const worker = new Worker(chrome.runtime.getURL('lib/ffmpeg.worker.js'));
   ffmpegBridge = new FFmpegBridge(worker);
 
   ffmpegBridge.on('log', ({ message }) => {
@@ -226,9 +220,9 @@ async function createFFmpeg() {
   });
 
   await ffmpegBridge.load({
-    coreURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.js'), 'text/javascript'),
-    wasmURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.wasm'), 'application/wasm'),
-    workerURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.worker.js'), 'text/javascript')
+    coreURL: chrome.runtime.getURL('lib/ffmpeg-core.js'),
+    wasmURL: chrome.runtime.getURL('lib/ffmpeg-core.wasm'),
+    workerURL: chrome.runtime.getURL('lib/ffmpeg-core.worker.js')
   });
 
   console.log('[B站下载助手] offscreen FFmpeg WASM 初始化完成');
