@@ -150,9 +150,9 @@ function renderTasks() {
     
     document.getElementById('clear-completed')?.addEventListener('click', async () => {
       if (await showConfirm(`确定清空 ${completed.length} 个已完成任务的记录？`)) {
-        completed.forEach(t => {
-          chrome.runtime.sendMessage({ type: 'DELETE_TASK', data: { taskId: t.id } });
-        });
+        for (const t of completed) {
+          if (t.id) chrome.runtime.sendMessage({ type: 'DELETE_TASK', data: { taskId: t.id } });
+        }
         tasks = tasks.filter(t => t.status !== 'completed');
         renderTasks();
       }
@@ -211,7 +211,7 @@ chrome.runtime.onMessage.addListener((message) => {
 
 // Clear failed tasks
 document.getElementById('clear-failed')?.addEventListener('click', async () => {
-  const failedIds = tasks.filter(t => t.status === 'failed').map(t => t.id);
+  const failedIds = tasks.filter(t => t.status === 'failed' && t.id).map(t => t.id);
   if (failedIds.length === 0) return;
   if (await showConfirm(`确定清理 ${failedIds.length} 个失败任务？`)) {
     failedIds.forEach(id => {
