@@ -76,7 +76,21 @@ async function loadTasks() {
   });
 }
 
-async function clearCompletedTasks() {
+async function deleteTaskFromDB(id) {
+  return new Promise((resolve) => {
+    const req = indexedDB.open('BiliDownloaderDB', 1);
+    req.onsuccess = (e) => {
+      const db = e.target.result;
+      const tx = db.transaction('tasks', 'readwrite');
+      tx.objectStore('tasks').delete(id);
+      tx.oncomplete = () => { db.close(); resolve(true); };
+      tx.onerror = () => { db.close(); resolve(false); };
+    };
+    req.onerror = () => resolve(false);
+  });
+}
+
+async function clearCompletedFromDB() {
   return new Promise((resolve) => {
     const req = indexedDB.open('BiliDownloaderDB', 1);
     req.onsuccess = (e) => {
@@ -90,8 +104,9 @@ async function clearCompletedTasks() {
             store.delete(t.id);
           }
         }
-        tx.oncomplete = () => { db.close(); resolve(); };
       };
+      tx.oncomplete = () => { db.close(); resolve(); };
+      tx.onerror = () => { db.close(); resolve(); };
     };
     req.onerror = () => resolve();
   });
@@ -183,14 +198,8 @@ function renderTasks() {
     
     document.getElementById('clear-completed')?.addEventListener('click', async () => {
       if (await showConfirm(`确定清空 ${completed.length} 个已完成任务的记录？`)) {
-        for (const t of completed) {
-          if (!t.id) continue;
-          await new Promise(resolve => {
-            chrome.runtime.sendMessage({ type: 'DELETE_TASK', data: { taskId: t.id } }, () => resolve());
-            setTimeout(resolve, 500);
-          });
-          tasks = tasks.filter(task => task.id !== t.id);
-        }
+        await clearCompletedFromDB();
+        await loadTasks();
         renderTasks();
       }
     });
@@ -202,8 +211,8 @@ function renderTasks() {
         const task = tasks.find(t => t.id === id);
         const msg = task ? `确定删除「${task.title}」的任务记录？` : '确定删除？';
         if (await showConfirm(msg)) {
-          chrome.runtime.sendMessage({ type: 'DELETE_TASK', data: { taskId: id } });
-          tasks = tasks.filter(t => t.id !== id);
+          await deleteTaskFromDB(id);
+          await loadTasks();
           renderTasks();
         }
       };
