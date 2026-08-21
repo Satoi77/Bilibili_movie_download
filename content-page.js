@@ -999,6 +999,30 @@
           }))
         });
         console.log('[B站下载助手] Enqueued', taskInfos.length, 'tasks to background queue');
+
+        // 异步补全各任务合计体积：不阻塞入队，单个失败静默跳过（执行期 quality 上报兜底）
+        (async () => {
+          for (const info of taskInfos) {
+            try {
+              const d = await getPlayUrl(info.aid, info.bvid, info.cid, 80);
+              if (!d?.dash) continue;
+              const byQ = {};
+              d.dash.video.forEach(v => {
+                if (!byQ[v.id]) byQ[v.id] = [];
+                byQ[v.id].push(v);
+              });
+              const topQ = Object.keys(byQ).map(Number).sort((a,b) => b-a)[0];
+              const topVideo = byQ[topQ].sort((a,b) => b.bandwidth - a.bandwidth)[0];
+              notify('UPDATE_TASK_SIZE', {
+                taskId: info.taskId,
+                videoSize: topVideo?.size || 0,
+                audioSize: d.dash.audio[0]?.size || 0
+              });
+            } catch(e) {
+              console.warn('[B站下载助手] 补全任务体积失败:', info.title, e);
+            }
+          }
+        })();
       });
       
     } catch(e) {

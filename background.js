@@ -579,6 +579,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (type === 'UPDATE_TASK_SIZE') {
+    biliDB.getTask(data.taskId).then(task => {
+      if (!task) { sendResponse({ status: 'ok' }); return; }
+      // 仅在体积未知时补全，避免覆盖执行期 quality 阶段上报的实际值
+      if (!task.totalSize) {
+        const total = ((data.videoSize || 0) + (data.audioSize || 0)) || 0;
+        if (total) {
+          task.videoSize = data.videoSize || 0;
+          task.audioSize = data.audioSize || 0;
+          task.totalSize = total;
+          biliDB.updateTask(task).then(() => {
+            notifySidePanel({ type: 'TASK_UPDATED', data: task });
+          });
+        }
+      }
+      sendResponse({ status: 'ok' });
+    });
+    return true;
+  }
+
   if (type === 'STOP_ALL') {
     (async () => {
       queuePaused = true;
