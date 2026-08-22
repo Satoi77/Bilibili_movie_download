@@ -18,9 +18,16 @@ class MiniBridge {
     this.nextId = 0;
     this.logs = [];
     this.dead = false;
+    this.lastErrorDetail = '';
     worker.onerror = (e) => {
       this.dead = true;
-      const err = new Error('worker 异常终止: ' + (e && e.message ? e.message : 'unknown'));
+      // 全量采集：脚本加载失败(404/CSP)、运行时未捕获异常走这里
+      this.lastErrorDetail = [
+        e.message ? 'message: ' + e.message : '',
+        e.filename ? 'file: ' + e.filename + (e.lineno ? ':' + e.lineno + ':' + (e.colno || 0) : '') : '',
+        e.error && e.error.stack ? 'stack: ' + e.error.stack : ''
+      ].filter(Boolean).join('\n') || '(无详情)';
+      const err = new Error('worker 异常终止\n' + this.lastErrorDetail);
       const pending = this.pending;
       this.pending = {};
       Object.values(pending).forEach(p => p.reject(err));
@@ -66,22 +73,55 @@ async function runProbe() {
   btn.disabled = true;
   stepsEl.textContent = '';
 
+  // ── 步骤 0：资源可达性预检 ──
+  const s0 = addStep('0. 扩展资源预检', '运行中…', 'run');
+  const resources = ['lib/ffmpeg.worker.js', 'lib/ffmpeg-core.js', 'lib/ffmpeg-core.wasm', 'lib/ffmpeg-core.worker.js'];
+  const preResults = [];
+  let preOk = true;
+  for (const p of resources) {
+    try {
+      const r = await fetch(chrome.runtime.getURL(p), { method: 'HEAD' });
+      preResults.push(`${p} — ${r.ok ? 'OK ' + r.status : 'HTTP ' + r.status}`);
+      if (!r.ok) preOk = false;
+    } catch (fetchErr) {
+      preResults.push(`${p} — fetch 异常: ${fetchErr.message}`);
+      preOk = false;
+    }
+  }
+  updateStep(s0, preOk ? '通过' : '失败', preOk ? 'ok' : 'fail', preResults.join('\n'));
+
   // ── 步骤 1：加载 core ──
   const s1 = addStep('1. 加载 ffmpeg-core', '运行中…', 'run');
-  worker = new Worker(chrome.runtime.getURL('lib/ffmpeg.worker.js'));
+  try {
+    worker = new Worker(chrome.runtime.getURL('lib/ffmpeg.worker.js'));
+  } catch (constructErr) {
+    // 同步抛出 = CSP 拦截或 URL 非法
+    updateStep(s1, '失败', 'fail',
+      'Worker 创建被拒绝: ' + (constructErr.stack || constructErr.message));
+    btn.disabled = false;
+    return;
+  }
   const bridge = new MiniBridge(worker);
   let loadOk = false;
   try {
     const t0 = performance.now();
-    await bridge.send('LOAD', {
+    const loadPromise = bridge.send('LOAD', {
       coreURL: chrome.runtime.getURL('lib/ffmpeg-core.js'),
       wasmURL: chrome.runtime.getURL('lib/ffmpeg-core.wasm'),
       workerURL: chrome.runtime.getURL('lib/ffmpeg-core.worker.js')
     }, []);
-    updateStep(s1, '成功', 'ok', `耗时 ${Math.round(performance.now() - t0)}ms`);
+    // wasm 编译耗时观测：超时只提示不中止，等待最终结果
+    const slowTimer = setTimeout(() => {
+      updateStep(s1, '仍在加载…', 'run',
+        `已等待 ${Math.round((performance.now() - t0) / 1000)}s — wasm 编译需数秒到数十秒\n` +
+        `若长时间无进展，请截图此页并打开 DevTools 查看该页面控制台报错`);
+    }, 15000);
+    try { await loadPromise; } finally { clearTimeout(slowTimer); }
     loadOk = true;
+    updateStep(s1, '成功', 'ok', `耗时 ${Math.round(performance.now() - t0)}ms`);
   } catch (e) {
-    updateStep(s1, '失败', 'fail', e.message);
+    const coreLogs = bridge.logs.length ? '\nffmpeg 日志:\n' + bridge.logs.slice(-5).join('\n') : '';
+    updateStep(s1, '失败', 'fail', `${e.message}${bridge.lastErrorDetail ? '\n' + bridge.lastErrorDetail : ''}${coreLogs}`);
   }
 
   if (!loadOk) { btn.disabled = false; return; }
