@@ -252,13 +252,15 @@ async function saveBlob(blob, filename, subdir) {
   // 直接对 Blob/File 建 URL：不再 arrayBuffer() 整份拷入内存（大文件会 OOM）
   const blobUrl = URL.createObjectURL(blob);
   try {
+    // SAVE_FILE 在下载终态（complete/interrupted）后才响应，此时数据源不再被引用，
+    // 可安全立即回收；不能提前 revoke，否则大文件尚未从 blob URL 拷完即中断
     const result = await chrome.runtime.sendMessage({
       type: 'SAVE_FILE',
       data: { url: blobUrl, path: subdir ? subdir + '/' + filename : filename }
     });
     if (!result?.success) throw new Error(result?.error || '保存失败');
   } finally {
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+    URL.revokeObjectURL(blobUrl);
   }
 }
 

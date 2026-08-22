@@ -733,9 +733,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     chrome.downloads.download({ url, filename: filePath, conflictAction: 'uniquify', saveAs: false }, (dlId) => {
       if (chrome.runtime.lastError) {
         sendResponse({ success: false, error: chrome.runtime.lastError.message });
-      } else {
-        sendResponse({ success: true, downloadId: dlId });
+        return;
       }
+      // 等下载到达终态再响应：blob URL 由调用方在收到响应后立即回收，
+      // 若创建条目即返回，大文件尚未从 blob URL 拷完就会被 revoke/上下文关闭中断
+      let finished = false;
+      let timer;
+      const finish = (resp) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        chrome.downloads.onChanged.removeListener(listener);
+        sendResponse(resp);
+      };
+      const listener = (delta) => {
+        if (delta.id !== dlId) return;
+        if (delta.state?.current === 'complete') {
+          finish({ success: true, downloadId: dlId });
+        } else if (delta.state?.current === 'interrupted') {
+          finish({ success: false, downloadId: dlId, error: delta.error?.current || '下载写入中断' });
+        }
+      };
+      timer = setTimeout(() => finish({ success: false, downloadId: dlId, error: '保存超时' }), 30 * 60 * 1000);
+      chrome.downloads.onChanged.addListener(listener);
     });
     return true;
   }

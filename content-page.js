@@ -286,7 +286,8 @@
 
   // 通过 background.js 的 chrome.downloads.download 保存（可靠，支持子目录）
   async function saveBlobViaDownloads(blob, filename, subdir) {
-    const buffer = await blob.arrayBuffer();
+    // 直接传 Blob 引用：结构化克隆共享底层数据（磁盘 backed），禁止 arrayBuffer() 全量拷贝
+    // （大文件多次拷贝会 OOM，正是"只剩 merge.txt"的元凶之一）
     const requestId = filename + '_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
     try {
       await new Promise((resolve, reject) => {
@@ -300,8 +301,9 @@
           else reject(new Error(e.data.data.error || '保存失败'));
         };
         window.addEventListener('message', handler);
-        const t = setTimeout(() => { window.removeEventListener('message', handler); reject(new Error('保存超时')); }, 120000);
-        window.postMessage({ source: 'bilibili-downloader', type: 'SAVE_BLOB', data: { requestId, buffer, filename, subdir: subdir || '', mime: blob.type } }, '*');
+        // 保存等待期 = 下载终态确认期（含大文件落盘耗时），超时兜底与后台一致放宽到 30 分钟
+        const t = setTimeout(() => { window.removeEventListener('message', handler); reject(new Error('保存超时')); }, 30 * 60 * 1000);
+        window.postMessage({ source: 'bilibili-downloader', type: 'SAVE_BLOB', data: { requestId, blob, filename, subdir: subdir || '' } }, '*');
       });
     } catch(e) {
       console.warn('[B站下载助手] SAVE_BLOB 失败，回退到 <a download>:', e);
@@ -324,8 +326,9 @@
     const safeTitle = sanitizeFilename(title);
     // MIME 用 video/mp4 且文件名用 .mp4：B 站 dash 流本身是 fMP4 容器，
     // 若命名为 .m4s，Chrome 会按内容类型把扩展名改写成 .mp4
-    const audioForSave = new Blob([await audioBlob.arrayBuffer()], { type: 'video/mp4' });
-    const videoForSave = new Blob([await videoBlob.arrayBuffer()], { type: 'video/mp4' });
+    // 用 slice 改 MIME（引用共享零拷贝）；禁止 arrayBuffer() 全量拷贝（大文件 OOM）
+    const audioForSave = audioBlob.slice(0, audioBlob.size, 'video/mp4');
+    const videoForSave = videoBlob.slice(0, videoBlob.size, 'video/mp4');
 
     const subdir = baseSubdir ? baseSubdir + '/' + safeTitle : safeTitle;
     await saveBlobViaDownloads(audioForSave, 'audio.mp4', subdir);

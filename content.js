@@ -180,12 +180,13 @@
 
     // Handle SAVE_BLOB - 在扩展上下文创建 blob URL 并调用 chrome.downloads.download
     if (type === 'SAVE_BLOB') {
-      const { requestId, buffer, filename, subdir, mime } = data;
+      const { requestId, blob, filename, subdir } = data;
       const filePath = subdir ? subdir + '/' + filename : filename;
-      const blob = new Blob([buffer], { type: mime || 'application/octet-stream' });
+      // 直接使用页面传来的 Blob 引用：结构化克隆共享底层数据，不做 buffer 全量拷贝
       const extUrl = URL.createObjectURL(blob);
       chrome.runtime.sendMessage({ type: 'SAVE_FILE', data: { url: extUrl, path: filePath } }, (result) => {
-        setTimeout(() => URL.revokeObjectURL(extUrl), 5000);
+        // 响应在下载终态后返回，立即回收数据源；提前 revoke 会中断大文件的写入
+        URL.revokeObjectURL(extUrl);
         if (chrome.runtime.lastError) {
           window.postMessage({ source: 'bilibili-downloader', type: 'save_blob_result', data: { requestId, success: false, error: chrome.runtime.lastError.message } }, '*');
           return;
