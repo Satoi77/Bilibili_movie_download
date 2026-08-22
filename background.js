@@ -14,7 +14,8 @@ let queueBusy = false;       // 当前是否有任务在派发/执行中
 let inFlightTaskId = null;   // 正在执行的任务 id
 let nextDispatchAt = 0;      // 下一次允许派发的时间戳（保证任务间延时）
 let inFlightExecutor = null; // 'offscreen' | 'hostTab' | null
-let hostTabId = null;        // 宿主 B 站 tab id（兜底执行用）
+let hostTabId = null;        // 当前宿主 B 站 tab id（兜底执行用）
+let hostTabAutoCreated = false; // 宿主 tab 是否为自动新建的兜底首页（只有它才允许队列空闲时关闭；借用用户的页面绝不能关）
 
 const STALL_TIMEOUT = 5 * 60 * 1000; // 任务超过 5 分钟无进度更新视为停滞
 const MAX_TASK_DURATION = 30 * 60 * 1000; // 单个任务基础时长上限（大文件按体积自动放宽，见 taskDurationLimit）
@@ -69,15 +70,51 @@ async function ensureOffscreen() {
   throw new Error('offscreen 未就绪');
 }
 
-async function ensureHostTab() {
-  if (hostTabId) {
-    try {
-      const tab = await chrome.tabs.get(hostTabId);
-      if (tab && tab.status === 'complete') return hostTabId;
-    } catch (e) {}
+// 宿主 tab 就绪探测：content.js 应答 status:'ok' 表示页面世界 content-page.js 已加载，
+// RUN_TASK 可安全派发；tab 已关闭/导航走/discarded 时 sendMessage 会 reject → 视为不可用
+async function probeHostTab(tabId) {
+  if (!tabId) return false;
+  try {
+    const res = await chrome.tabs.sendMessage(tabId, { type: 'HOST_PING' });
+    return res?.status === 'ok';
+  } catch (e) {
+    return false;
+  }
+}
+
+// 查找任意已就绪的 B 站页面（复用用户开着的标签页，避免无谓新开）
+async function findAnyReadyBiliTab() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: '*://*.bilibili.com/*' });
+  } catch (e) {
+    return null;
+  }
+  for (const t of tabs) {
+    if (t.discarded) continue;
+    if (await probeHostTab(t.id)) return t.id;
+  }
+  return null;
+}
+
+// 确定宿主 tab，优先级：内存记录 → 任务发起页（用户正开着的视频页）→ 任意就绪 B 站页 → 新建兜底首页。
+// 只有走到最后一步才 tabs.create，且标记 autoCreated 以便队列空闲时回收。
+async function ensureHostTab(preferredTabId) {
+  let chosen = null;
+  if (await probeHostTab(hostTabId)) chosen = hostTabId;
+  else if (preferredTabId !== hostTabId && await probeHostTab(preferredTabId)) chosen = preferredTabId;
+  else {
+    const found = await findAnyReadyBiliTab();
+    if (found) chosen = found;
+  }
+  if (chosen) {
+    if (chosen !== hostTabId) hostTabAutoCreated = false; // 换用了已有页面（用户的），不可自动关闭
+    hostTabId = chosen;
+    return hostTabId;
   }
   const tab = await chrome.tabs.create({ url: 'https://www.bilibili.com', active: false });
   hostTabId = tab.id;
+  hostTabAutoCreated = true;
   await waitHostTabReady(hostTabId);
   return hostTabId;
 }
@@ -104,7 +141,7 @@ async function waitHostTabReady(tabId) {
 
 async function dispatchToHostTab(task) {
   try {
-    const host = await ensureHostTab();
+    const host = await ensureHostTab(task.hostTabId); // 优先复用任务发起页（用户开着的视频页）
     inFlightExecutor = 'hostTab';
     await chrome.tabs.sendMessage(host, {
       type: 'RUN_TASK',
@@ -122,7 +159,8 @@ async function dispatchToHostTab(task) {
 }
 
 async function maybeCloseHostTab() {
-  if (!hostTabId) return;
+  // 只回收自动新建的兜底首页；借用用户的 B 站页面（含任务发起页）绝不关闭
+  if (!hostTabId || !hostTabAutoCreated) return;
   const all = await biliDB.getTasks();
   const active = all.filter(t => t.status === 'pending' || t.status === 'downloading');
   if (active.length === 0) {
