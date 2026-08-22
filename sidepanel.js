@@ -2,6 +2,7 @@
 // 所有数据读写通过 background.js 消息，不直接访问存储
 
 import { buildAlertText, createAlertManager } from './lib/failure-alert.js';
+import { isActiveTask } from './lib/db.js';
 
 let tasks = [];
 
@@ -128,7 +129,7 @@ function scheduleRender() {
 
 function renderTasks() {
   const downloading = tasks.filter(t => t.status === 'downloading');
-  const active = tasks.filter(t => ['pending', 'downloading', 'paused', 'failed'].includes(t.status));
+  const active = tasks.filter(isActiveTask);
   const completed = tasks.filter(t => t.status === 'completed').sort((a, b) => (b.completedAt || b.createdAt || '').localeCompare(a.completedAt || a.createdAt || ''));
   const failed = tasks.filter(t => t.status === 'failed');
   
@@ -344,8 +345,10 @@ document.getElementById('toggle-all')?.addEventListener('click', async () => {
 });
 
 document.getElementById('delete-all')?.addEventListener('click', async () => {
-  if (tasks.length === 0) return;
-  if (await showConfirm(`确定删除全部 ${tasks.length} 个任务？此操作不可撤销。`)) {
+  // 仅作用于「下载中」页面的任务；已完成记录不受影响（background 端 DELETE_ALL 同口径过滤）
+  const activeCount = tasks.filter(isActiveTask).length;
+  if (activeCount === 0) return;
+  if (await showConfirm(`确定删除全部 ${activeCount} 个下载任务？此操作不可撤销，已完成的记录不受影响。`)) {
     await msg('DELETE_ALL');
     const result = await msg('GET_TASKS');
     tasks = result?.tasks || [];
