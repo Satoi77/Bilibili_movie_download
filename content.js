@@ -96,6 +96,9 @@
     // Forward queue control messages to page context
     if (message.type === 'RUN_TASK' || message.type === 'ABORT_TASK') {
       window.postMessage({ source: 'bilibili-downloader', type: message.type, data: message.data || {} }, '*');
+      // 同步回受理应答：dispatchToHostTab 对 RUN_TASK await tabs.sendMessage，
+      // 无应答时 Promise reject 会把已开始执行的任务误标为"下载页面不可用"
+      sendResponse({ status: 'ok' });
       return;
     }
     if (message.type === 'offscreen_merge_result') {

@@ -307,6 +307,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'OFFSCREEN_RUN_TASK') {
     const { taskId, videoInfo, qualityIdx } = message.data || {};
     if (taskId && videoInfo) runOffscreenTask(taskId, videoInfo, qualityIdx || 0);
+    // 必须同步回受理应答：pumpQueue 对此消息 await sendMessage，
+    // 监听者存在却无人 sendResponse 时 MV3 Promise 必然 reject，
+    // 发送方会误判派发失败而走宿主 tab 兜底（误开 B 站首页）。
+    // 任务结果经 OFFSCREEN_TASK_DONE/ERROR/ABORTED/NEEDS_PAGE 异步上报。
+    sendResponse({ status: 'ok' });
     return false;
   }
 
