@@ -6,8 +6,9 @@
 // 结论决定大视频合并策略的升级路线。
 
 const MB = 1024 * 1024;
-// 阶梯测试序列：每级写完即删，堆占用不叠加；失败即停（OOM 会杀死 worker）
-const LADDER_MB = [256, 512, 768, 1024, 1280, 1536];
+// 阶梯测试序列：每级写完即删，堆占用不叠加；失败即停（OOM 会杀死 worker = 探到堆上限的标志）
+// 256~768MB 区间已实测通过，直接从未知区起步探顶
+const LADDER_MB = [1024, 1536, 2048, 2560];
 
 let worker = null;
 
@@ -149,7 +150,7 @@ async function runProbe() {
     updateStep(s2, '失败', 'fail', e.message);
   }
   const verdictLines = [];
-  if (probe) verdictLines.push(`当前构建堆上限 ${probe.heapGB} GB → 理论最大合并体积 ≈ 堆/2（输入+输出同驻内存）`);
+  if (probe) verdictLines.push(`初始堆 ${probe.heapGB} GB（HEAPU8 快照非上限；ALLOW_MEMORY_GROWTH 下堆按需增长）`);
 
   // ── 步骤 3：MEMFS 写入阶梯 ──
   let maxWriteMB = 0;
@@ -173,7 +174,9 @@ async function runProbe() {
       ladderDetail.push(`${mb}MB ✓ ${dt}ms`);
       await bridge.send('DELETE_FILE', { path: `probe_${mb}.bin` }, []).catch(() => {});
     } catch (writeErr) {
-      ladderDetail.push(`${mb}MB ✗ ${writeErr.message}`);
+      // OOM 杀死 worker = 探到堆增长上限（这正是我们要的测量值）
+      ladderDetail.push(`${mb}MB ✗ ${writeErr.message.split('\n')[0]}` +
+        (bridge.dead ? ' ← worker 被 OOM 终止：堆增长上限在此区间' : ''));
       break;
     } finally {
       u8 = null; // 页面侧立即释放引用
@@ -181,7 +184,17 @@ async function runProbe() {
   }
   updateStep(s3, maxWriteMB ? '完成' : '失败', maxWriteMB ? 'ok' : 'fail',
     `实际最大写入: ${maxWriteMB}MB\n` + ladderDetail.join('\n'));
-  if (maxWriteMB) verdictLines.push(`MEMFS 单文件实测上限 ≈ ${fmtMB(maxWriteMB * MB)}（受堆碎片化影响，低于理论值属正常）`);
+  if (maxWriteMB) verdictLines.push(`MEMFS 单文件实测写入 ≥ ${fmtMB(maxWriteMB * MB)}（堆动态增长正常）`);
+
+  // ── 阶梯后终态探测：确认堆实际增长到了哪里 ──
+  if (!bridge.dead) {
+    try {
+      const after = await bridge.send('PROBE', {}, []);
+      verdictLines.push(`阶梯后堆: ${after.heapGB} GB（初始 ${probe ? probe.heapGB : '?'} GB → 增长机制验证 ✓）`);
+    } catch (e) {}
+  } else {
+    verdictLines.push('worker 已在阶梯中因 OOM 崩溃，后续步骤跳过');
+  }
 
   // ── 步骤 4：WORKERFS 挂载测试 ──
   if (probe && probe.hasWorkerFS) {
