@@ -1,0 +1,6 @@
+{
+  "name": "bilibili-movie-download",
+  "private": true,
+  "type": "module",
+  "description": "Chrome 扩展:Bilibili 视频下载助手(type:module 仅用于 Node 端 ESM 单测,不影响扩展运行)"
+}

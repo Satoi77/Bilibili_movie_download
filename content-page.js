@@ -223,7 +223,15 @@
 
   // ─── Download with progress ───
   // 进度消息按 1% 粒度节流，避免刷爆后台/侧栏
-  async function downloadBlob(url, taskId, phase, label, signal) {
+
+  // 候选地址列表：主链接 + 备用链接（dash 条目 camelCase/snake_case 字段均兼容）
+  function streamUrlList(entry) {
+    return [entry?.baseUrl || entry?.base_url, ...(entry?.backupUrl || entry?.backup_url || [])]
+      .filter(u => typeof u === 'string' && u.length > 0);
+  }
+
+  // 单个地址的完整尝试：请求 + 读流 + 进度上报
+  async function downloadBlobOnce(url, taskId, phase, label, signal) {
     const r = await fetchWithTimeout(url, {}, 60000, signal);
     if (!r.ok) throw new Error(`${label} HTTP ${r.status}`);
     
@@ -259,6 +267,25 @@
     
     if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
     return new Blob(chunks);
+  }
+
+  // 逐个候选地址尝试：B 站 CDN 瞬时抖动（连接重置等表现为 TypeError: Failed to fetch）
+  // 只影响单个地址，切换备用链接重下即可，不再让整任务失败
+  async function downloadBlob(urls, taskId, phase, label, signal) {
+    const candidates = Array.isArray(urls) ? urls.filter(Boolean) : [urls].filter(Boolean);
+    if (candidates.length === 0) throw new Error(`${label} 无可用下载地址`);
+    let lastErr = null;
+    for (const url of candidates) {
+      if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+      try {
+        return await downloadBlobOnce(url, taskId, phase, label, signal);
+      } catch (e) {
+        // 用户中止立即透传，不浪费剩余地址
+        if (e.name === 'AbortError' || signal?.aborted) throw e;
+        lastErr = e;
+      }
+    }
+    throw lastErr;
   }
 
   function saveBlob(blob, filename) {
@@ -672,8 +699,8 @@
     notify('download_progress', { taskId, phase: 'download', percent: 0, label: '下载中' });
     
     const [audioBlob, videoBlob] = await Promise.all([
-      downloadBlob(bestAudio.baseUrl, taskId, 'audio', '音频', signal),
-      downloadBlob(bestVideo.baseUrl, taskId, 'video', '视频', signal)
+      downloadBlob(streamUrlList(bestAudio), taskId, 'audio', '音频', signal),
+      downloadBlob(streamUrlList(bestVideo), taskId, 'video', '视频', signal)
     ]);
     
     if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
