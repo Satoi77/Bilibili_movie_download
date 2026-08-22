@@ -362,7 +362,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
       })
       .catch(e => {
-        console.error('[FFmpeg Offscreen] Merge failed:', e);
+        console.debug('[FFmpeg Offscreen] Merge failed:', e);
         chrome.runtime.sendMessage({
           type: 'offscreen_merge_result',
           data: { taskId, success: false, error: e.message }

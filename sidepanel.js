@@ -17,7 +17,7 @@ function msg(type, data = {}) {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({ type, data }, (result) => {
       if (chrome.runtime.lastError) {
-        console.error('[B站下载助手] 消息发送失败:', type, chrome.runtime.lastError);
+        console.debug('[B站下载助手] 消息发送失败:', type, chrome.runtime.lastError);
         resolve(null);
       } else {
         resolve(result);

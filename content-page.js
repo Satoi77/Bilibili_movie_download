@@ -44,7 +44,7 @@
       const vd = d.data;
       return { aid: vd.aid, bvid: vd.bvid, cid: vd.cid, title: vd.title, pages: vd.pages || [] };
     } catch(e) {
-      console.warn('[B站下载助手] getVideoInfoByBvid error:', bvid, e);
+      console.debug('[B站下载助手] getVideoInfoByBvid error:', bvid, e);
       return null;
     }
   }
@@ -65,7 +65,7 @@
       const tree = state && parser.buildCollectionTree(state);
       if (tree) return tree;
     } catch(e) {
-      console.warn('[B站下载助手] __INITIAL_STATE__ 解析失败:', e);
+      console.debug('[B站下载助手] __INITIAL_STATE__ 解析失败:', e);
     }
 
     // DOM 兜底（series 页等无状态数据场景）：partsKnown=false 组，入队时经 getVideoInfoByBvid 展开
@@ -317,7 +317,7 @@
       });
       return downloadId; // 供"合并成功后按设置删除原始文件"使用
     } catch(e) {
-      console.warn('[B站下载助手] SAVE_BLOB 失败，回退到 <a download>:', e);
+      console.debug('[B站下载助手] SAVE_BLOB 失败，回退到 <a download>:', e);
       saveBlob(blob, filename);
       return null;
     }
@@ -691,7 +691,7 @@
         rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, targets.rawSubdir);
         rawSaved = true;
       } catch(e) {
-        console.warn('[B站下载助手] 保存原始文件失败:', e);
+        console.debug('[B站下载助手] 保存原始文件失败:', e);
       }
     }
 
@@ -708,7 +708,7 @@
         await downloadFile(mergedBlob, targets.mergedName, targets.mergedDir);
         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
       } catch(mergeError) {
-        console.error('[B站下载助手] FFmpeg 合并失败:', mergeError);
+        console.debug('[B站下载助手] FFmpeg 合并失败:', mergeError);
         if (signal?.aborted) throw mergeError;
         // 合并执行失败：降级为分离保存，任务正常完成
         if (!rawSaved) {
@@ -716,7 +716,7 @@
             await saveRawToSubdir(audioBlob, videoBlob, targets.rawSubdir);
             rawSaved = true;
           } catch(e) {
-            console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
+            console.debug('[B站下载助手] 兜底保存原始文件也失败:', e);
           }
         }
         try { await saveMergeTxt(targets.rawSubdir); } catch(e) {}
@@ -735,7 +735,7 @@
         rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, targets.rawSubdir);
         rawSaved = true;
       } catch(e) {
-        console.error('[B站下载助手] 分离文件保存失败:', e);
+        console.debug('[B站下载助手] 分离文件保存失败:', e);
       }
     }
     if (!rawSaved) throw new Error(`分离文件保存失败（文件 ${fmtBytesText(audioBlob.size + videoBlob.size)}）`);
@@ -752,7 +752,7 @@
         mergedOk = true;
         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
       } catch(mergeError) {
-        console.error('[B站下载助手] 大文件 FFmpeg 合并失败:', mergeError);
+        console.debug('[B站下载助手] 大文件 FFmpeg 合并失败:', mergeError);
         if (signal?.aborted) throw mergeError;
         try { await saveMergeTxt(targets.rawSubdir); } catch(e) {}
         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
@@ -772,7 +772,7 @@
           if (id) await removeSavedFileViaPage(id);
         }
       } catch(e) {
-        console.warn('[B站下载助手] 清理原始文件失败:', e);
+          console.debug('[B站下载助手] 清理原始文件失败:', e);
       }
     }
     return { note };
@@ -1200,7 +1200,7 @@
             taskItems.push(mkTask(g, info.aid, pg.cid, pg.part || '', padP(pg.page || 1), pages.length));
           }
         } catch (e) {
-          console.warn('[B站下载助手] 兜底组解析失败:', g.bvid, e);
+          console.debug('[B站下载助手] 兜底组解析失败:', g.bvid, e);
         }
       }
 
@@ -1228,7 +1228,7 @@
               audioSize: dashSize(d.dash.audio[0], dur)
             });
           } catch (e) {
-            console.warn('[B站下载助手] 补全任务体积失败:', it.title, e);
+            console.debug('[B站下载助手] 补全任务体积失败:', it.title, e);
           }
         }
       })();

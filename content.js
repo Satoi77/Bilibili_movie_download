@@ -33,7 +33,7 @@
       .then(r => r.arrayBuffer())
       .then(buf => ({ key: f.key, url: URL.createObjectURL(new Blob([buf], { type: f.mime })) }))
       .catch(e => {
-        console.warn('[B站下载助手] Pre-fetch failed for', f.path, e);
+        console.debug('[B站下载助手] Pre-fetch failed for', f.path, e);
         return null;
       })
   )).then(results => {
@@ -43,7 +43,7 @@
       window.postMessage({ source: 'bilibili-downloader', type: 'ffmpeg_urls', data: urls }, '*');
       console.log('[B站下载助手] FFmpeg pre-fetched OK:', Object.keys(urls).join(', '));
     } else {
-      console.warn('[B站下载助手] FFmpeg pre-fetch incomplete');
+      console.debug('[B站下载助手] FFmpeg pre-fetch incomplete');
     }
   });
 
@@ -169,7 +169,7 @@
           data: { taskId }
         });
       }).catch(e => {
-        console.error('[B站下载助手] Failed to store blobs:', e);
+        console.debug('[B站下载助手] Failed to store blobs:', e);
         const cb = pendingMerges.get(taskId);
         if (cb) {
           pendingMerges.delete(taskId);
