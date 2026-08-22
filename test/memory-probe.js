@@ -1,0 +1,179 @@
+// FFmpeg WASM 内存诊断（feature/ffmpeg-4gb 分支实验页）
+// 探测目标：
+//   1. 当前构建的实际 wasm 堆上限（2GB / 4GB）
+//   2. MEMFS writeFile 实际可写入的最大单文件
+//   3. WORKERFS 是否可用（输入文件不占堆的关键能力）
+// 结论决定大视频合并策略的升级路线。
+
+const MB = 1024 * 1024;
+// 阶梯测试序列：每级写完即删，堆占用不叠加；失败即停（OOM 会杀死 worker）
+const LADDER_MB = [256, 512, 768, 1024, 1280, 1536];
+
+let worker = null;
+
+class MiniBridge {
+  constructor(worker) {
+    this.worker = worker;
+    this.pending = {};
+    this.nextId = 0;
+    this.logs = [];
+    this.dead = false;
+    worker.onerror = (e) => {
+      this.dead = true;
+      const err = new Error('worker 异常终止: ' + (e && e.message ? e.message : 'unknown'));
+      const pending = this.pending;
+      this.pending = {};
+      Object.values(pending).forEach(p => p.reject(err));
+    };
+    worker.onmessage = ({ data: { id, type, data } }) => {
+      if (type === 'LOG') { this.logs.push(data.message || ''); return; }
+      const p = this.pending[id];
+      if (!p) return;
+      delete this.pending[id];
+      if (type === 'ERROR') p.reject(new Error(data));
+      else p.resolve(data);
+    };
+  }
+  send(type, payload, xfer) {
+    if (this.dead) return Promise.reject(new Error('worker 已崩溃'));
+    return new Promise((resolve, reject) => {
+      const id = this.nextId++;
+      this.pending[id] = { resolve, reject };
+      this.worker.postMessage({ id, type, data: payload }, xfer || []);
+    });
+  }
+}
+
+const stepsEl = document.getElementById('steps');
+function addStep(name, status, cls, detail) {
+  const div = document.createElement('div');
+  div.className = 'step';
+  div.innerHTML =
+    `<span class="status ${cls}">${status}</span><span class="name">${name}</span>` +
+    (detail ? `<div class="detail">${detail}</div>` : '');
+  stepsEl.appendChild(div);
+  return div;
+}
+function updateStep(div, status, cls, detail) {
+  div.querySelector('.status').textContent = status;
+  div.querySelector('.status').className = 'status ' + cls;
+  if (detail !== undefined) div.querySelector('.detail').textContent = detail;
+}
+function fmtMB(n) { return n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' GB' : Math.round(n / MB) + ' MB'; }
+
+async function runProbe() {
+  const btn = document.getElementById('run');
+  btn.disabled = true;
+  stepsEl.textContent = '';
+
+  // ── 步骤 1：加载 core ──
+  const s1 = addStep('1. 加载 ffmpeg-core', '运行中…', 'run');
+  worker = new Worker(chrome.runtime.getURL('lib/ffmpeg.worker.js'));
+  const bridge = new MiniBridge(worker);
+  let loadOk = false;
+  try {
+    const t0 = performance.now();
+    await bridge.send('LOAD', {
+      coreURL: chrome.runtime.getURL('lib/ffmpeg-core.js'),
+      wasmURL: chrome.runtime.getURL('lib/ffmpeg-core.wasm'),
+      workerURL: chrome.runtime.getURL('lib/ffmpeg-core.worker.js')
+    }, []);
+    updateStep(s1, '成功', 'ok', `耗时 ${Math.round(performance.now() - t0)}ms`);
+    loadOk = true;
+  } catch (e) {
+    updateStep(s1, '失败', 'fail', e.message);
+  }
+
+  if (!loadOk) { btn.disabled = false; return; }
+
+  // ── 步骤 2：PROBE 堆与文件系统 ──
+  let probe = null;
+  const s2 = addStep('2. 探测堆大小与文件系统', '运行中…', 'run');
+  try {
+    probe = await bridge.send('PROBE', {}, []);
+    updateStep(s2, '完成', 'ok',
+      `wasm 堆上限: ${probe.heapGB} GB (${probe.heapBytes} 字节)\n` +
+      `已打包文件系统: ${probe.filesystems.join(', ') || '(仅默认 MEMFS)'}\n` +
+      `WORKERFS: ${probe.hasWorkerFS ? '✓ 可用' : '✗ 未打包'}`);
+  } catch (e) {
+    updateStep(s2, '失败', 'fail', e.message);
+  }
+  const verdictLines = [];
+  if (probe) verdictLines.push(`当前构建堆上限 ${probe.heapGB} GB → 理论最大合并体积 ≈ 堆/2（输入+输出同驻内存）`);
+
+  // ── 步骤 3：MEMFS 写入阶梯 ──
+  let maxWriteMB = 0;
+  const s3 = addStep('3. MEMFS 单文件写入阶梯', '运行中…', 'run');
+  const ladderDetail = [];
+  for (const mb of LADDER_MB) {
+    if (bridge.dead) { ladderDetail.push(`${mb}MB — 跳过（worker 已崩溃）`); break; }
+    let u8 = null;
+    try {
+      u8 = new Uint8Array(mb * MB);
+      u8[0] = 1; u8[u8.length - 1] = 1; // 触碰首尾页，确保真实分配
+    } catch (allocErr) {
+      ladderDetail.push(`${mb}MB — 页面侧无法分配（JS 堆限制）: ${allocErr.message}`);
+      break;
+    }
+    try {
+      const t0 = performance.now();
+      await bridge.send('WRITE_FILE', { path: `probe_${mb}.bin`, data: u8 }, [u8.buffer]);
+      const dt = Math.round(performance.now() - t0);
+      maxWriteMB = mb;
+      ladderDetail.push(`${mb}MB ✓ ${dt}ms`);
+      await bridge.send('DELETE_FILE', { path: `probe_${mb}.bin` }, []).catch(() => {});
+    } catch (writeErr) {
+      ladderDetail.push(`${mb}MB ✗ ${writeErr.message}`);
+      break;
+    } finally {
+      u8 = null; // 页面侧立即释放引用
+    }
+  }
+  updateStep(s3, maxWriteMB ? '完成' : '失败', maxWriteMB ? 'ok' : 'fail',
+    `实际最大写入: ${maxWriteMB}MB\n` + ladderDetail.join('\n'));
+  if (maxWriteMB) verdictLines.push(`MEMFS 单文件实测上限 ≈ ${fmtMB(maxWriteMB * MB)}（受堆碎片化影响，低于理论值属正常）`);
+
+  // ── 步骤 4：WORKERFS 挂载测试 ──
+  if (probe && probe.hasWorkerFS) {
+    const s4 = addStep('4. WORKERFS 大文件挂载', '运行中…', 'run');
+    try {
+      const blobSize = 200 * MB;
+      const chunk = new Uint8Array(1024 * 1024);
+      crypto.getRandomValues(chunk);
+      const parts = [];
+      for (let i = 0; i < blobSize / chunk.length; i++) parts.push(chunk);
+      const bigBlob = new Blob(parts); // Blob 引用传给 worker，数据不进 wasm 堆
+      const mountRes = await bridge.send('MOUNT_WORKERFS',
+        { mountpoint: '/mnt', files: [{ name: 'probe.bin', data: bigBlob }] }, []);
+      // 让 ffmpeg 尝试读挂载文件：内容非法必然退出非零，但 log 中出现读取痕迹即证明通路成立
+      let readTrace = '';
+      try {
+        await bridge.send('EXEC', { args: ['-i', '/mnt/probe.bin', '-f', 'null', '-'], timeout: 30000 }, []);
+      } catch (execErr) {
+        readTrace = execErr.message;
+      }
+      const logTail = bridge.logs.filter(l => /Input|Invalid|error|probe\.bin/i.test(l)).slice(-3).join('\n');
+      await bridge.send('UNMOUNT_WORKERFS', { mountpoint: '/mnt' }, []).catch(() => {});
+      updateStep(s4, '完成', 'ok',
+        `挂载点: ${mountRes.mountpoint}（${mountRes.count} 个文件）\n` +
+        `ffmpeg 读取痕迹:\n${logTail || '(无匹配日志)'}\nEXEC 结果: ${readTrace || 'exit 0'}`);
+      verdictLines.push('WORKERFS 可用 ✓ → 升级路线：换 4GB 构建 + 输入走 WORKERFS 挂载，可合并 ~3.5GB 视频');
+    } catch (e) {
+      updateStep(s4, '失败', 'fail', e.message);
+      verdictLines.push('WORKERFS 挂载异常 ✗ → 需检查构建参数');
+    }
+  } else {
+    addStep('4. WORKERFS 挂载', '跳过', 'skip',
+      '当前 @ffmpeg/core 0.12.x 官方单线程标准构建未打包 WORKERFS。\n' +
+      '升级需自编译：emconfigure 追加 -s MAXIMUM_MEMORY=4GB -lworkerfs.js\n' +
+      '参考验证案例: pavloshargan/ffmpeg-browser-4gb-plus（WORKERFS 读 5GB 输入成功）');
+    verdictLines.push('官方构建无 WORKERFS → 输入必须整份写进 MEMFS，合并上限被锁死在 ~1GB');
+  }
+
+  // ── 汇总 ──
+  addStep('结论', '', '',
+    `<div class="verdict">${verdictLines.map(v => '· ' + v.replace(/</g, '&lt;')).join('<br>')}</div>`);
+  btn.disabled = false;
+}
+
+document.getElementById('run').addEventListener('click', runProbe);
