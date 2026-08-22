@@ -131,10 +131,36 @@
     }
   });
 
+  // 扩展上下文有效性探测：扩展重载/更新/停用后，残留的旧 content script 成为孤儿，
+  // chrome.runtime 绑定失效，任何 runtime API 调用都会同步抛 "Extension context invalidated."
+  function contextAlive() {
+    try {
+      return !!(chrome.runtime && chrome.runtime.id);
+    } catch (e) {
+      return false;
+    }
+  }
+
   // Listen for messages from page context
-  window.addEventListener('message', (event) => {
+  const onPageMessage = (event) => {
     if (event.source !== window) return;
     if (event.data?.source !== 'bilibili-downloader') return;
+
+    // 孤儿脚本降级：按既有响应契约回执失败（页面世界据此立即走 <a download> 等回退，
+    // 不必挂到超时），随后自清理监听器，避免后续每条消息都抛未捕获错误
+    if (!contextAlive()) {
+      const t = event.data.type;
+      if (t === 'SAVE_BLOB') {
+        window.postMessage({ source: 'bilibili-downloader', type: 'save_blob_result', data: { requestId: event.data.data?.requestId, success: false, error: '扩展已重载或更新，请刷新页面后重试' } }, '*');
+      } else if (t === 'GET_SETTINGS') {
+        window.postMessage({ source: 'bilibili-downloader', type: 'settings_result', data: {} }, '*');
+      } else if (t === 'DELETE_BLOB_FILE') {
+        window.postMessage({ source: 'bilibili-downloader', type: 'delete_blob_result', data: { requestId: event.data.data?.requestId, success: false, error: '扩展已重载或更新，请刷新页面后重试' } }, '*');
+      }
+      console.warn('[B站下载助手] 扩展已重载或更新，请刷新页面以恢复下载功能');
+      window.removeEventListener('message', onPageMessage);
+      return;
+    }
 
     const { type, data } = event.data;
 
@@ -164,10 +190,16 @@
         saveBlobToDB(taskId + '_video', video)
       ]).then(() => {
         console.log('[B站下载助手] Blobs stored, sending merge request to background');
-        chrome.runtime.sendMessage({
-          type: 'offscreen_merge',
-          data: { taskId }
-        });
+        try {
+          chrome.runtime.sendMessage({ type: 'offscreen_merge', data: { taskId } });
+        } catch (e) {
+          // 入口守卫与发送之间存在异步失效窗口，失败必须回执，否则 UI 永远等待 merge_result
+          const cb = pendingMerges.get(taskId);
+          if (cb) {
+            pendingMerges.delete(taskId);
+            cb({ success: false, error: '扩展上下文已失效: ' + e.message });
+          }
+        }
       }).catch(e => {
         console.debug('[B站下载助手] Failed to store blobs:', e);
         const cb = pendingMerges.get(taskId);
@@ -181,13 +213,18 @@
 
     // Handle GET_SETTINGS
     if (type === 'GET_SETTINGS') {
-      chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }, (result) => {
-        if (chrome.runtime.lastError) {
-          window.postMessage({ source: 'bilibili-downloader', type: 'settings_result', data: {} }, '*');
-          return;
-        }
-        window.postMessage({ source: 'bilibili-downloader', type: 'settings_result', data: result || {} }, '*');
-      });
+      const replySettings = (result, err) => {
+        window.postMessage({ source: 'bilibili-downloader', type: 'settings_result', data: err ? {} : (result || {}) }, '*');
+      };
+      try {
+        chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }, (result) => {
+          if (chrome.runtime.lastError) { replySettings(null, true); return; }
+          replySettings(result);
+        });
+      } catch (e) {
+        // 上下文在处理中途失效（id 可读但调用抛错的 Chrome 表现），按契约回执空设置
+        replySettings(null, true);
+      }
       return;
     }
 
@@ -197,35 +234,51 @@
       const filePath = subdir ? subdir + '/' + filename : filename;
       // 直接使用页面传来的 Blob 引用：结构化克隆共享底层数据，不做 buffer 全量拷贝
       const extUrl = URL.createObjectURL(blob);
-      chrome.runtime.sendMessage({ type: 'SAVE_FILE', data: { url: extUrl, path: filePath } }, (result) => {
-        // 响应在下载终态后返回，立即回收数据源；提前 revoke 会中断大文件的写入
+      const replySave = (payload) => {
+        window.postMessage({ source: 'bilibili-downloader', type: 'save_blob_result', data: { requestId, ...payload } }, '*');
+      };
+      try {
+        chrome.runtime.sendMessage({ type: 'SAVE_FILE', data: { url: extUrl, path: filePath } }, (result) => {
+          // 响应在下载终态后返回，立即回收数据源；提前 revoke 会中断大文件的写入
+          URL.revokeObjectURL(extUrl);
+          if (chrome.runtime.lastError) {
+            replySave({ success: false, error: chrome.runtime.lastError.message });
+            return;
+          }
+          // downloadId 透传给页面世界，供"合并成功后按设置删除原始文件"使用
+          replySave({ success: result?.success, error: result?.error, downloadId: result?.downloadId || null });
+        });
+      } catch (e) {
+        // 发送即失效（id 可读但调用抛错的孤儿脚本表现）：回收数据源并回执失败，
+        // 页面世界收到 success:false 立即降级 <a download>，不必挂到 30 分钟超时
         URL.revokeObjectURL(extUrl);
-        if (chrome.runtime.lastError) {
-          window.postMessage({ source: 'bilibili-downloader', type: 'save_blob_result', data: { requestId, success: false, error: chrome.runtime.lastError.message } }, '*');
-          return;
-        }
-        // downloadId 透传给页面世界，供"合并成功后按设置删除原始文件"使用
-        window.postMessage({ source: 'bilibili-downloader', type: 'save_blob_result', data: { requestId, success: result?.success, error: result?.error, downloadId: result?.downloadId || null } }, '*');
-      });
+        replySave({ success: false, error: e.message });
+      }
       return;
     }
 
     // Handle DELETE_BLOB_FILE - 删除已落盘的原始文件（合并成功后按设置清理）
     if (type === 'DELETE_BLOB_FILE') {
       const { requestId, downloadId } = data;
-      chrome.runtime.sendMessage({ type: 'DELETE_SAVED_FILE', data: { downloadId } }, (result) => {
-        if (chrome.runtime.lastError) {
-          window.postMessage({ source: 'bilibili-downloader', type: 'delete_blob_result', data: { requestId, success: false, error: chrome.runtime.lastError.message } }, '*');
-          return;
-        }
-        window.postMessage({ source: 'bilibili-downloader', type: 'delete_blob_result', data: { requestId, success: result?.success, error: result?.error } }, '*');
-      });
+      const replyDelete = (success, err) => {
+        window.postMessage({ source: 'bilibili-downloader', type: 'delete_blob_result', data: { requestId, success, error: err } }, '*');
+      };
+      try {
+        chrome.runtime.sendMessage({ type: 'DELETE_SAVED_FILE', data: { downloadId } }, (result) => {
+          if (chrome.runtime.lastError) { replyDelete(false, chrome.runtime.lastError.message); return; }
+          replyDelete(result?.success !== false, result?.error);
+        });
+      } catch (e) {
+        replyDelete(false, e.message);
+      }
       return;
     }
 
     // Handle DELETE_FILE
     if (type === 'DELETE_FILE') {
-      chrome.runtime.sendMessage({ type: 'DELETE_FILE', data }, () => {});
+      try {
+        chrome.runtime.sendMessage({ type: 'DELETE_FILE', data }, () => {});
+      } catch (e) {}
       return;
     }
 
@@ -236,5 +289,6 @@
         if (chrome.runtime.lastError) {}
       });
     } catch(e) {}
-  });
+  };
+  window.addEventListener('message', onPageMessage);
 })();
