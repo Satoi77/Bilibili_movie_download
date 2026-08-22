@@ -49,6 +49,13 @@ master 分支不受影响。
 
 产物替换 `lib/ffmpeg-core.js/.wasm/.worker.js`，下载链路增加 WORKERFS 挂载输入（`lib/ffmpeg.worker.js` 的 MOUNT_WORKERFS 已就绪），合并命令改为从 `/mnt/` 读输入。
 
+**自编译升级时的配套改造**（官方构建下收益有限，暂不实施）：
+
+- 输入分块写入：`mergeAudioVideo` 目前 `arrayBuffer()` 整读输入再 transfer——单块 ArrayBuffer ~2GB 上限使 >2GB 输入无法送进 worker。需 worker 增加 APPEND_CHUNK 指令，主线程按块 `file.slice().arrayBuffer()` 循环传输
+- 输出分块读出：`readFile(outputPath)` 整读会在堆内产生第二份输出副本；改 `FS.read` 定位循环 + 主线程 Blob chunks 累积，堆峰值进一步从 2T 降到 ≈T+窗口
+
+已基于实测落地的优化（master d74327f）：readFile 前先删输入（堆峰值 3T→2T，可合并体积上限提升约 300MB）；总大小 ≥900MB 跳过合并尝试（确定性失败区不浪费尝试、不杀死 worker）。
+
 ---
 
 ## 实测结果（2026-08-22，用户浏览器实测）
