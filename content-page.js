@@ -11,28 +11,28 @@
     window.postMessage({ source: 'bilibili-downloader', type, data }, '*');
   }
 
+  // 等待 ESM 解析器就绪（模块脚本异步执行，最长等 5 秒）
+  async function ensureParser() {
+    if (window.BiliCollectionParser) return window.BiliCollectionParser;
+    for (let i = 0; i < 50; i++) {
+      await new Promise(r => setTimeout(r, 100));
+      if (window.BiliCollectionParser) return window.BiliCollectionParser;
+    }
+    throw new Error('合集解析器未就绪');
+  }
+
   // ─── API Helpers ───
   async function fetchPageHTML(url) {
     const r = await fetch(url || location.href, {credentials:'include'});
     return r.text();
   }
 
-  function parseInitialState(html) {
-    let m = html.match(/<script>window\.__INITIAL_STATE__=(.+?)<\/script>/);
-    if (m && m[1]) {
-      try {
-        let s = m[1].replace(/;\(function\(\)\{.*?\}\(\)\);?$/, '');
-        const st = JSON.parse(s);
-        if (st.videoData) return st.videoData;
-      } catch(e) {}
-    }
-    return null;
-  }
-
   async function getVideoInfo(url) {
     const html = await fetchPageHTML(url);
-    const vd = parseInitialState(html);
-    if (!vd) return null;
+    const parser = await ensureParser();
+    const st = parser.extractInitialState(html);
+    if (!st || !st.videoData) return null;
+    const vd = st.videoData;
     return { aid: vd.aid, bvid: vd.bvid, cid: vd.cid, title: vd.title, pages: vd.pages || [] };
   }
 
@@ -58,93 +58,51 @@
   }
 
   async function sniffCollection() {
-    const videos = [];
-    const seen = new Set();
-    let collectionName = '';
-    
-    // Extract from __INITIAL_STATE__
     try {
       const html = await fetchPageHTML();
-      const stateMatch = html.match(/<script>window\.__INITIAL_STATE__=(.+?)<\/script>/);
-      if (stateMatch && stateMatch[1]) {
-        let stateStr = stateMatch[1].replace(/;\(function\(\)\{.*?\}\(\)\);?$/, '');
-        const state = JSON.parse(stateStr);
-        
-        // Extract collection name from multiple possible locations
-        if (state.ugc_season?.title) {
-          collectionName = state.ugc_season.title;
-        } else if (state.collection?.title) {
-          collectionName = state.collection.title;
-        } else if (state.series?.title) {
-          collectionName = state.series.title;
-        } else if (state.title && state.sections) {
-          // Direct top-level with sections = collection page
-          collectionName = state.title;
-        }
-        
-        // Extract videos from ugc_season
-        if (state.ugc_season?.section) {
-          state.ugc_season.section.forEach(section => {
-            (section.episodes || []).forEach(ep => {
-              const bvid = ep.bvid;
-              if (bvid && !seen.has(bvid)) {
-                seen.add(bvid);
-                videos.push({
-                  bvid,
-                  title: ep.title || ep.arc?.title || '',
-                  aid: ep.aid || ep.arc?.aid,
-                  cid: ep.cid,
-                  url: `https://www.bilibili.com/video/${bvid}`
-                });
-              }
-            });
-          });
-        }
-        
-        // Multi-page video
-        if (state.videoData?.pages && state.videoData.pages.length > 1) {
-          if (!collectionName) collectionName = state.videoData.title || '';
-          state.videoData.pages.forEach(p => {
-            const bvid = state.videoData.bvid;
-            if (!seen.has(bvid + '_p' + p.page)) {
-              seen.add(bvid + '_p' + p.page);
-              videos.push({
-                bvid,
-                title: `P${p.page} ${p.part || ''}`,
-                aid: state.videoData.aid,
-                cid: p.cid,
-                url: `https://www.bilibili.com/video/${bvid}?p=${p.page}`
-              });
-            }
-          });
-        }
-      }
+      const parser = await ensureParser();
+      const state = parser.extractInitialState(html);
+      const tree = state && parser.buildCollectionTree(state);
+      if (tree) return tree;
     } catch(e) {
-      console.warn('[B站下载助手] __INITIAL_STATE__ parse error:', e);
+      console.warn('[B站下载助手] __INITIAL_STATE__ 解析失败:', e);
     }
-    
-    // DOM fallback: data-key attributes
-    if (videos.length === 0) {
-      const items = document.querySelectorAll('[data-key^="BV"]');
-      items.forEach(item => {
-        const bvid = item.getAttribute('data-key');
-        if (!bvid || seen.has(bvid)) return;
-        seen.add(bvid);
-        const titleEl = item.querySelector('.title-txt') || item.querySelector('[class*="title"]');
-        const title = titleEl?.textContent?.trim() || '';
-        if (title) {
-          videos.push({ bvid, title, url: `https://www.bilibili.com/video/${bvid}` });
+
+    // DOM 兜底（series 页等无状态数据场景）：partsKnown=false 组，入队时经 getVideoInfoByBvid 展开
+    const seen = new Set();
+    const groups = [];
+    document.querySelectorAll('[data-key^="BV"]').forEach(item => {
+      const bvid = item.getAttribute('data-key');
+      if (!bvid || seen.has(bvid)) return;
+      seen.add(bvid);
+      const titleEl = item.querySelector('.title-txt') || item.querySelector('[class*="title"]');
+      const title = titleEl?.textContent?.trim() || '';
+      if (title) {
+        groups.push({ title, bvid, aid: '', cover: '', partsKnown: false, parts: [] });
+      }
+    });
+    if (groups.length === 0) return null;
+    const collectionName = document.title?.replace(/- Bilibili.*$/, '').replace(/_哔哩哔哩.*$/, '').trim() || '合集下载';
+    console.log('[B站下载助手] DOM 兜底嗅探:', groups.length, '个视频');
+    return { collectionName, groups };
+  }
+
+  // 旧版扁平列表 UI 适配层：树 → 平铺单元（已知 cid 直接给，未知组整视频交给 getVideoInfoByBvid）
+  function flattenTreeToLegacyVideos(tree) {
+    const videos = [];
+    for (const g of tree.groups) {
+      if (g.partsKnown && g.parts.length > 0) {
+        for (const pt of g.parts) {
+          videos.push({
+            bvid: g.bvid, aid: g.aid, cid: pt.cid,
+            title: g.parts.length > 1 ? `${g.title} P${pt.p} ${pt.title}` : g.title
+          });
         }
-      });
+      } else {
+        videos.push({ bvid: g.bvid, aid: g.aid, title: g.title });
+      }
     }
-    
-    // Fallback collection name
-    if (!collectionName && videos.length > 0) {
-      collectionName = document.title?.replace(/- Bilibili.*$/, '').replace(/_哔哩哔哩.*$/, '').trim() || '合集下载';
-    }
-    
-    console.log('[B站下载助手] Sniffed videos:', videos.length, 'collection:', collectionName);
-    return { videos, collectionName };
+    return videos;
   }
 
   function fmtSize(bytes) {
@@ -1025,9 +983,10 @@
     body.innerHTML = '<div style="text-align:center;color:#999;padding:20px;">正在嗅探合集视频...</div>';
     
     try {
-      const { videos, collectionName } = await sniffCollection();
+      const tree = await sniffCollection();
+      const videos = tree ? flattenTreeToLegacyVideos(tree) : [];
       currentCollectionVideos = videos;
-      
+
       if (videos.length === 0) {
         body.innerHTML = `<div style="text-align:center;color:#999;padding:20px;">
           <div style="margin-bottom:8px;">未检测到合集/系列视频</div>
@@ -1043,7 +1002,7 @@
       body.innerHTML = `
         <div style="flex-shrink:0;padding:16px 16px 0 16px;">
         <div style="margin-bottom:12px;padding:8px 12px;background:#f5f5f5;border-radius:6px;font-size:12px;color:#666;">
-          合集: <span style="color:#00a1d6;font-weight:500;">${collectionName}</span> (${videos.length}个视频)
+          合集: <span style="color:#00a1d6;font-weight:500;">${tree.collectionName}</span> (${videos.length}个视频)
         </div>
         <div style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;">
           <span style="font-weight:500;">选择下载视频</span>
@@ -1080,7 +1039,7 @@
           return;
         }
         
-        console.log('[B站下载助手] Batch starting, selected:', selected.length, 'collection:', collectionName);
+        console.log('[B站下载助手] Batch starting, selected:', selected.length, 'collection:', tree.collectionName);
         hidePanel();
         
         // Step 1: Fetch all video infos
@@ -1094,8 +1053,16 @@
               info = await getVideoInfoByBvid(v.bvid);
             }
             if (info) {
-              const taskId = 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
-              taskInfos.push({ ...info, taskId });
+              // 多P视频展开为多个任务单元（否则只能下到 P1）
+              const pgList = (Array.isArray(info.pages) && info.pages.length > 1) ? info.pages : [null];
+              for (const pg of pgList) {
+                taskInfos.push({
+                  taskId: 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6),
+                  aid: info.aid, bvid: info.bvid,
+                  cid: pg ? pg.cid : info.cid,
+                  title: pg ? `${info.title} P${pg.page} ${pg.part}` : info.title
+                });
+              }
             } else {
               console.warn('[B站下载助手] Could not get info for:', v.bvid);
             }

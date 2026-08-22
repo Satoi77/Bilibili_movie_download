@@ -2,6 +2,16 @@
 (function() {
   let pageReady = false; // 页面世界的 content-page.js 是否已加载（宿主 tab 就绪判据）
 
+  // 合集解析器（ESM）：以 module 方式注入页面世界，执行后挂 window.BiliCollectionParser。
+  // 模块脚本为异步加载，与下方经典脚本的先后顺序不保证，消费方以轮询等待兜底（同 ffmpeg_urls 模式）
+  if (!document.getElementById('bilibili-dl-parser')) {
+    const p = document.createElement('script');
+    p.id = 'bilibili-dl-parser';
+    p.type = 'module';
+    p.src = chrome.runtime.getURL('lib/collection-parser.js');
+    (document.head || document.documentElement).appendChild(p);
+  }
+
   // Always inject page script first (non-blocking)
   if (!document.getElementById('bilibili-downloader-ext')) {
     const s = document.createElement('script');

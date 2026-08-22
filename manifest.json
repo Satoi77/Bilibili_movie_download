@@ -33,7 +33,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["content-page.js", "lib/ffmpeg.worker.js", "lib/ffmpeg-core.js", "lib/ffmpeg-core.wasm", "lib/ffmpeg-core.worker.js"],
+      "resources": ["content-page.js", "lib/collection-parser.js", "lib/ffmpeg.worker.js", "lib/ffmpeg-core.js", "lib/ffmpeg-core.wasm", "lib/ffmpeg-core.worker.js"],
       "matches": ["*://*.bilibili.com/*"]
     }
   ],
