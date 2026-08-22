@@ -626,7 +626,8 @@
       if (controller.signal.aborted) {
         notify('TASK_ABORTED', { taskId });
       } else {
-        console.error('[B站下载助手] Task failed:', taskId, e);
+        // 预期内的任务失败已通过 TASK_ERROR 上报 UI，用 debug 级避免被浏览器扩展错误日志收集刷屏
+        console.debug('[B站下载助手] Task failed:', taskId, e);
         notify('TASK_ERROR', { taskId, error: e.message });
       }
     } finally {
@@ -640,7 +641,7 @@
     
     const data = await getPlayUrl(videoInfo.aid, videoInfo.bvid, videoInfo.cid, 80, signal);
     if (!data?.dash) {
-      console.error('[B站下载助手] getPlayUrl returned null or no dash:', data);
+      console.debug('[B站下载助手] getPlayUrl returned null or no dash:', data);
       throw new Error('获取播放地址失败');
     }
     console.log('[B站下载助手] dash videos:', data.dash.video.length, 'audios:', data.dash.audio.length);

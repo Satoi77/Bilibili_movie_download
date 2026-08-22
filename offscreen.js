@@ -300,7 +300,8 @@ async function runOffscreenTask(taskId, videoInfo, qualityIdx) {
     } else if (e.code === 'NEEDS_PAGE') {
       sendToBg({ type: 'OFFSCREEN_NEEDS_PAGE', data: { taskId } });
     } else {
-      console.error('[B站下载助手] Offscreen task failed:', taskId, e);
+      // 预期内的任务失败已通过 OFFSCREEN_TASK_ERROR 上报，用 debug 级避免刷爆扩展错误日志
+      console.debug('[B站下载助手] Offscreen task failed:', taskId, e);
       sendToBg({ type: 'OFFSCREEN_TASK_ERROR', data: { taskId, error: e.message } });
     }
   } finally {
