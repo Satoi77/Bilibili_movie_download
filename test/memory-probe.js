@@ -62,9 +62,19 @@ function addStep(name, status, cls, detail) {
   return div;
 }
 function updateStep(div, status, cls, detail) {
-  div.querySelector('.status').textContent = status;
-  div.querySelector('.status').className = 'status ' + cls;
-  if (detail !== undefined) div.querySelector('.detail').textContent = detail;
+  const st = div.querySelector('.status');
+  st.textContent = status;
+  st.className = 'status ' + cls;
+  if (detail !== undefined) {
+    // 错误展示路径必须比业务路径更健壮：展示代码崩溃会掩盖真实错误
+    let d = div.querySelector('.detail');
+    if (!d) {
+      d = document.createElement('div');
+      d.className = 'detail';
+      div.appendChild(d);
+    }
+    d.textContent = detail;
+  }
 }
 function fmtMB(n) { return n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' GB' : Math.round(n / MB) + ' MB'; }
 
