@@ -1,5 +1,7 @@
 # FFmpeg 4GB 内存方案验证（feature/ffmpeg-4gb 分支）
 
+> **2026-08-22 实测完成，最终结论见文末「实测结果」。**
+
 ## 背景与调研结论
 
 当前使用 @ffmpeg/core 0.12.x 官方单线程标准构建（`lib/ffmpeg-core.wasm`，30.1MB）：
@@ -45,3 +47,22 @@ master 分支不受影响。
 ```
 
 产物替换 `lib/ffmpeg-core.js/.wasm/.worker.js`，下载链路增加 WORKERFS 挂载输入（`lib/ffmpeg.worker.js` 的 MOUNT_WORKERFS 已就绪），合并命令改为从 `/mnt/` 读输入。
+
+---
+
+## 实测结果（2026-08-22，用户浏览器实测）
+
+| 探测项 | 结果 | 判读 |
+|---|---|---|
+| 加载 | 成功，54ms | 链路正常 |
+| 初始堆 | 32MB（0.03GB） | INITIAL_MEMORY 快照；非上限 |
+| MEMFS 写入 1024MB / 1536MB | ✓ 235ms / 470ms | ALLOW_MEMORY_GROWTH 开启且工作正常 |
+| 页面侧分配 2048MB Uint8Array | ✗ `Array buffer allocation failed` | **Chrome 单块 ArrayBuffer ~2GB 上限**——JS 侧先于 wasm 侧撞墙 |
+| WORKERFS | 未打包（仅 MEMFS） | 官方构建预期内 |
+
+**最终结论**：
+
+1. 官方构建存在**双重天花板**：wasm 堆 `MAXIMUM_MEMORY` 默认 2GB + 单块 ArrayBuffer ~2GB（输入 transfer 进 worker 前必须在 JS 侧整块分配）。合并需 ≈2×总大小同驻堆 → **总大小封顶 ~1GB**。
+2. 600MB 合并阈值有完整实测背书；3.21GB 视频在官方构建下任何调参都无法合并，"先落盘分离文件保底再尝试合并"策略（master 317c7a5）是官方构建下的最优解。
+3. 升级唯一解 = 自编译 4GB 构建 + WORKERFS：WORKERFS 输入以磁盘 backed Blob 直挂，**完全绕开 ArrayBuffer 上限**（比单纯加大堆更本质）；输出 stream-copy 占堆 ≈总大小 ≤4GB → 理论可合并 ~3.5GB 视频。投入成本：Emscripten 编译环境 + 替换 lib/ 三件产物 + 下载链路改挂载读入。
+4. 观察备注：写入 1536MB 后 PROBE 的 HEAPU8.length 仍显示 32MB——Module 导出视图在 growth 后未同步（陈旧视图），不影响结论（写入成功本身证明增长），后续探测勿以该指标判断上限。
