@@ -155,6 +155,13 @@
     return bytes+'B';
   }
 
+  // B 站 playurl 的 dash size 字段已实测返回空值：优先取值，空则按 bandwidth(位/秒)×duration(秒) 估算
+  function dashSize(entry, durationSec) {
+    if (entry?.size) return entry.size;
+    if (entry?.bandwidth && durationSec > 0) return Math.round(entry.bandwidth / 8 * durationSec);
+    return 0;
+  }
+
   // ─── Timeout / abort helpers ───
 
   async function fetchWithTimeout(url, options, ms, signal) {
@@ -628,8 +635,9 @@
     const bestAudio = data.dash.audio[0];
     
     const label = QMAP[q] || q + 'P';
-    // B 站 playurl 的 dash 条目带精确字节数，上报给任务卡片展示
-    const totalSize = (bestVideo.size || 0) + (bestAudio.size || 0);
+    // B 站 playurl 的 dash 条目带精确字节数（size 为空时按码率估算），上报给任务卡片展示
+    const dur = data.dash.duration || Math.round((data.timelength || 0) / 1000);
+    const totalSize = dashSize(bestVideo, dur) + dashSize(bestAudio, dur);
     notify('download_progress', { taskId, phase: 'quality', percent: 0, label, totalSize });
     
     if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
@@ -645,7 +653,9 @@
     if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
     
     notify('download_progress', { taskId, phase: 'download', percent: 100, label: '下载完成' });
-    
+    // 用真实字节数修正任务卡片的合计容量（入队时的值为估算）
+    notify('download_progress', { taskId, phase: 'quality', percent: 0, totalSize: audioBlob.size + videoBlob.size });
+
     const safeTitle = sanitizeFilename(title);
     const baseSubdir = DOWNLOAD_BASE;
     let rawSaved = false;
@@ -841,14 +851,15 @@
         videoByQ[v.id].push(v);
       });
       
+      const dashDur = data.dash.duration || Math.round((data.timelength || 0) / 1000);
       const options = Object.keys(videoByQ).map(Number).sort((a,b) => b-a).map(q => {
         const streams = videoByQ[q].sort((a,b) => b.bandwidth - a.bandwidth);
         return {
           q, label: QMAP[q] || q+'P',
           videoUrl: streams[0].baseUrl,
           audioUrl: data.dash.audio[0].baseUrl,
-          videoSize: streams[0].size || 0,
-          audioSize: data.dash.audio[0].size || 0
+          videoSize: dashSize(streams[0], dashDur),
+          audioSize: dashSize(data.dash.audio[0], dashDur)
         };
       });
       
@@ -1013,10 +1024,11 @@
               });
               const topQ = Object.keys(byQ).map(Number).sort((a,b) => b-a)[0];
               const topVideo = byQ[topQ].sort((a,b) => b.bandwidth - a.bandwidth)[0];
+              const dur = d.dash.duration || Math.round((d.timelength || 0) / 1000);
               notify('UPDATE_TASK_SIZE', {
                 taskId: info.taskId,
-                videoSize: topVideo?.size || 0,
-                audioSize: d.dash.audio[0]?.size || 0
+                videoSize: dashSize(topVideo, dur),
+                audioSize: dashSize(d.dash.audio[0], dur)
               });
             } catch(e) {
               console.warn('[B站下载助手] 补全任务体积失败:', info.title, e);
