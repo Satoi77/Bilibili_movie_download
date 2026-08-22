@@ -1,58 +1,58 @@
-# Task 2 报告：offscreen.html + offscreen.js — offscreen 下载执行器
+# Task 2 报告：注入接线与嗅探重写（manifest + content.js + content-page.js）
+
+**Status: DONE_WITH_CONCERNS（唯一 concern：Step 7 手动冒烟待用户验收）**
 
 ## 实现内容
 
-1. **offscreen.html**：`<script src="offscreen.js"></script>` → `<script type="module" src="offscreen.js"></script>`
-2. **offscreen.js**：按 brief 逐字重写，新增下载执行引擎：
-   - 顶部 `import { executeTask } from './lib/download-core.js'`
-   - 原 FFmpeg 合并路径（`loadFFmpeg` / `openMergeDB` / `readBlobFromDB` / `deleteBlobFromDB` / `mergeWithFFmpeg`）完整保留
-   - 新增 `FFmpegBridge`（Blob URL Worker 通信桥，含 `Op` 协议 / `RESULT_OPS` / 私有字段）与 `createFFmpeg`（fetch→Blob→BlobURL 加载 ffmpeg-core）
-   - 新增后台任务执行：`activeTaskControllers` / `sendToBg` / `notify` / `getSettings` / `saveBlob` / `runOffscreenTask`
-   - 消息监听：`OFFSCREEN_PING`（返回 `{status:'ok'}`）、`OFFSCREEN_RUN_TASK`、`OFFSCREEN_ABORT_TASK`、`offscreen_merge_request`（一字不改）
-   - 回报消息：`OFFSCREEN_PROGRESS` / `OFFSCREEN_TASK_DONE` / `OFFSCREEN_TASK_ERROR` / `OFFSCREEN_TASK_ABORTED` / `OFFSCREEN_NEEDS_PAGE`
+严格按简报 Step 1→8 顺序执行，代码逐字采用简报给定版本：
 
-## 验证命令与输出
+1. **manifest.json:36** — `web_accessible_resources.resources` 加入 `"lib/collection-parser.js"`。
+2. **content.js:5-16** — 原注入块之前插入解析器注入块：`<script type="module">` 方式加载 `lib/collection-parser.js`（id `bilibili-dl-parser`），先于 content-page.js 注入；保留原"先后顺序不保证、轮询兜底"注释。
+3. **content-page.js:14-22** — `notify` 之后新增 `ensureParser()`：轮询 `window.BiliCollectionParser`（50×100ms = 5 秒上限），超时抛 `'合集解析器未就绪'`。
+4. **content-page.js:29-37** — 删除整个旧 `parseInitialState`（已 grep 确认全仓无其他调用方）；`getVideoInfo` 改为 `fetchPageHTML → ensureParser → parser.extractInitialState(html)`，返回形状 `{aid,bvid,cid,title,pages}` 完全不变（单视频下载路径向后兼容）。
+5. **content-page.js:60-89** — `sniffCollection()` 整体替换：先走解析器 `buildCollectionTree` 返回两级树；失败/无树时 DOM 兜底产出 `{collectionName, groups}`，兜底组形状 `{title, bvid, aid:'', cover:'', partsKnown:false, parts:[]}`。返回 null 当且仅当兜底也无视频。
+6. **content-page.js:91-107** — 新增临时适配层 `flattenTreeToLegacyVideos(tree)`：`partsKnown && parts.length>0` 的组按 parts 展开为 `{bvid, aid, cid, title}`（多P时标题拼 `P{n} {part.title}`）；否则整组输出 `{bvid, aid, title}`（无 cid → 入队时经 getVideoInfoByBvid 展开）。Task 4 移除。
+7. **content-page.js:986-987 / 1005 / 1042 / 批量处理器 Step 1 循环** — showCollectionTab 适配：解构改为 `tree + flattenTreeToLegacyVideos`；模板与闭包 console 两处 `collectionName` → `tree.collectionName`；批量点击处理器把单条 push 替换为多P展开（`info.pages.length > 1` 时每P一个任务单元，cid/title 按 page 取，否则维持单任务）。
 
-### 1. 语法检查（UTF-8 安全管道）
-```powershell
-$OutputEncoding = [System.Text.Encoding]::UTF8
-[System.IO.File]::ReadAllText('offscreen.js', [System.Text.Encoding]::UTF8) | node --input-type=module --check
+未改动任何其他文件、任何输出路径逻辑、UI 其他区域。
+
+## 验证命令与实际输出
+
 ```
-输出：无输出，`exit=0`（用 `Write-Output "exit=$LASTEXITCODE"` 确认 `exit=0`）
-
-### 2. 保留 handler 比对
-用 node 脚本从 HEAD 版本与工作区版本中提取 `offscreen_merge_request` 块（normalize CRLF→LF 后比对）：
+node --check content-page.js   → 无输出（通过）
+node --check content.js        → 无输出（通过）
+node --check background.js     → 无输出（通过）
+node test/collection-parser.test.mjs → 24 passed, 0 failed
+node test/failure-alert.test.mjs     → 结果: 17 通过, 0 失败
 ```
-OLD handler len 716 NEW handler len 716
-MERGE_HANDLER_MATCH
-```
-即旧版 offscreen.js 中 `offscreen_merge_request` handler 与新版逐字节一致（差异仅为行尾符 LF/CRLF，属 git 自动换行处理）。
+链尾探针 `ALL_TESTS_EXIT_0` 打印，整体退出码 0。
 
-### 3. 接口一致性核对
-- `lib/download-core.js:102` 导出 `export async function executeTask(taskId, videoInfo, qualityIdx, deps)`
-- deps 契约 `{ getSettings, getFFmpeg, notify, saveBlob, signal }` 与 offscreen 传入参数完全对应
-- `executeTask` 内使用 `ffmpeg.writeFile/run/readFile/deleteFile`，`FFmpegBridge` 均提供
-- `e.code === 'NEEDS_PAGE'` 判定在 `download-core.js`（113/118 行设置）与 `runOffscreenTask`（检查）一致
+补充静态自检：
+- `parseInitialState` 在源码中零残留（仅历史简报/diff 归档文件中出现）；
+- content-page.js 中剩余 `collectionName` 引用全部合法（sniffCollection 内局部变量两处、showCollectionTab 的 `tree.collectionName` 两处）；
+- `sniffCollection` 仅 showCollectionTab 一处调用方，旧形状 `{videos, collectionName}` 解构已不存在。
 
-### 4. HTML 改动确认
-`offscreen.html` 第 5 行确为 `<script type="module" src="offscreen.js"></script>`
+## 文件变更（实际行号，改造后）
 
-## 变更文件
+| 文件 | 变更 |
+|---|---|
+| manifest.json | :36 |
+| content.js | :5-16（新增解析器注入块） |
+| content-page.js | :14-22 ensureParser；:29-37 getVideoInfo 重写+删 parseInitialState；:60-107 sniffCollection 替换+flattenTreeToLegacyVideos；:986-987/:1005/:1042/:1058-1073 showCollectionTab 适配 |
 
-- `offscreen.html`（1 行改）
-- `offscreen.js`（完整重写，201 insertions / 3 deletions，本次提交）
+## 提交
 
-提交：`4d4caa6 feat(download): offscreen 新增后台下载执行器，监听 OFFSCREEN_RUN_TASK`
-（仅暂存上述两个文件；`git status --short` 确认仅有未跟踪的 `.superpowers/` 目录，非本任务范围）
+- d6e4ef1 `feat(collection): 页面接入两级树解析器，修复嗅探路径并把合集各视频全部分P纳入批量下载`（3 files changed, 79 insertions(+), 102 deletions(-)）
 
-## 自审结论
+工作区另有 `.superpowers/sdd/` 下其他会话遗留变更（progress.md、task-1-*、task-2-brief.md 及未跟踪脚本/diff），按纪律未纳入本次提交。
 
-- **完整性**：四个消息处理齐备（OFFSCREEN_PING / OFFSCREEN_RUN_TASK / OFFSCREEN_ABORT_TASK / offscreen_merge_request）；五种回报消息（PROGRESS/DONE/ERROR/ABORTED/NEEDS_PAGE）齐全
-- **质量**：代码与 brief 逐字一致（含中文注释与 `console.log` 文案）
-- **纪律**：未改动其他任何文件（未触碰 lib/download-core.js、background.js、content.js、manifest.json）
-- **测试**：语法检查通过（exit 0）；merge handler 与旧版逐字节一致
+## 自检发现
 
-## 问题与关注点
+- Completeness：8 个 Step 全部处理；flattenTreeToLegacyVideos 对 partsKnown=false 组输出 `{bvid, aid, title}` 无 cid，正确触发批量处理器的 getVideoInfoByBvid 分支（DOM 兜底组 aid='' 为 falsy 同样命中该分支）。
+- Quality：旧 parseInitialState 删净；全部中文"为什么"注释随代码逐字带入。
+- Discipline：未动输出路径/UI 其他区域；多P展开仅替换了简报指定的 push 块。
 
-- **`lib/ffmpeg.js` 不存在**：遗留的 FFmpeg 合并路径 `loadFFmpeg()` 引用 `lib/ffmpeg.js`（`loadScript(extUrl('lib/ffmpeg.js'))`），但该文件已被此前提交 `1015006 chore: remove unused npm ffmpeg.js bundle` 移除（当前 `lib/` 仅有 ffmpeg-core.js/.wasm/.worker.js 与 ffmpeg.worker.js）。因此若实际调用 `offscreen_merge_request`，`loadScript` 会抛 "Failed to load"。这是**既有状况**，brief 明确要求原样保留该 handler 且不改其他文件，故未处理，仅提示：遗留合并路径当前不可用（下载主路径已切换到新的 FFmpegBridge 方案，不受影响）。
-- 提交时 git 提示 LF→CRLF 换行警告，属仓库 autocrlf 常规行为，无影响。
+## Concerns
+
+1. **Step 7 手动冒烟待用户手动验收**（需 chrome://extensions 加载扩展）：打开 https://www.bilibili.com/video/BV1sJwezxEpJ → 控制台应出现 `[B站下载助手] Page script loaded` → 合集嗅探 tab 应显示 55 个平铺单元（6 视频全部分P），而非当前视频的 11 分P。
+2. 多P展开的 taskId 由 `Date.now()+Math.random()` 生成，同一循环内毫秒碰撞理论可能但随机后缀使其概率可忽略（简报原文如此，未偏离）。

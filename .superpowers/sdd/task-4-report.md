@@ -1,56 +1,44 @@
-# Task 4 Report: background.js — 队列派发改 offscreen 优先 + 宿主 tab 兜底
+# Task 4 报告：合集 tab 两级树形 UI 重写
 
-**Status:** DONE_WITH_CONCERNS
-**Commit:** `1adfc9d feat(download): 队列派发改 offscreen 优先，失败自动切隐藏宿主 tab 兜底`
+**Status: DONE**
+**Commit: e008e8f `feat(ui): 合集tab两级树形勾选——父子三态联动+统一画质选择+按分P批量入队`（仅含 content-page.js，1 file changed, +249/-147）**
 
-## What was implemented
+## 实现内容
 
-按 task-4-brief 的 Step 1-7 逐条应用，仅修改 `background.js`：
+1. **UI 工具函数新增（content-page.js:783-793）**：在 `let currentVideoInfo = null;` 之后按简报逐字新增 `escAttr` / `fmtDur` / `padP` 三个函数。
+2. **删除 `currentCollectionVideos` 全部引用点（零残留）**：
+   - 声明 `let currentCollectionVideos = [];`（原 :800）— 已删
+   - showCollectionTab 内赋值 `currentCollectionVideos = videos;` — 随函数整体替换删除
+   - waitAndInit 内清零 `currentCollectionVideos = [];`（原 :1150）— 已删；`currentVideoInfo = null;` 按要求保留
+3. **删除 Task 2 临时适配层 `flattenTreeToLegacyVideos`**：连同其注释「旧版扁平列表 UI 适配层…」一并移除。
+4. **showCollectionTab 整体替换（content-page.js:981-1232，252 行）**：简报 Step 2 代码逐字落地（程序化校验 252 行逐行 identical），包含：两级树渲染（renderTree/groupBadge）、父子三态联动（syncGroupVisual 的 checked/indeterminate）、全选、展开/收起箭头旋转、已选分P计数与按钮态（updateCounts）、统一画质 radio（probeLoop 对首个可用分P枚举一次）、onBatchGo 按 `directUnits + expandGroups(DOM兜底 getVideoInfoByBvid 展开)` 入队，条目形状 `{taskId, aid, bvid, cid, title:'<一级标题> | <P0n_分P名>', qualityIdx, quality, dir:'<合集名>/<一级标题>', baseName:'<P0n_分P名>'}`，入队后异步 UPDATE_TASK_SIZE 补体积。
 
-- **Step 1a**：模块级状态新增 `let inFlightExecutor = null` 与 `let hostTabId = null`。
-- **Step 1b**：`sendAbort(task)` → `sendAbort(taskId)`，按 `inFlightExecutor` 分发到 `OFFSCREEN_ABORT_TASK`（offscreen）或 `ABORT_TASK`（hostTab）。
-- **Step 2**：在 `sendAbort` 之后新增 `ensureOffscreen()`（增强版：创建后 50×200ms OFFSCREEN_PING 就绪探测）、`ensureHostTab()`、`waitHostTabReady()`（15s 超时，HOST_PING 探测）、`dispatchToHostTab()`（成功置 `inFlightExecutor='hostTab'`；失败 `failTask(id,'下载页面不可用',false)` + 释放队列状态并返回 false）、`maybeCloseHostTab()`（无 pending/downloading 任务时移除宿主 tab）。
-- **Step 3**：`pumpQueue` 派发改为 offscreen 优先（`ensureOffscreen()` → 置 `inFlightExecutor='offscreen'` → `OFFSCREEN_RUN_TASK`），异常时 `dispatchToHostTab` 兜底，兜底失败 `return pumpQueue()`。
-- **Step 4**：`advanceQueue` 释放 `inFlightExecutor`，并新增 `maybeCloseHostTab()` 调用。
-- **Step 5**：`chrome.runtime.onMessage.addListener` 内、`// ─── Settings ───` 之前插入 `OFFSCREEN_PING / OFFSCREEN_PROGRESS / OFFSCREEN_TASK_DONE / OFFSCREEN_TASK_ERROR / OFFSCREEN_TASK_ABORTED / OFFSCREEN_NEEDS_PAGE` 六个 handler（`OFFSCREEN_NEEDS_PAGE` 置 `offscreenTried=true` 后转 `dispatchToHostTab`，失败 `advanceQueue`）。
-- **Step 6**：`ENQUEUE_TASKS` 与 `ENQUEUE_TASK` 任务对象在 `lastProgressAt: 0` 后追加 `offscreenTried: false`，保留 `hostTabId`（仍用于 `chrome.sidePanel.open`）。
-- **Step 7**：4 处 abort 调用改为传 id（DELETE_TASK / STOP_ALL / STOP_TASK / DELETE_ALL），并在各自清空 `inFlightTaskId` 处追加 `inFlightExecutor = null`（STOP_ALL 按 brief 放在 `sendAbort` 之后、`inFlightTaskId = null` 之前）。
+## 验证命令与实际输出
 
-## Deviation from literal brief（必要修正）
+| 命令 | 结果 |
+|---|---|
+| `node --check content-page.js` | 通过（无输出，脚本打印 syntax OK） |
+| `node test/collection-parser.test.mjs` | **24 passed, 0 failed** |
+| `node test/output-paths.test.mjs` | **9 passed, 0 failed** |
 
-**删除了文件底部旧版 `ensureOffscreen()`（原 539-549 行）。** 原因：
+## 文件改动区间
 
-- brief Step 2 要求在 `sendAbort` 之后**插入**新版 `ensureOffscreen`，但文件底部已存在旧版同名顶层函数声明。
-- 已用 node 验证：ES module 中同作用域重复顶层函数声明为 **SyntaxError**（`Identifier 'ensureOffscreen' has already been declared`），Step 8 语法检查必然失败。
-- brief 自身的描述也印证"新版替换旧版"：`ensureOffscreen()`（增强：创建后等待就绪）即对既有 pattern 的升级。
-- 删除后 `offscreen_merge` handler（现 674 行）自动使用新版 `ensureOffscreen`（行为上是旧版的超集，对合并路径兼容）。这是唯一超出 brief 字面操作的改动，且为通过 Step 8 的必要条件。
+- content-page.js:
+  - :783-793 新增 escAttr/fmtDur/padP
+  - :90-106 删除 flattenTreeToLegacyVideos 及注释（改造前位置）
+  - :981-1232 showCollectionTab 整体替换（142 行 → 252 行）
+  - waitAndInit 内清零行删除（现 :1252 仅剩 currentVideoInfo 清零）
 
-## Verification commands and exact output
+## Self-Review 发现
 
-1. 语法检查（brief Step 8，UTF-8 安全管道）：
-   ```powershell
-   $OutputEncoding = [System.Text.Encoding]::UTF8
-   [System.IO.File]::ReadAllText('background.js', [System.Text.Encoding]::UTF8) | node --input-type=module --check
-   ```
-   → 无输出，`exit=0`（第二次复跑确认 `syntax_exit=0`）。
-2. `git diff --stat` → 仅 `background.js`，`1 file changed, 184 insertions(+), 36 deletions(-)`。
-3. `git status --short` → 仅遗留 `.superpowers/`（未跟踪，属其他会话产物，未纳入提交）。
+- **Completeness**：grep 复核证据 —— content-page.js 中 `currentCollectionVideos` 与 `flattenTreeToLegacyVideos` 命中数为 **0**（仅 .superpowers/sdd/ 下历史文档有命中，非代码）；escAttr/fmtDur/padP 定义各 1 处、调用点齐全。新函数体与简报代码 **252 行逐字一致**（node 程序化比对输出 VERBATIM MATCH）。
+- **Quality**：XSS 覆盖 —— 所有用户数据插值点（collectionName/g.title/pt.title）均经 escAttr 双重转义（title 属性 + 文本内容）；三态联动逻辑：父勾选→parts 全映射、子勾选→syncGroupVisual 设 indeterminate、无 parts 组直接用 checked；画质 radio 取值带 `?.value || '0'` 兜底。
+- **Discipline**：未触碰本任务外区域；git 提交仅暂存 content-page.js（未用 git add -A）。工作区中 .superpowers/sdd/*.md 等改动为其他会话遗留，未纳入提交。
 
-## Files changed
+## 过程说明（一处执行方式偏差）
 
-- `background.js`（唯一改动文件；`git add background.js` 精确暂存后提交）
+首次尝试用 Edit 工具整体替换失败：文件空白行含尾随空格且不可见，无法精确复现 oldString。改用 Node 脚本按语义标记定位函数边界（`async function showCollectionTab() {` 起、`// ─── Init ───` 前的 `}` 止，并校验中间无其他内容）做行区间拼接，保持 CRLF/UTF-8 无 BOM 不变，拼接后经 node --check、双测试套件与逐字比对三重验证。
 
-## Self-review findings
+## Concerns
 
-- `sendAbort(` 仅定义处（35 行）带 `taskId` 参数，4 个调用点（340/532/566/596）全部传 id，无残留传 task 对象。
-- `inFlightExecutor = null` 齐备：dispatchToHostTab 失败分支（108）、advanceQueue（203）、OFFSCREEN_TASK_ABORTED（290）、DELETE_TASK（343）、STOP_ALL（533）、STOP_TASK（567）、DELETE_ALL（602）。
-- `inFlightExecutor` 置位：pumpQueue='offscreen'（165）、dispatchToHostTab='hostTab'（98）。
-- `offscreenTried: false` 在 ENQUEUE_TASKS（477）与 ENQUEUE_TASK（507）两处均存在；OFFSCREEN_NEEDS_PAGE（301）置 true。
-- `ensureOffscreen` 全文件仅一处定义（44 行），被 pumpQueue（164）与 offscreen_merge（674）使用。
-- 各替换区域与 brief 代码逐字核对一致。
-
-## Issues / concerns
-
-1. **brief 未提及旧版 `ensureOffscreen` 的删除**（见上，已按必须修正处理）。若或chestrator 期望严格零改动，请知悉此项。
-2. **次要观察（未改动，遵循 brief）**：`checkStalledTasks()` 停滞清场时未复位 `inFlightExecutor`（仅清 `inFlightTaskId`/`queueBusy`）。影响有限——下一任务派发时会重新置位，且停滞场景下 `inFlightTaskId` 已为 null，STOP_ALL 不会误发 abort；属自愈性陈旧值。brief 明确要求该函数不改动，故保留。
-3. 遗留提示（非本任务引入）：offscreen 旧 FFmpeg 合并路径 `offscreen_merge_request` 依赖已移除的 `lib/ffmpeg.js`，task-2 已记录该既有状况。
+- 无阻塞项。

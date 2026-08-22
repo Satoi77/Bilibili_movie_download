@@ -1,286 +1,301 @@
-# Task 4: background.js — 队列派发改 offscreen 优先 + 宿主 tab 兜底
+### Task 4: 合集 tab 两级树形 UI 重写
 
 **Files:**
-- Modify: `background.js`
+- Modify: `content-page.js`（UI 区：新增 `escAttr/fmtDur/padP` 工具；showCollectionTab 整体替换；删除 Task 2 的 flattenTreeToLegacyVideos；删除 currentCollectionVideos 变量的声明与赋值）
 
 **Interfaces:**
-- Consumes:
-  - offscreen 消息：`OFFSCREEN_PING` / `OFFSCREEN_RUN_TASK` / `OFFSCREEN_ABORT_TASK`（发出）
-  - offscreen 回报：`OFFSCREEN_PROGRESS` / `OFFSCREEN_TASK_DONE` / `OFFSCREEN_TASK_ERROR` / `OFFSCREEN_TASK_ABORTED` / `OFFSCREEN_NEEDS_PAGE`（接收）
-  - 宿主 tab：`RUN_TASK` / `ABORT_TASK`（tabs.sendMessage 发出）；回报沿用 `download_progress` / `TASK_DONE` / `TASK_ERROR` / `TASK_ABORTED`
-- Produces:
-  - 模块级状态：`let inFlightExecutor = null`（`'offscreen'` | `'hostTab'`）、`let hostTabId = null`
-  - `ensureOffscreen()`（增强：创建后等待就绪）
-  - `dispatchToHostTab(task)` / `ensureHostTab()` / `waitHostTabReady(tabId)`
-  - `sendAbort(taskId)`（按 inFlightExecutor 分发）
-  - `maybeCloseHostTab()`
+- Consumes: sniffCollection（Task 2 树形状）、getVideoInfoByBvid、getPlayUrl、dashSize、QMAP、notify('ENQUEUE_TASKS'/'UPDATE_TASK_SIZE')
+- Produces: 入队条目完整形状 `{taskId, aid, bvid, cid, title:'<一级标题> | <P0n_分P名>', qualityIdx, quality, dir:'<合集名>/<一级标题>', baseName:'<P0n_分P名>'}`（Task 3 已打通消费端）
 
-- [ ] **Step 1: 修改 `background.js` 头部状态与辅助函数**
+- [ ] **Step 1: UI 工具函数**
 
-将第 12-15 行区域替换为：
+在 UI 区（`let currentVideoInfo = null;` 附近）新增：
 
 ```js
-let queuePaused = false;
-let queueBusy = false;       // 当前是否有任务在派发/执行中
-let inFlightTaskId = null;   // 正在执行的任务 id
-let nextDispatchAt = 0;      // 下一次允许派发的时间戳（保证任务间延时）
-let inFlightExecutor = null; // 'offscreen' | 'hostTab' | null
-let hostTabId = null;        // 宿主 B 站 tab id（兜底执行用）
+  function escAttr(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+  }
+
+  function fmtDur(sec) {
+    sec = Math.round(sec || 0);
+    if (!sec) return '';
+    return Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0');
+  }
+
+  function padP(n) { return 'P' + String(n).padStart(2, '0'); }
 ```
 
-将第 33-38 行 `sendAbort` 函数替换为：
+同时删除 `currentCollectionVideos` 变量声明（`let currentCollectionVideos = [];`）、其在 showCollectionTab/waitAndInit 中的赋值与清零（变量不再被引用）。
+
+- [ ] **Step 2: showCollectionTab 整体替换**
+
+删除 Task 2 的 `flattenTreeToLegacyVideos`，并将 showCollectionTab 整体替换为：
 
 ```js
-async function sendAbort(taskId) {
-  if (inFlightExecutor === 'offscreen') {
-    try { await chrome.runtime.sendMessage({ type: 'OFFSCREEN_ABORT_TASK', data: { taskId } }); } catch (e) {}
-  } else if (inFlightExecutor === 'hostTab' && hostTabId) {
-    try { await chrome.tabs.sendMessage(hostTabId, { type: 'ABORT_TASK', data: { taskId } }); } catch (e) {}
-  }
-}
-```
+  async function showCollectionTab() {
+    const body = document.getElementById('bili-dl-body');
+    body.style.cssText = 'display:flex;flex-direction:column;flex:1;overflow:hidden;padding:0;margin:0;';
+    body.innerHTML = '<div style="text-align:center;color:#999;padding:20px;">正在嗅探合集视频...</div>';
 
-- [ ] **Step 2: 新增 offscreen 与宿主 tab 工具函数**
-
-在 `sendAbort` 之后插入：
-
-```js
-// ─── Offscreen 与宿主 tab 工具 ───
-async function ensureOffscreen() {
-  const existing = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
-  if (existing.length === 0) {
-    await chrome.offscreen.createDocument({
-      url: 'offscreen.html',
-      reasons: ['WORKERS'],
-      justification: '后台下载与 FFmpeg 合并'
-    });
-  }
-  for (let i = 0; i < 50; i++) {
-    try {
-      const res = await chrome.runtime.sendMessage({ type: 'OFFSCREEN_PING' });
-      if (res?.status === 'ok') return;
-    } catch (e) {}
-    await sleep(200);
-  }
-  throw new Error('offscreen 未就绪');
-}
-
-async function ensureHostTab() {
-  if (hostTabId) {
-    try {
-      const tab = await chrome.tabs.get(hostTabId);
-      if (tab && tab.status === 'complete') return hostTabId;
-    } catch (e) {}
-  }
-  const tab = await chrome.tabs.create({ url: 'https://www.bilibili.com', active: false });
-  hostTabId = tab.id;
-  await waitHostTabReady(hostTabId);
-  return hostTabId;
-}
-
-async function waitHostTabReady(tabId) {
-  const deadline = Date.now() + 15000;
-  while (Date.now() < deadline) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (tab?.status === 'complete') {
-        try {
-          await chrome.tabs.sendMessage(tabId, { type: 'HOST_PING' });
-          return;
-        } catch (e) {}
-      }
-    } catch (e) {
-      throw e;
+    const tree = await sniffCollection();
+    if (!tree || tree.groups.length === 0) {
+      body.style.cssText = '';
+      body.innerHTML = `<div style="text-align:center;color:#999;padding:20px;">
+        <div style="margin-bottom:8px;">未检测到合集/系列视频</div>
+        <div style="font-size:12px;color:#bbb;">提示：请在以下页面使用此功能</div>
+        <div style="font-size:12px;color:#bbb;">· UP主合集页面（视频右侧有合集列表）</div>
+        <div style="font-size:12px;color:#bbb;">· 系列视频页面</div>
+        <div style="font-size:12px;color:#bbb;">· 多P视频页面</div>
+      </div>`;
+      return;
     }
-    await sleep(500);
-  }
-  throw new Error('宿主页面就绪超时');
-}
 
-async function dispatchToHostTab(task) {
-  try {
-    const host = await ensureHostTab();
-    inFlightExecutor = 'hostTab';
-    await chrome.tabs.sendMessage(host, {
-      type: 'RUN_TASK',
-      data: { taskId: task.id, videoInfo: task.videoInfo, qualityIdx: task.qualityIdx || 0 }
-    });
-    return true;
-  } catch (e) {
-    await failTask(task.id, '下载页面不可用', false);
-    queueBusy = false;
-    inFlightTaskId = null;
-    inFlightExecutor = null;
-    nextDispatchAt = 0;
-    return false;
-  }
-}
+    // 选择状态：每 group 一个槽位；partsKnown=false 组用 checked 表示整视频勾选
+    const sel = tree.groups.map(g => ({
+      open: false,
+      checked: true,
+      parts: g.partsKnown ? g.parts.map(() => true) : []
+    }));
+    const totalParts = tree.groups.reduce((n, g) => n + g.parts.length, 0);
 
-async function maybeCloseHostTab() {
-  if (!hostTabId) return;
-  const all = await biliDB.getTasks();
-  const active = all.filter(t => t.status === 'pending' || t.status === 'downloading');
-  if (active.length === 0) {
-    try { await chrome.tabs.remove(hostTabId); } catch (e) {}
-    hostTabId = null;
-  }
-}
-```
+    // 画质档位探测：对第一个可用分P枚举一次，全批统一使用该档位序号
+    let options = [];
+    probeLoop:
+    for (const g of tree.groups) {
+      if (!g.partsKnown) continue;
+      for (const pt of g.parts) {
+        if (!pt.cid) continue;
+        try {
+          const data = await getPlayUrl(g.aid, g.bvid, pt.cid, 80);
+          if (data?.dash) {
+            const byQ = {};
+            data.dash.video.forEach(v => { (byQ[v.id] = byQ[v.id] || []).push(v); });
+            options = Object.keys(byQ).map(Number).sort((a, b) => b - a).map(q => ({
+              q, label: QMAP[q] || q + 'P'
+            }));
+          }
+        } catch (e) {}
+        break probeLoop;
+      }
+    }
 
-- [ ] **Step 3: 修改 `pumpQueue` 派发逻辑**
+    const listElRef = () => document.getElementById('bili-dl-video-list');
 
-将 `pumpQueue` 中从 `if (!task.hostTabId) {` 到 `return true;` 的整段（第 79-99 行）替换为：
+    function optionsBlock() {
+      if (!options.length) return '<span style="font-size:12px;color:#999;">画质：默认最高</span>';
+      return '<span style="display:inline-flex;gap:10px;align-items:center;">' + options.map((o, i) =>
+        `<label style="cursor:pointer;font-size:12px;color:#333;"><input type="radio" name="bili-dl-q" value="${i}" ${i === 0 ? 'checked' : ''} style="accent-color:#00a1d6;">${o.label}</label>`
+      ).join('') + '</span>';
+    }
 
-```js
-  try {
-    await ensureOffscreen();
-    inFlightExecutor = 'offscreen';
-    await chrome.runtime.sendMessage({
-      type: 'OFFSCREEN_RUN_TASK',
-      data: { taskId: task.id, videoInfo: task.videoInfo, qualityIdx: task.qualityIdx || 0 }
-    });
-  } catch (e) {
-    const ok = await dispatchToHostTab(task);
-    if (!ok) return pumpQueue(); // 继续处理下一个
-  }
-  return true;
-```
+    body.innerHTML = `
+      <div style="flex-shrink:0;padding:14px 16px 0 16px;">
+        <div style="margin-bottom:10px;font-weight:600;font-size:14px;color:#333;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${escAttr(tree.collectionName)}">${escAttr(tree.collectionName)}</div>
+        <div style="margin-bottom:10px;padding:8px 12px;background:#f5f5f5;border-radius:6px;font-size:12px;color:#666;">
+          共 ${tree.groups.length} 个视频 / ${totalParts} 个分P · 已选 <span id="bili-dl-sel-count">-</span> 个分P
+        </div>
+        <div style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:8px;">
+          <label style="cursor:pointer;font-size:12px;color:#00a1d6;white-space:nowrap;">
+            <input type="checkbox" id="bili-dl-select-all" checked style="accent-color:#00a1d6;"> 全选
+          </label>
+          ${optionsBlock()}
+        </div>
+      </div>
+      <div id="bili-dl-video-list" style="flex:1;overflow-y:auto;padding:4px 16px;"></div>
+      <div style="flex-shrink:0;padding:12px 16px;border-top:1px solid #f0f0f0;background:#fff;">
+        <button id="bili-dl-batch-go" style="width:100%;padding:12px;background:linear-gradient(135deg,#00a1d6,#fb7299);color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;">批量下载</button>
+      </div>`;
 
-注意：`pumpQueue` 开头仍保留 `checkStalledTasks()`；`queuePaused/queueBusy/nextDispatchAt` 判断不变。
+    function groupBadge(g) {
+      return g.partsKnown ? (g.parts.length + 'P') : '整视频';
+    }
 
-- [ ] **Step 4: 修改 `advanceQueue` 释放执行者**
+    function renderTree() {
+      listElRef().innerHTML = tree.groups.map((g, gi) => {
+        const st = sel[gi];
+        const partsWrap = g.partsKnown ? `
+          <div class="bili-p-wrap" data-gi="${gi}" style="${st.open ? '' : 'display:none;'}margin-top:3px;padding-left:18px;">
+            ${g.parts.length ? g.parts.map((pt, pi) => `
+              <label style="display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;cursor:pointer;margin-bottom:2px;border:1px solid #f0f0f0;">
+                <input type="checkbox" class="bili-p-check" data-gi="${gi}" data-pi="${pi}" ${st.parts[pi] ? 'checked' : ''} style="accent-color:#00a1d6;">
+                <span style="color:#00a1d6;font-size:12px;width:36px;flex-shrink:0;">${padP(pt.p)}</span>
+                <span style="flex:1;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${escAttr(pt.title)}">${escAttr(pt.title)}</span>
+                ${pt.duration ? `<span style="font-size:11px;color:#bbb;flex-shrink:0;">${fmtDur(pt.duration)}</span>` : ''}
+              </label>`).join('') : '<div style="font-size:11px;color:#bbb;padding:4px 12px;">无分P信息</div>'}
+          </div>` : '';
+        return `
+          <div style="margin-bottom:4px;">
+            <div style="display:flex;align-items:center;gap:8px;padding:7px 8px;border:1px solid #e0e0e0;border-radius:6px;">
+              <input type="checkbox" class="bili-g-check" data-gi="${gi}" style="accent-color:#00a1d6;">
+              <span class="bili-g-title" data-gi="${gi}" style="flex:1;font-size:13px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${escAttr(g.title)}">${escAttr(g.title)}</span>
+              <span style="font-size:11px;color:#999;flex-shrink:0;">${groupBadge(g)}</span>
+              ${g.partsKnown ? `<span class="bili-g-arrow" data-gi="${gi}" style="cursor:pointer;color:#00a1d6;font-size:11px;width:14px;text-align:center;flex-shrink:0;transition:transform 0.15s;">▶</span>` : ''}
+            </div>
+            ${partsWrap}
+          </div>`;
+      }).join('');
+      bindTreeEvents();
+      updateCounts();
+    }
 
-将 `advanceQueue` 函数体（第 124-135 行）改为：
+    // 父级复选框视觉三态同步（indeterminate 无法用 HTML 表达，须设 property）
+    function syncGroupVisual(gi) {
+      const cb = listElRef().querySelector(`.bili-g-check[data-gi="${gi}"]`);
+      if (!cb) return;
+      const st = sel[gi];
+      if (!st.parts.length) { cb.checked = st.checked; cb.indeterminate = false; return; }
+      const someOn = st.parts.some(Boolean);
+      cb.checked = st.parts.every(Boolean);
+      cb.indeterminate = someOn && !cb.checked;
+    }
 
-```js
-async function advanceQueue(taskId) {
-  if (!taskId || inFlightTaskId === taskId) {
-    inFlightTaskId = null;
-    queueBusy = false;
-    inFlightExecutor = null;
-  }
-  if (queuePaused) return;
-  const settings = await loadQueueSettings();
-  const delay = Math.floor(Math.random() * (settings.delayMax - settings.delayMin + 1)) + settings.delayMin;
-  nextDispatchAt = Date.now() + delay;
-  await sleep(delay);
-  maybeCloseHostTab();
-  pumpQueue();
-}
-```
-
-- [ ] **Step 5: 新增 `OFFSCREEN_*` 消息处理**
-
-在 `chrome.runtime.onMessage.addListener` 中、`// ─── Settings ───` 之前插入：
-
-```js
-  // ─── Offscreen 后台下载 ───
-  if (type === 'OFFSCREEN_PING') {
-    sendResponse({ status: 'ok' });
-    return true;
-  }
-
-  if (type === 'OFFSCREEN_PROGRESS') {
-    biliDB.getTask(data.taskId).then(task => {
-      if (!task) return;
-      if (data.phase === 'audio') task.progress.audio = data.percent;
-      if (data.phase === 'video') task.progress.video = data.percent;
-      if (data.phase === 'merge') task.progress.merge = data.percent;
-      if (data.phase === 'delay') task.delayMessage = data.label;
-      if (data.phase === 'quality' && data.label) task.quality = data.label;
-      task.lastProgressAt = Date.now();
-      biliDB.updateTask(task).then(() => {
-        notifySidePanel({ type: 'TASK_UPDATED', data: task });
+    function countSelected() {
+      let n = 0;
+      tree.groups.forEach((g, gi) => {
+        if (!g.partsKnown) { if (sel[gi].checked) n += 1; return; }
+        n += sel[gi].parts.filter(Boolean).length;
       });
-    });
-    sendResponse({ status: 'ok' });
-    return true;
-  }
+      return n;
+    }
 
-  if (type === 'OFFSCREEN_TASK_DONE') {
-    (async () => {
-      const t = await biliDB.getTask(data.taskId);
-      if (t && t.status === 'downloading') {
-        t.status = 'completed';
-        t.progress = { audio: 100, video: 100, merge: 100 };
-        t.completedAt = new Date().toISOString();
-        await notifyTask(t);
-      }
-      advanceQueue(data.taskId);
-      sendResponse({ status: 'ok' });
-    })();
-    return true;
-  }
+    function updateCounts() {
+      const n = countSelected();
+      const cnt = document.getElementById('bili-dl-sel-count');
+      if (cnt) cnt.textContent = String(n);
+      const go = document.getElementById('bili-dl-batch-go');
+      go.textContent = n > 0 ? `批量下载 ${n} 个分P` : '请至少选择一个分P';
+      go.style.opacity = n > 0 ? '1' : '0.5';
+      go.style.pointerEvents = n > 0 ? 'auto' : 'none';
+    }
 
-  if (type === 'OFFSCREEN_TASK_ERROR') {
-    (async () => {
-      await failTask(data.taskId, data.error || '未知错误', true);
-      advanceQueue(data.taskId);
-      sendResponse({ status: 'ok' });
-    })();
-    return true;
-  }
+    function toggleOpen(gi) {
+      sel[gi].open = !sel[gi].open;
+      const wrap = listElRef().querySelector(`.bili-p-wrap[data-gi="${gi}"]`);
+      if (wrap) wrap.style.display = sel[gi].open ? '' : 'none';
+      const ar = listElRef().querySelector(`.bili-g-arrow[data-gi="${gi}"]`);
+      if (ar) ar.style.transform = sel[gi].open ? 'rotate(90deg)' : '';
+    }
 
-  if (type === 'OFFSCREEN_TASK_ABORTED') {
-    (async () => {
-      const t = await biliDB.getTask(data.taskId);
-      if (t && t.status === 'downloading') {
-        t.status = 'paused';
-        await notifyTask(t);
-      }
-      if (inFlightTaskId === data.taskId) {
-        inFlightTaskId = null;
-        queueBusy = false;
-        inFlightExecutor = null;
-      }
-      sendResponse({ status: 'ok' });
-    })();
-    return true;
-  }
+    function bindTreeEvents() {
+      document.getElementById('bili-dl-select-all').onchange = (e) => {
+        sel.forEach(s => {
+          s.checked = e.target.checked;
+          if (s.parts.length) s.parts = s.parts.map(() => e.target.checked);
+        });
+        renderTree();
+      };
+      listElRef().querySelectorAll('.bili-g-check').forEach(cb => {
+        const gi = +cb.dataset.gi;
+        syncGroupVisual(gi);
+        cb.onchange = () => {
+          sel[gi].checked = cb.checked;
+          sel[gi].parts = sel[gi].parts.map(() => cb.checked);
+          updateCounts();
+        };
+      });
+      listElRef().querySelectorAll('.bili-p-check').forEach(cb => {
+        cb.onchange = () => {
+          sel[+cb.dataset.gi].parts[+cb.dataset.pi] = cb.checked;
+          syncGroupVisual(+cb.dataset.gi);
+          updateCounts();
+        };
+      });
+      listElRef().querySelectorAll('.bili-g-title,.bili-g-arrow').forEach(el => {
+        el.onclick = () => toggleOpen(+el.dataset.gi);
+      });
+      document.getElementById('bili-dl-batch-go').onclick = onBatchGo;
+    }
 
-  if (type === 'OFFSCREEN_NEEDS_PAGE') {
-    (async () => {
-      const t = await biliDB.getTask(data.taskId);
-      if (t && t.status === 'downloading') {
-        t.offscreenTried = true;
-        await notifyTask(t);
-        const ok = await dispatchToHostTab(t);
-        if (!ok) advanceQueue(data.taskId);
+    async function onBatchGo() {
+      const qIdx = parseInt(document.querySelector('input[name="bili-dl-q"]:checked')?.value || '0');
+      const qualityLabel = options[qIdx]?.label || '';
+
+      const directUnits = [];
+      const expandGroups = [];
+      tree.groups.forEach((g, gi) => {
+        if (!g.partsKnown) {
+          if (sel[gi].checked) expandGroups.push(g);
+          return;
+        }
+        g.parts.forEach((pt, pi) => {
+          if (sel[gi].parts[pi] && pt.cid) directUnits.push({ g, pt });
+        });
+      });
+
+      hidePanel();
+
+      const mkTask = (g, aid, cid, partTitle, pn) => ({
+        taskId: 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
+        aid, bvid: g.bvid, cid,
+        title: `${g.title} | ${pn} ${partTitle}`,
+        qualityIdx: qIdx,
+        quality: qualityLabel,
+        dir: `${tree.collectionName}/${g.title}`,
+        baseName: `${pn}_${partTitle}`
+      });
+
+      const taskItems = directUnits.map(u => mkTask(u.g, u.g.aid, u.pt.cid, u.pt.title, padP(u.pt.p)));
+
+      // DOM 兜底组：入队前拉取视频详情展开其全部分P（spec §4.1 第 4 优先级）
+      for (const g of expandGroups) {
+        try {
+          const info = await getVideoInfoByBvid(g.bvid);
+          if (!info) continue;
+          const pages = (Array.isArray(info.pages) && info.pages.length > 0)
+            ? info.pages
+            : [{ page: 1, part: '', cid: info.cid }];
+          for (const pg of pages) {
+            taskItems.push(mkTask(g, info.aid, pg.cid, pg.part || '', padP(pg.page || 1)));
+          }
+        } catch (e) {
+          console.warn('[B站下载助手] 兜底组解析失败:', g.bvid, e);
+        }
       }
-      sendResponse({ status: 'ok' });
-    })();
-    return true;
+
+      if (taskItems.length === 0) {
+        alert('无法获取所选内容的下载信息');
+        return;
+      }
+
+      notify('ENQUEUE_TASKS', { tasks: taskItems });
+
+      // 异步补全各分P体积（沿用 UPDATE_TASK_SIZE 既有链路；单个失败静默跳过，执行期 quality 上报兜底）
+      (async () => {
+        for (const it of taskItems) {
+          try {
+            const d = await getPlayUrl(it.aid, it.bvid, it.cid, 80);
+            if (!d?.dash) continue;
+            const byQ = {};
+            d.dash.video.forEach(v => { (byQ[v.id] = byQ[v.id] || []).push(v); });
+            const topQ = Object.keys(byQ).map(Number).sort((a, b) => b - a)[0];
+            const topVideo = byQ[topQ].sort((a, b) => b.bandwidth - a.bandwidth)[0];
+            const dur = d.dash.duration || Math.round((d.timelength || 0) / 1000);
+            notify('UPDATE_TASK_SIZE', {
+              taskId: it.taskId,
+              videoSize: dashSize(topVideo, dur),
+              audioSize: dashSize(d.dash.audio[0], dur)
+            });
+          } catch (e) {
+            console.warn('[B站下载助手] 补全任务体积失败:', it.title, e);
+          }
+        }
+      })();
+    }
+
+    renderTree();
   }
 ```
 
-- [ ] **Step 6: 更新入队任务字段**
+- [ ] **Step 5: 语法与回归检查**
 
-`ENQUEUE_TASKS`（第 302-333 行）与 `ENQUEUE_TASK`（第 335-361 行）中创建的任务对象，在 `lastProgressAt: 0` 后各追加一行 `offscreenTried: false`，并保留 `hostTabId`（仍用于 `chrome.sidePanel.open`）。
+Run: `node --check content-page.js; node test/collection-parser.test.mjs; node test/output-paths.test.mjs`
+Expected: 语法通过，两个测试全绿
 
-- [ ] **Step 7: 更新停止/删除的 abort 调用**
-
-将以下 4 处的 `sendAbort(inflight)` / `sendAbort(t)` 调用改为传 `taskId`：
-- `DELETE_TASK` 内：`await sendAbort(inflight.id);`
-- `STOP_ALL` 内：`await sendAbort(inflight.id);`
-- `STOP_TASK` 内：`await sendAbort(t.id);`
-- `DELETE_ALL` 内：`await sendAbort(inflight.id);`
-
-并在 `STOP_ALL` 的 `if (inflight) await sendAbort(inflight);` 之后、`inFlightTaskId = null;` 之前增加 `inFlightExecutor = null;`；`DELETE_TASK`、`STOP_TASK`、`DELETE_ALL` 中清空 `inFlightTaskId` 处同样追加 `inFlightExecutor = null;`。
-
-- [ ] **Step 8: 语法检查**
-
-因 PowerShell 5.1 管道 GBK 编码问题，使用 UTF-8 安全管道：
-
-```powershell
-$OutputEncoding = [System.Text.Encoding]::UTF8
-[System.IO.File]::ReadAllText('background.js', [System.Text.Encoding]::UTF8) | node --input-type=module --check
-```
-
-Expected: 无输出，exit code 0
-
-- [ ] **Step 9: Commit**
+- [ ] **Step 6: 提交**
 
 ```bash
-git add background.js
-git commit -m "feat(download): 队列派发改 offscreen 优先，失败自动切隐藏宿主 tab 兜底"
+git add content-page.js
+git commit -m "feat(ui): 合集tab两级树形勾选——父子三态联动+统一画质选择+按分P批量入队"
 ```
+
+---

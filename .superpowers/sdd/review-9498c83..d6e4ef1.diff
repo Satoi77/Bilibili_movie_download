@@ -1,0 +1,368 @@
+# Review package: 9498c83..d6e4ef1
+
+## Commits
+d6e4ef1 feat(collection): 页面接入两级树解析器，修复嗅探路径并把合集各视频全部分P纳入批量下载
+
+## Files changed
+ content-page.js | 169 +++++++++++++++++++++++---------------------------------
+ content.js      |  10 ++++
+ manifest.json   |   2 +-
+ 3 files changed, 79 insertions(+), 102 deletions(-)
+
+## Diff
+diff --git a/content-page.js b/content-page.js
+index d549d79..8d12fe9 100644
+--- a/content-page.js
++++ b/content-page.js
+@@ -4,42 +4,42 @@
+   window.__biliDLInjected = true;
+ 
+   // ─── Constants ───
+   const QMAP = {16:'360P',32:'480P',64:'720P',80:'1080P',112:'1080P高码率',120:'4K',125:'HDR'};
+ 
+   // ─── Bridge to extension ───
+   function notify(type, data) {
+     window.postMessage({ source: 'bilibili-downloader', type, data }, '*');
+   }
+ 
++  // 等待 ESM 解析器就绪（模块脚本异步执行，最长等 5 秒）
++  async function ensureParser() {
++    if (window.BiliCollectionParser) return window.BiliCollectionParser;
++    for (let i = 0; i < 50; i++) {
++      await new Promise(r => setTimeout(r, 100));
++      if (window.BiliCollectionParser) return window.BiliCollectionParser;
++    }
++    throw new Error('合集解析器未就绪');
++  }
++
+   // ─── API Helpers ───
+   async function fetchPageHTML(url) {
+     const r = await fetch(url || location.href, {credentials:'include'});
+     return r.text();
+   }
+ 
+-  function parseInitialState(html) {
+-    let m = html.match(/<script>window\.__INITIAL_STATE__=(.+?)<\/script>/);
+-    if (m && m[1]) {
+-      try {
+-        let s = m[1].replace(/;\(function\(\)\{.*?\}\(\)\);?$/, '');
+-        const st = JSON.parse(s);
+-        if (st.videoData) return st.videoData;
+-      } catch(e) {}
+-    }
+-    return null;
+-  }
+-
+   async function getVideoInfo(url) {
+     const html = await fetchPageHTML(url);
+-    const vd = parseInitialState(html);
+-    if (!vd) return null;
++    const parser = await ensureParser();
++    const st = parser.extractInitialState(html);
++    if (!st || !st.videoData) return null;
++    const vd = st.videoData;
+     return { aid: vd.aid, bvid: vd.bvid, cid: vd.cid, title: vd.title, pages: vd.pages || [] };
+   }
+ 
+   async function getVideoInfoByBvid(bvid) {
+     try {
+       const r = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, {credentials:'include'});
+       const d = await r.json();
+       if (d.code !== 0 || !d.data) return null;
+       const vd = d.data;
+       return { aid: vd.aid, bvid: vd.bvid, cid: vd.cid, title: vd.title, pages: vd.pages || [] };
+@@ -51,107 +51,65 @@
+ 
+   async function getPlayUrl(avid, bvid, cid, qn = 80, signal) {
+     const url = `https://api.bilibili.com/x/player/wbi/playurl?qn=${qn}&fnver=0&fnval=4048&fourk=1&avid=${avid}&bvid=${bvid}&cid=${cid}`;
+     const r = await fetchWithTimeout(url, {credentials:'include'}, 30000, signal);
+     const d = await r.json();
+     if (d.code !== 0) return null;
+     return d.data;
+   }
+ 
+   async function sniffCollection() {
+-    const videos = [];
+-    const seen = new Set();
+-    let collectionName = '';
+-    
+-    // Extract from __INITIAL_STATE__
+     try {
+       const html = await fetchPageHTML();
+-      const stateMatch = html.match(/<script>window\.__INITIAL_STATE__=(.+?)<\/script>/);
+-      if (stateMatch && stateMatch[1]) {
+-        let stateStr = stateMatch[1].replace(/;\(function\(\)\{.*?\}\(\)\);?$/, '');
+-        const state = JSON.parse(stateStr);
+-        
+-        // Extract collection name from multiple possible locations
+-        if (state.ugc_season?.title) {
+-          collectionName = state.ugc_season.title;
+-        } else if (state.collection?.title) {
+-          collectionName = state.collection.title;
+-        } else if (state.series?.title) {
+-          collectionName = state.series.title;
+-        } else if (state.title && state.sections) {
+-          // Direct top-level with sections = collection page
+-          collectionName = state.title;
+-        }
+-        
+-        // Extract videos from ugc_season
+-        if (state.ugc_season?.section) {
+-          state.ugc_season.section.forEach(section => {
+-            (section.episodes || []).forEach(ep => {
+-              const bvid = ep.bvid;
+-              if (bvid && !seen.has(bvid)) {
+-                seen.add(bvid);
+-                videos.push({
+-                  bvid,
+-                  title: ep.title || ep.arc?.title || '',
+-                  aid: ep.aid || ep.arc?.aid,
+-                  cid: ep.cid,
+-                  url: `https://www.bilibili.com/video/${bvid}`
+-                });
+-              }
+-            });
+-          });
+-        }
+-        
+-        // Multi-page video
+-        if (state.videoData?.pages && state.videoData.pages.length > 1) {
+-          if (!collectionName) collectionName = state.videoData.title || '';
+-          state.videoData.pages.forEach(p => {
+-            const bvid = state.videoData.bvid;
+-            if (!seen.has(bvid + '_p' + p.page)) {
+-              seen.add(bvid + '_p' + p.page);
+-              videos.push({
+-                bvid,
+-                title: `P${p.page} ${p.part || ''}`,
+-                aid: state.videoData.aid,
+-                cid: p.cid,
+-                url: `https://www.bilibili.com/video/${bvid}?p=${p.page}`
+-              });
+-            }
+-          });
+-        }
+-      }
++      const parser = await ensureParser();
++      const state = parser.extractInitialState(html);
++      const tree = state && parser.buildCollectionTree(state);
++      if (tree) return tree;
+     } catch(e) {
+-      console.warn('[B站下载助手] __INITIAL_STATE__ parse error:', e);
++      console.warn('[B站下载助手] __INITIAL_STATE__ 解析失败:', e);
+     }
+-    
+-    // DOM fallback: data-key attributes
+-    if (videos.length === 0) {
+-      const items = document.querySelectorAll('[data-key^="BV"]');
+-      items.forEach(item => {
+-        const bvid = item.getAttribute('data-key');
+-        if (!bvid || seen.has(bvid)) return;
+-        seen.add(bvid);
+-        const titleEl = item.querySelector('.title-txt') || item.querySelector('[class*="title"]');
+-        const title = titleEl?.textContent?.trim() || '';
+-        if (title) {
+-          videos.push({ bvid, title, url: `https://www.bilibili.com/video/${bvid}` });
++
++    // DOM 兜底（series 页等无状态数据场景）：partsKnown=false 组，入队时经 getVideoInfoByBvid 展开
++    const seen = new Set();
++    const groups = [];
++    document.querySelectorAll('[data-key^="BV"]').forEach(item => {
++      const bvid = item.getAttribute('data-key');
++      if (!bvid || seen.has(bvid)) return;
++      seen.add(bvid);
++      const titleEl = item.querySelector('.title-txt') || item.querySelector('[class*="title"]');
++      const title = titleEl?.textContent?.trim() || '';
++      if (title) {
++        groups.push({ title, bvid, aid: '', cover: '', partsKnown: false, parts: [] });
++      }
++    });
++    if (groups.length === 0) return null;
++    const collectionName = document.title?.replace(/- Bilibili.*$/, '').replace(/_哔哩哔哩.*$/, '').trim() || '合集下载';
++    console.log('[B站下载助手] DOM 兜底嗅探:', groups.length, '个视频');
++    return { collectionName, groups };
++  }
++
++  // 旧版扁平列表 UI 适配层：树 → 平铺单元（已知 cid 直接给，未知组整视频交给 getVideoInfoByBvid）
++  function flattenTreeToLegacyVideos(tree) {
++    const videos = [];
++    for (const g of tree.groups) {
++      if (g.partsKnown && g.parts.length > 0) {
++        for (const pt of g.parts) {
++          videos.push({
++            bvid: g.bvid, aid: g.aid, cid: pt.cid,
++            title: g.parts.length > 1 ? `${g.title} P${pt.p} ${pt.title}` : g.title
++          });
+         }
+-      });
+-    }
+-    
+-    // Fallback collection name
+-    if (!collectionName && videos.length > 0) {
+-      collectionName = document.title?.replace(/- Bilibili.*$/, '').replace(/_哔哩哔哩.*$/, '').trim() || '合集下载';
++      } else {
++        videos.push({ bvid: g.bvid, aid: g.aid, title: g.title });
++      }
+     }
+-    
+-    console.log('[B站下载助手] Sniffed videos:', videos.length, 'collection:', collectionName);
+-    return { videos, collectionName };
++    return videos;
+   }
+ 
+   function fmtSize(bytes) {
+     if (!bytes) return '未知';
+     if (bytes > 1073741824) return (bytes/1073741824).toFixed(2)+'GB';
+     if (bytes > 1048576) return (bytes/1048576).toFixed(2)+'MB';
+     if (bytes > 1024) return (bytes/1024).toFixed(2)+'KB';
+     return bytes+'B';
+   }
+ 
+@@ -1018,39 +976,40 @@
+     } catch(e) {
+       body.innerHTML = '<div style="text-align:center;color:#f44336;padding:20px;">加载失败: ' + e.message + '</div>';
+     }
+   }
+ 
+   async function showCollectionTab() {
+     const body = document.getElementById('bili-dl-body');
+     body.innerHTML = '<div style="text-align:center;color:#999;padding:20px;">正在嗅探合集视频...</div>';
+     
+     try {
+-      const { videos, collectionName } = await sniffCollection();
++      const tree = await sniffCollection();
++      const videos = tree ? flattenTreeToLegacyVideos(tree) : [];
+       currentCollectionVideos = videos;
+-      
++
+       if (videos.length === 0) {
+         body.innerHTML = `<div style="text-align:center;color:#999;padding:20px;">
+           <div style="margin-bottom:8px;">未检测到合集/系列视频</div>
+           <div style="font-size:12px;color:#bbb;">提示：请在以下页面使用此功能</div>
+           <div style="font-size:12px;color:#bbb;">· UP主合集页面（视频右侧有合集列表）</div>
+           <div style="font-size:12px;color:#bbb;">· 系列视频页面</div>
+           <div style="font-size:12px;color:#bbb;">· 多P视频页面</div>
+         </div>`;
+         return;
+       }
+       
+       body.style.cssText = 'display:flex;flex-direction:column;flex:1;overflow:hidden;padding:0;margin:0;';
+       body.innerHTML = `
+         <div style="flex-shrink:0;padding:16px 16px 0 16px;">
+         <div style="margin-bottom:12px;padding:8px 12px;background:#f5f5f5;border-radius:6px;font-size:12px;color:#666;">
+-          合集: <span style="color:#00a1d6;font-weight:500;">${collectionName}</span> (${videos.length}个视频)
++          合集: <span style="color:#00a1d6;font-weight:500;">${tree.collectionName}</span> (${videos.length}个视频)
+         </div>
+         <div style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;">
+           <span style="font-weight:500;">选择下载视频</span>
+           <label style="cursor:pointer;font-size:12px;color:#00a1d6;">
+             <input type="checkbox" id="bili-dl-select-all" checked> 全选
+           </label>
+         </div>
+         </div>
+         <div id="bili-dl-video-list" style="flex:1;overflow-y:auto;padding:0 16px;">
+           ${videos.map((v, i) => `
+@@ -1073,36 +1032,44 @@
+       
+       document.getElementById('bili-dl-batch-go').addEventListener('click', async () => {
+         const checked = [...document.querySelectorAll('.bili-dl-video-check:checked')].map(cb => parseInt(cb.value));
+         const selected = checked.map(i => videos[i]).filter(Boolean);
+         
+         if (selected.length === 0) {
+           alert('请至少选择一个视频');
+           return;
+         }
+         
+-        console.log('[B站下载助手] Batch starting, selected:', selected.length, 'collection:', collectionName);
++        console.log('[B站下载助手] Batch starting, selected:', selected.length, 'collection:', tree.collectionName);
+         hidePanel();
+         
+         // Step 1: Fetch all video infos
+         const taskInfos = [];
+         for (const v of selected) {
+           try {
+             let info;
+             if (v.aid && v.cid) {
+               info = { aid: v.aid, bvid: v.bvid, cid: v.cid, title: v.title };
+             } else if (v.bvid) {
+               info = await getVideoInfoByBvid(v.bvid);
+             }
+             if (info) {
+-              const taskId = 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
+-              taskInfos.push({ ...info, taskId });
++              // 多P视频展开为多个任务单元（否则只能下到 P1）
++              const pgList = (Array.isArray(info.pages) && info.pages.length > 1) ? info.pages : [null];
++              for (const pg of pgList) {
++                taskInfos.push({
++                  taskId: 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6),
++                  aid: info.aid, bvid: info.bvid,
++                  cid: pg ? pg.cid : info.cid,
++                  title: pg ? `${info.title} P${pg.page} ${pg.part}` : info.title
++                });
++              }
+             } else {
+               console.warn('[B站下载助手] Could not get info for:', v.bvid);
+             }
+           } catch(e) {
+             console.error('[B站下载助手] Fetch info error:', v.title, e);
+           }
+         }
+         
+         if (taskInfos.length === 0) {
+           alert('无法获取任何视频信息');
+diff --git a/content.js b/content.js
+index 4a90ff6..50fb1d1 100644
+--- a/content.js
++++ b/content.js
+@@ -1,14 +1,24 @@
+ // content.js - Bridge between page context and extension
+ (function() {
+   let pageReady = false; // 页面世界的 content-page.js 是否已加载（宿主 tab 就绪判据）
+ 
++  // 合集解析器（ESM）：以 module 方式注入页面世界，执行后挂 window.BiliCollectionParser。
++  // 模块脚本为异步加载，与下方经典脚本的先后顺序不保证，消费方以轮询等待兜底（同 ffmpeg_urls 模式）
++  if (!document.getElementById('bilibili-dl-parser')) {
++    const p = document.createElement('script');
++    p.id = 'bilibili-dl-parser';
++    p.type = 'module';
++    p.src = chrome.runtime.getURL('lib/collection-parser.js');
++    (document.head || document.documentElement).appendChild(p);
++  }
++
+   // Always inject page script first (non-blocking)
+   if (!document.getElementById('bilibili-downloader-ext')) {
+     const s = document.createElement('script');
+     s.id = 'bilibili-downloader-ext';
+     s.src = chrome.runtime.getURL('content-page.js');
+     (document.head || document.documentElement).appendChild(s);
+   }
+ 
+   // Pre-fetch FFmpeg files asynchronously (non-blocking, best-effort)
+   const files = [
+diff --git a/manifest.json b/manifest.json
+index 74e561b..2632cf6 100644
+--- a/manifest.json
++++ b/manifest.json
+@@ -26,21 +26,21 @@
+   "content_scripts": [
+     {
+       "matches": ["*://*.bilibili.com/*"],
+       "js": ["content.js"],
+       "css": ["styles/content.css"],
+       "run_at": "document_start"
+     }
+   ],
+   "web_accessible_resources": [
+     {
+-      "resources": ["content-page.js", "lib/ffmpeg.worker.js", "lib/ffmpeg-core.js", "lib/ffmpeg-core.wasm", "lib/ffmpeg-core.worker.js"],
++      "resources": ["content-page.js", "lib/collection-parser.js", "lib/ffmpeg.worker.js", "lib/ffmpeg-core.js", "lib/ffmpeg-core.wasm", "lib/ffmpeg-core.worker.js"],
+       "matches": ["*://*.bilibili.com/*"]
+     }
+   ],
+   "side_panel": {
+     "default_path": "sidepanel.html"
+   },
+   "action": {
+     "default_icon": {
+       "16": "assets/icon16.png",
+       "48": "assets/icon48.png",

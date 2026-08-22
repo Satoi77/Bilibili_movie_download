@@ -1,381 +1,190 @@
-# Task 2: offscreen.html + offscreen.js — offscreen 下载执行器
+### Task 2: 注入接线与嗅探重写（manifest + content.js + content-page.js）
 
 **Files:**
-- Modify: `offscreen.html`（script 改 type=module）
-- Rewrite: `offscreen.js`（保留原 FFmpeg 合并 handler，新增下载执行引擎）
+- Modify: `manifest.json:36`（web_accessible_resources.resources 数组）
+- Modify: `content.js:6-11`（注入块之前插入解析器注入）
+- Modify: `content-page.js:20-37`（删 parseInitialState，getVideoInfo 改走解析器）
+- Modify: `content-page.js:60-148`（sniffCollection 整体替换）
+- Modify: `content-page.js:1028`（showCollectionTab 嗅探调用处适配 + 旧批量处理器多P展开）
+- Create: `content-page.js` 内新增 `ensureParser()`、`flattenTreeToLegacyVideos()` 两个函数
 
 **Interfaces:**
-- Consumes: `lib/download-core.js` 的 `executeTask`（Task 1 已创建，导出 `executeTask(taskId, videoInfo, qualityIdx, deps)`，deps = `{ getSettings, getFFmpeg, notify, saveBlob, signal }`）
-- Produces:
-  - 消息处理：`OFFSCREEN_PING` → `sendResponse({status:'ok'})`；`OFFSCREEN_RUN_TASK`（data: taskId/videoInfo/qualityIdx）；`OFFSCREEN_ABORT_TASK`（data: taskId）
-  - 消息回报（chrome.runtime.sendMessage 发出）：
-    - `OFFSCREEN_PROGRESS` data: `{ taskId, phase, percent, label }`
-    - `OFFSCREEN_TASK_DONE` / `OFFSCREEN_TASK_ERROR`(含 error) / `OFFSCREEN_TASK_ABORTED` / `OFFSCREEN_NEEDS_PAGE`，均 data: `{ taskId[, error] }`
-  - 保留原 `offscreen_merge_request` / `offscreen_merge_result` handler（一字不改）
+- Consumes: Task 1 的 `window.BiliCollectionParser.{extractInitialState, buildCollectionTree}`
+- Produces: `sniffCollection(): Promise<{collectionName, groups}|null>`（新形状，DOM 兜底组的 `partsKnown:false`）；`flattenTreeToLegacyVideos(tree): Array<{bvid,aid,cid,title}>`（临时适配层，Task 4 移除）
 
-- [ ] **Step 1: 修改 `offscreen.html`**
+- [ ] **Step 1: manifest.json 注册可访问资源**
 
-将 `<script src="offscreen.js"></script>` 改为：
+第 36 行 resources 数组加入 `"lib/collection-parser.js"`：
 
-```html
-<script type="module" src="offscreen.js"></script>
+```json
+      "resources": ["content-page.js", "lib/collection-parser.js", "lib/ffmpeg.worker.js", "lib/ffmpeg-core.js", "lib/ffmpeg-core.wasm", "lib/ffmpeg-core.worker.js"],
 ```
 
-- [ ] **Step 2: 重写 `offscreen.js`**
+- [ ] **Step 2: content.js 注入解析器（先于 content-page.js）**
 
-完整内容如下（原 offscreen_merge_request 逻辑保留，追加下载执行引擎）：
+将原注入块（6-11 行）替换为：
 
 ```js
-// offscreen.js - 后台下载执行（主）+ FFmpeg 合并（保留）
-import { executeTask } from './lib/download-core.js';
-
-// ─── FFmpeg 合并（原有，依赖 lib/ffmpeg.js + FFmpegWASM 全局）───
-let ffmpegInstance = null;
-let loadPromise = null;
-
-function loadScript(url) {
-  return new Promise((resolve, reject) => {
-    const script = document.createElement('script');
-    script.src = url;
-    script.onload = resolve;
-    script.onerror = () => reject(new Error('Failed to load: ' + url));
-    document.head.appendChild(script);
-  });
-}
-
-async function loadFFmpeg() {
-  if (ffmpegInstance?.loaded) return ffmpegInstance;
-  if (loadPromise) return loadPromise;
-
-  loadPromise = (async () => {
-    const extUrl = (path) => chrome.runtime.getURL(path);
-
-    console.log('[FFmpeg Offscreen] Loading ffmpeg.js via script tag...');
-    await loadScript(extUrl('lib/ffmpeg.js'));
-
-    const FFmpegClass = self.FFmpegWASM?.FFmpeg || self.FFmpegWASM;
-    if (!FFmpegClass) {
-      throw new Error('FFmpeg constructor not found. self.FFmpegWASM=' + typeof self.FFmpegWASM);
-    }
-
-    ffmpegInstance = new FFmpegClass();
-
-    console.log('[FFmpeg Offscreen] Loading wasm core...');
-    await ffmpegInstance.load({
-      coreURL: extUrl('lib/ffmpeg-core.js'),
-      wasmURL: extUrl('lib/ffmpeg-core.wasm'),
-      workerURL: extUrl('lib/ffmpeg-core.worker.js')
-    });
-
-    console.log('[FFmpeg Offscreen] Loaded successfully');
-    return ffmpegInstance;
-  })();
-
-  return loadPromise;
-}
-
-function openMergeDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open('BiliMergeData', 1);
-    req.onupgradeneeded = (e) => {
-      const db = e.target.result;
-      if (!db.objectStoreNames.contains('blobs')) {
-        db.createObjectStore('blobs');
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function readBlobFromDB(key) {
-  const db = await openMergeDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('blobs', 'readonly');
-    const req = tx.objectStore('blobs').get(key);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function deleteBlobFromDB(key) {
-  const db = await openMergeDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('blobs', 'readwrite');
-    const req = tx.objectStore('blobs').delete(key);
-    req.onsuccess = () => resolve();
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function mergeWithFFmpeg(taskId) {
-  const ffmpeg = await loadFFmpeg();
-
-  const audioBuf = await readBlobFromDB(taskId + '_audio');
-  const videoBuf = await readBlobFromDB(taskId + '_video');
-  
-  if (!audioBuf || !videoBuf) {
-    throw new Error('Audio or video data not found in IndexedDB for task: ' + taskId);
+  // 合集解析器（ESM）：以 module 方式注入页面世界，执行后挂 window.BiliCollectionParser。
+  // 模块脚本为异步加载，与下方经典脚本的先后顺序不保证，消费方以轮询等待兜底（同 ffmpeg_urls 模式）
+  if (!document.getElementById('bilibili-dl-parser')) {
+    const p = document.createElement('script');
+    p.id = 'bilibili-dl-parser';
+    p.type = 'module';
+    p.src = chrome.runtime.getURL('lib/collection-parser.js');
+    (document.head || document.documentElement).appendChild(p);
   }
 
-  console.log('[FFmpeg Offscreen] Read from DB, audio:', audioBuf.byteLength, 'video:', videoBuf.byteLength);
-  await ffmpeg.writeFile('audio.m4s', new Uint8Array(audioBuf));
-  await ffmpeg.writeFile('video.m4s', new Uint8Array(videoBuf));
-
-  console.log('[FFmpeg Offscreen] Running merge...');
-  await ffmpeg.exec(['-i', 'video.m4s', '-i', 'audio.m4s', '-c', 'copy', 'output.mp4']);
-
-  const result = await ffmpeg.readFile('output.mp4');
-  console.log('[FFmpeg Offscreen] Merge done, output size:', result.length);
-
-  await ffmpeg.deleteFile('audio.m4s');
-  await ffmpeg.deleteFile('video.m4s');
-  await ffmpeg.deleteFile('output.mp4');
-
-  await deleteBlobFromDB(taskId + '_audio');
-  await deleteBlobFromDB(taskId + '_video');
-
-  return result.buffer;
-}
-
-// ─── 下载执行引擎（FFmpegBridge，Blob URL Worker）───
-const Op = {
-  LOAD: 'LOAD', EXEC: 'EXEC',
-  WRITE_FILE: 'WRITE_FILE', READ_FILE: 'READ_FILE',
-  DELETE_FILE: 'DELETE_FILE',
-  ERROR: 'ERROR', LOG: 'LOG', PROGRESS: 'PROGRESS'
-};
-const RESULT_OPS = new Set([Op.LOAD, Op.EXEC, Op.WRITE_FILE, Op.READ_FILE, Op.DELETE_FILE]);
-
-let nextMsgId = 0;
-
-class FFmpegBridge {
-  #worker = null;
-  #pending = {};
-  #logHandlers = [];
-  #progressHandlers = [];
-  ready = false;
-
-  constructor(worker) {
-    this.#worker = worker;
-    this.#attachReceiver();
+  // Always inject page script first (non-blocking)
+  if (!document.getElementById('bilibili-downloader-ext')) {
+    const s = document.createElement('script');
+    s.id = 'bilibili-downloader-ext';
+    s.src = chrome.runtime.getURL('content-page.js');
+    (document.head || document.documentElement).appendChild(s);
   }
-
-  #attachReceiver() {
-    this.#worker.onmessage = ({ data: { id, type, data } }) => {
-      if (type === Op.LOG) {
-        this.#logHandlers.forEach(fn => fn(data));
-        return;
-      }
-      if (type === Op.PROGRESS) {
-        this.#progressHandlers.forEach(fn => fn(data));
-        return;
-      }
-      const p = this.#pending[id];
-      if (!p) return;
-      delete this.#pending[id];
-      if (type === Op.ERROR) {
-        p.reject(new Error(data));
-      } else if (RESULT_OPS.has(type)) {
-        if (type === Op.LOAD) this.ready = true;
-        p.resolve(data);
-      }
-    };
-  }
-
-  #send(type, payload, transferable) {
-    return new Promise((resolve, reject) => {
-      const id = nextMsgId++;
-      this.#pending[id] = { resolve, reject };
-      this.#worker.postMessage({ id, type, data: payload }, transferable || []);
-    });
-  }
-
-  on(event, handler) {
-    if (event === 'log') this.#logHandlers.push(handler);
-    else if (event === 'progress') this.#progressHandlers.push(handler);
-  }
-
-  load(opts) {
-    return this.#send(Op.LOAD, opts);
-  }
-
-  run(args, timeout) {
-    return this.#send(Op.EXEC, { args, timeout: timeout ?? -1 });
-  }
-
-  writeFile(path, data) {
-    const xfer = data instanceof Uint8Array ? [data.buffer] : [];
-    return this.#send(Op.WRITE_FILE, { path, data }, xfer);
-  }
-
-  readFile(path, encoding) {
-    return this.#send(Op.READ_FILE, { path, encoding });
-  }
-
-  deleteFile(path) {
-    return this.#send(Op.DELETE_FILE, { path });
-  }
-
-  destroy() {
-    if (this.#worker) {
-      this.#worker.terminate();
-      this.#worker = null;
-      this.ready = false;
-    }
-  }
-}
-
-let ffmpegBridge = null;
-
-async function toBlobURL(resourceURL, mimeType) {
-  const res = await fetch(resourceURL);
-  if (!res.ok) throw new Error('fetch 失败: ' + resourceURL + ' HTTP ' + res.status);
-  const buf = await res.arrayBuffer();
-  return URL.createObjectURL(new Blob([buf], { type: mimeType }));
-}
-
-async function createFFmpeg() {
-  if (ffmpegBridge?.ready) return ffmpegBridge;
-
-  const workerBlobURL = await toBlobURL(chrome.runtime.getURL('lib/ffmpeg.worker.js'), 'text/javascript');
-  const worker = new Worker(workerBlobURL);
-  ffmpegBridge = new FFmpegBridge(worker);
-
-  ffmpegBridge.on('log', ({ message }) => {
-    if (message) console.log('[FFmpeg Offscreen]', message);
-  });
-
-  await ffmpegBridge.load({
-    coreURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.js'), 'text/javascript'),
-    wasmURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.wasm'), 'application/wasm'),
-    workerURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.worker.js'), 'text/javascript')
-  });
-
-  console.log('[B站下载助手] offscreen FFmpeg WASM 初始化完成');
-  return ffmpegBridge;
-}
-
-// ─── 后台任务执行 ───
-const activeTaskControllers = new Map();
-
-function sendToBg(message) {
-  chrome.runtime.sendMessage(message).catch(() => {});
-}
-
-function notify(taskId, payload) {
-  sendToBg({ type: 'OFFSCREEN_PROGRESS', data: { taskId, ...payload } });
-}
-
-async function getSettings() {
-  try {
-    return (await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' })) || {};
-  } catch (e) {
-    return {};
-  }
-}
-
-async function saveBlob(blob, filename, subdir) {
-  const buffer = await blob.arrayBuffer();
-  const blobUrl = URL.createObjectURL(new Blob([buffer], { type: blob.type || 'application/octet-stream' }));
-  try {
-    const result = await chrome.runtime.sendMessage({
-      type: 'SAVE_FILE',
-      data: { url: blobUrl, path: subdir ? subdir + '/' + filename : filename }
-    });
-    if (!result?.success) throw new Error(result?.error || '保存失败');
-  } finally {
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
-  }
-}
-
-async function runOffscreenTask(taskId, videoInfo, qualityIdx) {
-  const controller = new AbortController();
-  activeTaskControllers.set(taskId, controller);
-  try {
-    await executeTask(taskId, videoInfo, qualityIdx, {
-      getSettings,
-      getFFmpeg: createFFmpeg,
-      notify: (payload) => notify(taskId, payload),
-      saveBlob,
-      signal: controller.signal
-    });
-    sendToBg({ type: 'OFFSCREEN_TASK_DONE', data: { taskId } });
-  } catch (e) {
-    if (controller.signal.aborted) {
-      sendToBg({ type: 'OFFSCREEN_TASK_ABORTED', data: { taskId } });
-    } else if (e.code === 'NEEDS_PAGE') {
-      sendToBg({ type: 'OFFSCREEN_NEEDS_PAGE', data: { taskId } });
-    } else {
-      console.error('[B站下载助手] Offscreen task failed:', taskId, e);
-      sendToBg({ type: 'OFFSCREEN_TASK_ERROR', data: { taskId, error: e.message } });
-    }
-  } finally {
-    activeTaskControllers.delete(taskId);
-  }
-}
-
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'OFFSCREEN_PING') {
-    sendResponse({ status: 'ok' });
-    return false;
-  }
-
-  if (message.type === 'OFFSCREEN_RUN_TASK') {
-    const { taskId, videoInfo, qualityIdx } = message.data || {};
-    if (taskId && videoInfo) runOffscreenTask(taskId, videoInfo, qualityIdx || 0);
-    return false;
-  }
-
-  if (message.type === 'OFFSCREEN_ABORT_TASK') {
-    const c = activeTaskControllers.get((message.data || {}).taskId);
-    if (c) { try { c.abort(); } catch (e) {} }
-    return false;
-  }
-
-  if (message.type === 'offscreen_merge_request') {
-    const { taskId } = message.data;
-
-    console.log('[FFmpeg Offscreen] Merge request for task:', taskId);
-
-    mergeWithFFmpeg(taskId)
-      .then(merged => {
-        console.log('[FFmpeg Offscreen] Merge success, sending result back');
-        chrome.runtime.sendMessage({
-          type: 'offscreen_merge_result',
-          data: { taskId, success: true, buffer: merged }
-        });
-      })
-      .catch(e => {
-        console.error('[FFmpeg Offscreen] Merge failed:', e);
-        chrome.runtime.sendMessage({
-          type: 'offscreen_merge_result',
-          data: { taskId, success: false, error: e.message }
-        });
-      });
-
-    return false;
-  }
-
-  return false;
-});
 ```
 
-- [ ] **Step 3: 语法检查**
+- [ ] **Step 3: content-page.js 新增 ensureParser 并改写 getVideoInfo**
 
-因 PowerShell 5.1 管道会以 GBK 编码损坏中文（已知环境问题），使用 UTF-8 安全管道：
+在 `notify` 函数（约第 12 行）之后新增：
 
-```powershell
-$OutputEncoding = [System.Text.Encoding]::UTF8
-[System.IO.File]::ReadAllText('offscreen.js', [System.Text.Encoding]::UTF8) | node --input-type=module --check
+```js
+  // 等待 ESM 解析器就绪（模块脚本异步执行，最长等 5 秒）
+  async function ensureParser() {
+    if (window.BiliCollectionParser) return window.BiliCollectionParser;
+    for (let i = 0; i < 50; i++) {
+      await new Promise(r => setTimeout(r, 100));
+      if (window.BiliCollectionParser) return window.BiliCollectionParser;
+    }
+    throw new Error('合集解析器未就绪');
+  }
 ```
 
-Expected: 无输出，exit code 0
-（同时用相同命令检查 `offscreen.html` 之外无 JS 文件；html 改动无语法可查，人工确认 `<script type="module" src="offscreen.js"></script>`）
+删除整个 `parseInitialState` 函数（20-30 行），将 `getVideoInfo` 替换为：
 
-- [ ] **Step 4: Commit**
+```js
+  async function getVideoInfo(url) {
+    const html = await fetchPageHTML(url);
+    const parser = await ensureParser();
+    const st = parser.extractInitialState(html);
+    if (!st || !st.videoData) return null;
+    const vd = st.videoData;
+    return { aid: vd.aid, bvid: vd.bvid, cid: vd.cid, title: vd.title, pages: vd.pages || [] };
+  }
+```
+
+- [ ] **Step 4: sniffCollection 整体替换**
+
+原 60-148 行整体替换为：
+
+```js
+  async function sniffCollection() {
+    try {
+      const html = await fetchPageHTML();
+      const parser = await ensureParser();
+      const state = parser.extractInitialState(html);
+      const tree = state && parser.buildCollectionTree(state);
+      if (tree) return tree;
+    } catch(e) {
+      console.warn('[B站下载助手] __INITIAL_STATE__ 解析失败:', e);
+    }
+
+    // DOM 兜底（series 页等无状态数据场景）：partsKnown=false 组，入队时经 getVideoInfoByBvid 展开
+    const seen = new Set();
+    const groups = [];
+    document.querySelectorAll('[data-key^="BV"]').forEach(item => {
+      const bvid = item.getAttribute('data-key');
+      if (!bvid || seen.has(bvid)) return;
+      seen.add(bvid);
+      const titleEl = item.querySelector('.title-txt') || item.querySelector('[class*="title"]');
+      const title = titleEl?.textContent?.trim() || '';
+      if (title) {
+        groups.push({ title, bvid, aid: '', cover: '', partsKnown: false, parts: [] });
+      }
+    });
+    if (groups.length === 0) return null;
+    const collectionName = document.title?.replace(/- Bilibili.*$/, '').replace(/_哔哩哔哩.*$/, '').trim() || '合集下载';
+    console.log('[B站下载助手] DOM 兜底嗅探:', groups.length, '个视频');
+    return { collectionName, groups };
+  }
+```
+
+紧随其后新增适配层（供旧版扁平 UI 继续工作，Task 4 移除）：
+
+```js
+  // 旧版扁平列表 UI 适配层：树 → 平铺单元（已知 cid 直接给，未知组整视频交给 getVideoInfoByBvid）
+  function flattenTreeToLegacyVideos(tree) {
+    const videos = [];
+    for (const g of tree.groups) {
+      if (g.partsKnown && g.parts.length > 0) {
+        for (const pt of g.parts) {
+          videos.push({
+            bvid: g.bvid, aid: g.aid, cid: pt.cid,
+            title: g.parts.length > 1 ? `${g.title} P${pt.p} ${pt.title}` : g.title
+          });
+        }
+      } else {
+        videos.push({ bvid: g.bvid, aid: g.aid, title: g.title });
+      }
+    }
+    return videos;
+  }
+```
+
+- [ ] **Step 5: showCollectionTab 适配新嗅探形状 + 旧批量处理器展开多P**
+
+showCollectionTab 开头（原 1028 行附近）：
+
+```js
+      const { videos, collectionName } = await sniffCollection();
+      currentCollectionVideos = videos;
+      
+      if (videos.length === 0) {
+```
+
+改为：
+
+```js
+      const tree = await sniffCollection();
+      const videos = tree ? flattenTreeToLegacyVideos(tree) : [];
+      currentCollectionVideos = videos;
+
+      if (videos.length === 0) {
+```
+
+同一函数内渲染合集名的两处 `collectionName` 改为 `tree.collectionName`（模板中 `${collectionName}` 一处、闭包内 console 一处），并在批量点击处理器的 Step 1 循环里，把单条 push 替换为多P展开：
+
+```js
+            if (info) {
+              // 多P视频展开为多个任务单元（否则只能下到 P1）
+              const pgList = (Array.isArray(info.pages) && info.pages.length > 1) ? info.pages : [null];
+              for (const pg of pgList) {
+                taskInfos.push({
+                  taskId: 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6),
+                  aid: info.aid, bvid: info.bvid,
+                  cid: pg ? pg.cid : info.cid,
+                  title: pg ? `${info.title} P${pg.page} ${pg.part}` : info.title
+                });
+              }
+            } else {
+              console.warn('[B站下载助手] Could not get info for:', v.bvid);
+            }
+```
+
+- [ ] **Step 6: 语法检查与既有测试回归**
+
+Run: `node --check content-page.js; node --check content.js; node --check background.js; node test/collection-parser.test.mjs; node test/failure-alert.test.mjs`
+Expected: --check 全部无输出（语法通过），两个测试全绿退出码 0
+
+- [ ] **Step 7: 手动冒烟（加载扩展）**
+
+chrome://extensions 重新加载扩展 → 打开 https://www.bilibili.com/video/BV1sJwezxEpJ → 控制台应出现 `[B站下载助手] Page script loaded` → 打开下载面板"合集嗅探"tab → 应显示 55 个平铺单元（6 视频全部分P），不再是当前视频的 11 分P。
+
+- [ ] **Step 8: 提交**
 
 ```bash
-git add offscreen.html offscreen.js
-git commit -m "feat(download): offscreen 新增后台下载执行器，监听 OFFSCREEN_RUN_TASK"
+git add manifest.json content.js content-page.js
+git commit -m "feat(collection): 页面接入两级树解析器，修复嗅探路径并把合集各视频全部分P纳入批量下载"
 ```
+
+---

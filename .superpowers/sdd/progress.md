@@ -46,3 +46,15 @@
 - [x] 合并: 用户决策暂不自编译 4GB 构建, feature/ffmpeg-4gb 全部合入 master(fast-forward 317c7a5→ba146b9)。master 现含: 大文件保底合并策略(317c7a5) + 内存诊断工具链(bb9debd..1d6186e) + 外来会话的 CDN 兜底与失败告警条(5c5a5be/01695a1)。全量 node --check 通过。诊断页保留于 test/memory-probe.html(设置页入口), 未来若启动自编译可直接复用
 - [x] 清理: 诊断页从设置页移除并删除 test/memory-probe.* (d785124), worker 的 PROBE/MOUNT_WORKERFS 指令保留供自编译复用, 结论固化于 README-TEST.md
 - [x] 优化: 基于实测内存数据的大文件处理审计与改造 (d74327f)。内存轨迹分析发现合并链路峰值实为 ≈3×总大小(输入2T+输出T+readFile再拷T), 实测 wasm 上限 2GB 下实际只能合并 ≤650MB。落地两项: ① mergeAudioVideo/mergeWithFFmpeg 先删输入再 readFile(峰值 3T→2T, 可合并上限提升至 ~950MB); ② 新增 MERGE_HARD_LIMIT=900MB 确定性失败区直接跳过合并尝试(省白等时间+避免 OOM 杀死 worker 连累后续任务重建 core), 双通道(download-core/content-page)同构。分块读写列为自编译升级配套改造记录于 README (暂不实施)
+
+# ===== 新计划：合集两级树批量下载 =====
+# 计划：docs/superpowers/plans/2026-08-22-collection-batch-download.md
+# 分支：master（沿用本仓库直接实施惯例）
+# BASE commit: 9b61e15
+- [x] Task 1: 解析核心 lib/collection-parser.js（commits 9b61e15..9498c83 含 mapPages 去重 refactor，review clean；Minor 留终审triage: IIFE剥离正则偏脆(降级安全)、分支③丢弃pages[0]标题时长(对齐旧版)、两守卫分支无用例）
+- [x] Task 2: 注入接线与嗅探重写（commits 9498c83..d6e4ef1, review clean 零C/I；Minor留终审triage: taskId Date.now+random 理论碰撞(plan)、pg.part空串尾随空格(plan)；用户冒烟建议加测纯多P页(非合集))
+- [x] Task 3: dir/baseName 贯穿（commits d6e4ef1..3582c16, review clean 零C/I；实现侧对简报三处合理偏离均核实：测试④暴露简报参考缺陷→|| '_'双世界同步、saveMergeTxt实为3处、死变量连带清理；Minor留终审triage: 镜像版null守卫不对称(plan,不可达)、dir空段//不占位(plan)、空标题历史路径BASE/→BASE/_系计划测试④既定目标行为)
+- [x] Task 4: 两级树形 UI 重写（commits 3582c16..e008e8f, review clean 零C/I；行区间拼接经审查实证无损；Minor留终审triage: showCollectionTab无try/catch兜底加载态(plan,风险极低)、空分P名尾随空格(plan)、全选框无反向同步)
+- [x] Task 5: 自动化门禁全过（83断言: parser24+paths9+alert17+resume18+stream7+scope8；7文件--check干净）；手动验收清单待用户真机执行（BV1sJwezxEpJ）
+- [x] 终审 (9b61e15..e008e8f): Ready to merge=Yes 零C/I；10条积累Minor全部分诊可延后/不修（#8系计划测试④目标行为非回归）；详见 final-review-collection.txt
+- [ ] 待用户复测: 合集tab树形交互+55分P三级目录落盘 / 分离文件多P互不覆盖 / 单视频tab路径回归 / 纯多P页全分P

@@ -1,0 +1,35 @@
+终审记录：合集两级树形批量下载（9b61e15..e008e8f）
+=====================================================
+审查范围：5 commits（parser 核心 / 注入接线与嗅探重写 / dir-baseName 贯穿 / 两级树 UI / 全量验证）
+
+结论：Ready to merge = Yes
+- 零 Critical / 零 Important
+- 跨任务集成链路端到端验证无断点：
+  树形状 parser→UI 一致；入队条目 dir/baseName 从 mkTask→background 透传→双执行器
+  resolveOutputTargets 全链路贯通；ENQUEUE_TASK 单条路径与新字段兼容
+- 向后兼容红线逐字段成立：无 dir/baseName 的存量任务与单视频 tab 行为不变
+  （唯一退化：空标题任务 BASE/ → BASE/_，系计划测试④明确定义的目标行为，非回归）
+- 自动化门禁独立复跑通过：83 断言全绿（collection-parser 24 + output-paths 9 +
+  failure-alert 17 + resume 18 + stream-backup 7 + task-scope 8）+ 7 文件语法检查
+
+10 条积累 Minor 分诊：全部「可延后」或「不修」
+- #1 extractInitialState 剥离正则无 s 标志（跨行 IIFE 剥离失败→降级 DOM 兜底，安全但脆）→ 可延后，建议跟进补 s 标志+用例
+- #2 分支③丢弃 pages[0] part 标题/时长（对齐旧版取舍）→ 可延后
+- #3 episode 无 arc / episodes 非数组守卫无用例 → 可延后（覆盖广度）
+- #4 taskId Date.now+random 理论碰撞（随机后缀概率可忽略）→ 可延后 [plan]
+- #5 pg.part 空串尾随空格 / baseName 双下划线（真实 view API 恒返回 part 名，触发面极窄）→ 可延后 [plan]
+- #6 镜像版 resolveOutputTargets 缺 null 守卫（不可达分叉，带守卫版恰是单测覆盖的导出版）→ 可延后 [plan]
+- #7 dir 空段 '//'（需两级名同时为空，parser 有 bvid/vd.title 兜底，实际不可达）→ 可延后 [plan]
+- #8 空标题历史路径 BASE/→BASE/_ → 不修（计划测试④目标行为，更安全）
+- #9 showCollectionTab 无 try/catch 兜底加载态（所有现实 reject 源已内捕获；对旧版小回退，5 行成本）→ 可延后，建议作首个跟进项
+- #10 全选框无反向同步（纯视觉，计数与按钮态准确）→ 可延后
+
+建议合并后首个跟进小任务（一次提交可打包三项）：
+① showCollectionTab 调用点补 catch 渲染错误态（#9）
+② 全选框三态反向同步（#10）
+③ extractInitialState 正则加 s 标志 + 跨行 IIFE 用例（#1）
+另：resolveOutputTargets 两份镜像注释互指对方位置。
+
+待用户真机验收（plan Task 5 Step 3 清单，验收页 BV1sJwezxEpJ）：
+树形交互/三态勾选、55 分P入队、卡片标题格式、三级目录落盘、分离文件多P互不覆盖、
+单视频 tab 回归路径一致、纯多P页（非合集）全分P下载。

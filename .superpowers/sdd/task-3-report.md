@@ -1,40 +1,77 @@
-# Task 3 Report: manifest.json CSP + content.js 防广播回声过滤
+# Task 3 报告：任务模型 dir/baseName 贯穿（输出路径规则 + 队列透传 + 双执行器）
 
-## Status: DONE
+**Status:** DONE_WITH_CONCERNS
+**Commit:** `3582c16` feat(download): 批量任务三级目录输出——dir/baseName 贯穿队列入参到双执行器，路径规则收敛 resolveOutputTargets（4 files changed, +112/-42）
 
-## What I implemented
+## 一、实现内容
 
-1. **manifest.json**: 在 `host_permissions` 块之后、`background` 块之前，按 brief 精确插入 `content_security_policy` 块（2 空格缩进，与既有风格一致）：
-   - `"extension_pages": "script-src 'self' blob: 'wasm-unsafe-eval'; worker-src 'self' blob:; object-src 'self'"`
-   - 使 offscreen 文档内可 `new Worker(blobURL)` 运行 FFmpeg。
+严格按简报 Step 1→9 执行，TDD 流程完整：
 
-2. **content.js**: 将文件末尾「转发其他消息到 background」块替换为带 `OFFSCREEN_*` 过滤的版本：
-   - 新增 `if (type.startsWith('OFFSCREEN_')) return;` 守卫，防止 offscreen 上报进度/结果时 content script 广播回声导致 background 重复处理。
-   - 注释更新为中文，与项目注释风格一致。
+1. **resolveOutputTargets 唯一事实源**：lib/download-core.js 新增导出版（纯函数，单测覆盖）；content-page.js 在 MERGE_HARD_LIMIT 之后新增镜像版（经典脚本无法 import ESM，沿用 QMAP/dashSize 跨世界复制先例）。路径规则：有 dir → 合并 `<DOWNLOAD_BASE>/<safeDir>/<safeBase>_<label>.mp4`、分离文件与 merge.txt 落 `<DOWNLOAD_BASE>/<safeDir>/<safeBase>/`（按 baseName 隔离防多P互覆）；无 dir → 与历史行为逐字段一致。
+2. **executeTask 接线**（download-core.js）：`safeTitle/subdir` 二行替换为 `const targets = resolveOutputTargets(videoInfo, label)`，7 处引用全部改接 targets。
+3. **background.js 透传**：ENQUEUE_TASKS(586)/ENQUEUE_TASK(617) 两处 videoInfo 构造各加 `dir: it.dir || '', baseName: it.baseName || ''`（保持各自原缩进）。
+4. **content-page.js 双执行器同构接线**：saveRawToSubdir/saveMergeTxt 签名改为收最终子目录 finalSubdir；executeDownload 内 `safeTitle/baseSubdir` 替换为 targets，实际存在的全部调用点改接完毕。
 
-未修改其他任何文件。
+## 二、TDD 证据
 
-## Verification commands and exact output
+### RED（Step 1→2）
+```
+$ node test/output-paths.test.mjs
+SyntaxError: The requested module '../lib/download-core.js'
+does not provide an export named 'resolveOutputTargets'
+```
+失败原因与简报预期完全一致（导出不存在）。
 
-- `node --check content.js` → 无输出，exit code 0 ✓
-- `Get-Content manifest.json -Raw | ConvertFrom-Json | Out-Null; echo "JSON OK"` → **失败**（见下方 Concerns）
+### GREEN（Step 3→4）
+首次按简报代码**逐字**实现后运行：
+```
+8 passed, 1 failed
+✗ 空对象退化为占位名
+```
+暴露简报自身缺陷（详见关注点①）：`sanitizeFilename('')` 得空串，逐字实现产生 `rawSubdir === 'bilibili_download/'`，而简报自带的测试用例要求退化到占位名 `'bilibili_download/_'`。以测试为可执行规格、按自动修复规则做最小修正——空清洗结果回退 `_` 占位（导出版与镜像版同步加 `|| '_'`）后：
+```
+$ node test/output-paths.test.mjs
+9 passed, 0 failed
+```
 
-补充验证（确认 JSON 实际有效）：
-- `Get-Content manifest.json -Raw -Encoding UTF8 | ConvertFrom-Json | Out-Null; echo "JSON OK (UTF8 read)"` → 输出 `JSON OK (UTF8 read)` ✓
-- 以原始字节按 UTF-8 解码后再 `ConvertFrom-Json` → 通过 ✓（BOM: False）
+## 三、验证命令与输出（Step 8 全量回归）
 
-## Files changed
+```
+$ node test/output-paths.test.mjs      → 9 passed, 0 failed
+$ node test/collection-parser.test.mjs → 24 passed, 0 failed   （Task 1 回归无破坏）
+$ node test/failure-alert.test.mjs     → 17 通过, 0 失败        （既有回归无破坏）
+$ node --check background.js           → 无输出
+$ node --check content-page.js         → 无输出
+$ node --check lib/download-core.js    → 无输出
+EXIT=0
+```
+迭代过程中每次改动后均单独跑过 focus 测试（output-paths）确认即时反馈。
 
-- `manifest.json`（+3 行：content_security_policy 块）
-- `content.js`（+2 行：OFFSCREEN_* 守卫 + 注释变更）
-- 提交：`4162c12 fix(manifest): 放宽 blob: worker CSP 供 offscreen 使用，content.js 过滤 OFFSCREEN_* 防回声`
+## 四、改动明细（提交后实际行号）
 
-## Self-review findings
+| 文件 | 位置 | 内容 |
+|---|---|---|
+| lib/download-core.js | :15-38 | 新增中文"为什么"注释块 + `resolveOutputTargets` 导出版（含 `\|\| '_'` 占位回退） |
+| lib/download-core.js | :320 | 删除因此次改造而死的 `const title = videoInfo.title;` |
+| lib/download-core.js | :384 | `targets = resolveOutputTargets(videoInfo, label)` |
+| lib/download-core.js | :395-396 / :421,:463 / :431,:471,:478 | 7 处引用 → targets.rawSubdir ×5、targets.mergedName+mergedDir ×2 |
+| background.js | :586, :617 | 两处 videoInfo 增加 dir/baseName 透传 |
+| content-page.js | :290-308 | 镜像版 resolveOutputTargets（含相同 `\|\| '_'` 回退） |
+| content-page.js | :367-381, :383-400 | saveRawToSubdir(audioBlob, videoBlob, finalSubdir)、saveMergeTxt(finalSubdir) 新签名；txt 内容未动 |
+| content-page.js | :654, :700 | 删除死变量 title；targets 接线（label 于 ：677 先算完，顺序安全） |
+| content-page.js | :708,:733,:752 / :725,:768 / :739,:774,:781 | 实际全部 8 个调用点改接 |
+| test/output-paths.test.mjs | 新建 | 简报原文逐字 |
 
-- 两处改动与 brief 完全一致，diff 审查确认仅这两文件、无多余改动。
-- content.js 语法检查通过；JSON 经 UTF-8 显式读取验证合法。
-- 提交仅暂存 manifest.json 与 content.js；工作区其余未跟踪项为 `.superpowers/`（任务基础设施目录），未纳入提交。
+## 五、自查结论
 
-## Issues / concerns
+- **完整性**：executeTask 7 处 ✓；executeDownload 简报称"6 类共 9 处"，实际文件仅存在 8 个调用点（saveRawToSubdir×3 + downloadFile×2 + saveMergeTxt×3，简报把 saveMergeTxt 多计为 4 处），现存调用点已 100% 改接，无遗漏（grep 验证零残留 baseSubdir/safeTitle/title 引用，78/79 行 title 属无关 UI 函数未触碰）。
+- **向后兼容**：无 dir 时三返回值与历史产物名/位置逐字段对照一致（mergedDir=DOWNLOAD_BASE、mergedName=`标题_画质.mp4`、rawSubdir=`DOWNLOAD_BASE/标题`）；background 缺省 `''` 恒走 falsy 分支；download-core 的 saveMergeTxt(saveBlob, subdir) 导出签名未动；三个既有测试全绿佐证。
+- **镜像一致性**：除注释外与导出版仅两处写法差异，均为简报原文自带且语义等价——null 守卫风格（页面世界调用点 videoInfo 必非空）、label 无默认参（调用处必传）。
+- **验证**：上表命令全部实跑、干净。
 
-- **brief 的验证命令在 PowerShell 5.1 中文系统下必然失败**：`Get-Content` 默认按 ANSI(GBK) 读取无 BOM 的 UTF-8 文件，会破坏文件内既有的中文 `description` 字符串，导致 `ConvertFrom-Json` 报错（"应为:...实际为..."，定位到第 142 字符附近的乱码）。这是**文件内容原本就存在的 UTF-8 中文**造成的读取端编码问题，与本次改动无关（改动前该命令同样会失败）。显式加 `-Encoding UTF8` 后验证通过。建议在 plan 中将该验证命令更新为 UTF-8 显式读取版本。
+## 六、关注点
+
+1. **简报自身不一致（已修）**：简报 Step 3 逐字实现无法通过其 Step 1 用例④。已按测试意图最小修正为 `sanitizeFilename(...) || '_'`，双版本同步。若编排者希望维持逐字实现，则需反向修改测试用例④——二者只能取一，当前取测试侧。
+2. **超出简报的两处微清理**：删除了双执行器内因本次改造而失去全部引用的 `const title` 局部变量（零死代码标准；纯局部变量，无行为影响）。
+3. **计数偏差**：简报"四处 saveMergeTxt"与实际 3 处不符，属简报统计误差，不影响语义完整性。
+4. **工作区遗留**：`.superpowers/sdd/*` 下有其他会话的未提交变更（progress.md、task-1/2 报告简报、review-*.diff 等），按规约未纳入本次提交，提请编排者知悉。

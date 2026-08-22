@@ -1,0 +1,542 @@
+# Review package: d6e4ef1..3582c16
+
+## Commits
+3582c16 feat(download): 批量任务三级目录输出——dir/baseName 贯穿队列入参到双执行器，路径规则收敛 resolveOutputTargets
+
+## Files changed
+ background.js              |  4 +--
+ content-page.js            | 67 +++++++++++++++++++++++++---------------------
+ lib/download-core.js       | 42 ++++++++++++++++++++++-------
+ test/output-paths.test.mjs | 41 ++++++++++++++++++++++++++++
+ 4 files changed, 112 insertions(+), 42 deletions(-)
+
+## Diff
+diff --git a/background.js b/background.js
+index c04ffeb..51e37bc 100644
+--- a/background.js
++++ b/background.js
+@@ -576,21 +576,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+       const list = data.tasks || [];
+       const base = Date.now();
+       const hostTabId = sender.tab ? sender.tab.id : null;
+       for (let i = 0; i < list.length; i++) {
+         const it = list[i];
+         const task = {
+           id: it.taskId,
+           title: it.title || '',
+           quality: it.quality || '等待中',
+           bvid: it.bvid || '',
+-          videoInfo: { aid: it.aid, bvid: it.bvid, cid: it.cid, title: it.title || '' },
++          videoInfo: { aid: it.aid, bvid: it.bvid, cid: it.cid, title: it.title || '', dir: it.dir || '', baseName: it.baseName || '' },
+           qualityIdx: it.qualityIdx || 0,
+           totalSize: (it.videoSize || 0) + (it.audioSize || 0) || 0,
+           status: 'pending',
+           progress: { audio: 0, video: 0, merge: 0 },
+           retryCount: 0,
+           createdAt: new Date(base + i).toISOString(),
+           lastProgressAt: 0,
+           offscreenTried: false,
+           hostTabId
+         };
+@@ -607,21 +607,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+   }
+ 
+   if (type === 'ENQUEUE_TASK') {
+     (async () => {
+       const it = data.task || {};
+       const task = {
+         id: it.taskId,
+         title: it.title || '',
+         quality: it.quality || '等待中',
+         bvid: it.bvid || '',
+-        videoInfo: { aid: it.aid, bvid: it.bvid, cid: it.cid, title: it.title || '' },
++        videoInfo: { aid: it.aid, bvid: it.bvid, cid: it.cid, title: it.title || '', dir: it.dir || '', baseName: it.baseName || '' },
+         qualityIdx: it.qualityIdx || 0,
+         totalSize: (it.videoSize || 0) + (it.audioSize || 0) || 0,
+         status: 'pending',
+         progress: { audio: 0, video: 0, merge: 0 },
+         retryCount: 0,
+         createdAt: new Date().toISOString(),
+         lastProgressAt: 0,
+         offscreenTried: false,
+         hostTabId: sender.tab ? sender.tab.id : null
+       };
+diff --git a/content-page.js b/content-page.js
+index 8d12fe9..5713f38 100644
+--- a/content-page.js
++++ b/content-page.js
+@@ -280,20 +280,39 @@
+   // 固定下载根目录：浏览器默认下载目录下的 bilibili_download 子目录
+   const DOWNLOAD_BASE = 'bilibili_download';
+   // wasm32 的 FFmpeg WASM 堆有约 2GB 硬上限：合并需同时容纳 输入+输出 ≈ 2×总大小。
+   // 该阈值不是"跳过合并"的一刀切门槛：超过阈值的大文件先落盘分离文件作保底，
+   // 仍会尝试合并（卡在内存边界附近的文件有机会成功），失败时保底文件直接可用。
+   const MERGE_THRESHOLD = 600 * 1024 * 1024;
+   // 实测（2026-08-22 内存诊断）：官方构建 wasm 堆默认上限 2GB，总大小 ≥900MB 时
+   // 合并必然 OOM 且会杀死 FFmpeg worker（连累后续任务），直接落盘保底不再尝试
+   const MERGE_HARD_LIMIT = 900 * 1024 * 1024;
+ 
++  // 输出路径解析（与 lib/download-core.js 的导出版保持一致；页面世界经典脚本无法 import）
++  function resolveOutputTargets(videoInfo, label) {
++    const safeTitle = sanitizeFilename(videoInfo.title || '') || '_';
++    if (videoInfo.dir) {
++      const safeDir = String(videoInfo.dir).split('/').map(sanitizeFilename).join('/');
++      const safeBase = sanitizeFilename(videoInfo.baseName || safeTitle);
++      return {
++        mergedDir: DOWNLOAD_BASE + '/' + safeDir,
++        mergedName: `${safeBase}${label ? '_' + label : ''}.mp4`,
++        rawSubdir: DOWNLOAD_BASE + '/' + safeDir + '/' + safeBase
++      };
++    }
++    return {
++      mergedDir: DOWNLOAD_BASE,
++      mergedName: `${safeTitle}${label ? '_' + label : ''}.mp4`,
++      rawSubdir: DOWNLOAD_BASE + '/' + safeTitle
++    };
++  }
++
+   function fmtBytesText(n) {
+     if (n >= 1073741824) return (n / 1073741824).toFixed(2) + 'GB';
+     if (n >= 1048576) return Math.round(n / 1048576) + 'MB';
+     return n + 'B';
+   }
+ 
+   // 通过 background.js 的 chrome.downloads.download 保存（可靠，支持子目录）
+   async function saveBlobViaDownloads(blob, filename, subdir) {
+     // 直接传 Blob 引用：结构化克隆共享底层数据（磁盘 backed），禁止 arrayBuffer() 全量拷贝
+     // （大文件多次拷贝会 OOM，正是"只剩 merge.txt"的元凶之一）
+@@ -340,60 +359,50 @@
+       window.postMessage({ source: 'bilibili-downloader', type: 'DELETE_BLOB_FILE', data: { requestId, downloadId } }, '*');
+     });
+   }
+ 
+   // 下载文件：保存到设置中的自定义子目录，否则浏览器默认
+   async function downloadFile(blob, filename, subdir) {
+     await saveBlobViaDownloads(blob, filename, subdir || '');
+   }
+ 
+   /**
+-   * 保存原始音频/视频文件到子目录
+-   * @param {Blob} audioBlob - 音频数据
+-   * @param {Blob} videoBlob - 视频数据
+-   * @param {string} title - 视频标题（用于子目录名）
++   * 保存原始音频/视频文件到最终子目录（目录已含 baseName 隔离层）
+    */
+-  async function saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir) {
+-    const safeTitle = sanitizeFilename(title);
++  async function saveRawToSubdir(audioBlob, videoBlob, finalSubdir) {
+     // MIME 用 video/mp4 且文件名用 .mp4：B 站 dash 流本身是 fMP4 容器，
+     // 若命名为 .m4s，Chrome 会按内容类型把扩展名改写成 .mp4
+     // 用 slice 改 MIME（引用共享零拷贝）；禁止 arrayBuffer() 全量拷贝（大文件 OOM）
+     const audioForSave = audioBlob.slice(0, audioBlob.size, 'video/mp4');
+     const videoForSave = videoBlob.slice(0, videoBlob.size, 'video/mp4');
+-
+-    const subdir = baseSubdir ? baseSubdir + '/' + safeTitle : safeTitle;
+-    const audioId = await saveBlobViaDownloads(audioForSave, 'audio.mp4', subdir);
+-    const videoId = await saveBlobViaDownloads(videoForSave, 'video.mp4', subdir);
+-    console.log('[B站下载助手] 原始文件已保存到子目录:', subdir);
++    const audioId = await saveBlobViaDownloads(audioForSave, 'audio.mp4', finalSubdir);
++    const videoId = await saveBlobViaDownloads(videoForSave, 'video.mp4', finalSubdir);
++    console.log('[B站下载助手] 原始文件已保存到子目录:', finalSubdir);
+     return [audioId, videoId]; // downloadId 列表，供合并成功后按设置删除
+   }
+ 
+   /**
+-   * 保存 merge.txt 合并说明到子目录（仅在 FFmpeg 合并失败时调用）
+-   * @param {string} title - 视频标题
+-   * @param {string} baseSubdir - 基础子目录
++   * 保存 merge.txt 合并说明到最终子目录（仅在 FFmpeg 合并失败时调用）
+    */
+-  async function saveMergeTxt(title, baseSubdir) {
+-    const safeTitle = sanitizeFilename(title);
+-    const subdir = baseSubdir ? baseSubdir + '/' + safeTitle : safeTitle;
++  async function saveMergeTxt(finalSubdir) {
+     const txtContent = [
+       '将此目录下的 audio.mp4 和 video.mp4 合并为 mp4 文件。',
+       '',
+       '方法一：使用 ffmpeg 命令行',
+       '  ffmpeg -i video.mp4 -i audio.mp4 -vcodec copy -acodec copy merged.mp4',
+       '',
+       '方法二：将本文件重命名为 merge.bat，双击运行',
+       '  （需要已安装 ffmpeg 并添加到 PATH 环境变量）'
+     ].join('\r\n');
+     const blob = new Blob([txtContent], { type: 'text/plain' });
+-    await saveBlobViaDownloads(blob, 'merge.txt', subdir);
+-    console.log('[B站下载助手] merge.txt 已保存到子目录:', subdir);
++    await saveBlobViaDownloads(blob, 'merge.txt', finalSubdir);
++    console.log('[B站下载助手] merge.txt 已保存到子目录:', finalSubdir);
+   }
+ 
+   async function deleteDownloadedFile(downloadPath) {
+     window.postMessage({
+       source: 'bilibili-downloader',
+       type: 'DELETE_FILE',
+       data: { path: downloadPath }
+     }, '*');
+   }
+ 
+@@ -638,21 +647,20 @@
+         console.error('[B站下载助手] Task failed:', taskId, e);
+         notify('TASK_ERROR', { taskId, error: e.message });
+       }
+     } finally {
+       activeTaskControllers.delete(taskId);
+     }
+   }
+ 
+   // ─── Execute a single download ───
+   async function executeDownload(taskId, videoInfo, qualityIdx, signal) {
+-    const title = videoInfo.title;
+     const settings = await fetchSettings();
+     
+     const data = await getPlayUrl(videoInfo.aid, videoInfo.bvid, videoInfo.cid, 80, signal);
+     if (!data?.dash) {
+       console.error('[B站下载助手] getPlayUrl returned null or no dash:', data);
+       throw new Error('获取播放地址失败');
+     }
+     console.log('[B站下载助手] dash videos:', data.dash.video.length, 'audios:', data.dash.audio.length);
+     
+     const videoByQ = {};
+@@ -682,103 +690,102 @@
+       downloadBlob(streamUrlList(bestAudio), taskId, 'audio', '音频', signal),
+       downloadBlob(streamUrlList(bestVideo), taskId, 'video', '视频', signal)
+     ]);
+     
+     if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+     
+     notify('download_progress', { taskId, phase: 'download', percent: 100, label: '下载完成' });
+     // 用真实字节数修正任务卡片的合计容量（入队时的值为估算）
+     notify('download_progress', { taskId, phase: 'quality', percent: 0, totalSize: audioBlob.size + videoBlob.size });
+ 
+-    const safeTitle = sanitizeFilename(title);
+-    const baseSubdir = DOWNLOAD_BASE;
++    const targets = resolveOutputTargets(videoInfo, label);
+     let rawSaved = false;
+     let rawFileIds = null;
+ 
+     // 如果开启了保存原始文件，先保存
+     if (settings.saveRawFiles) {
+       try {
+         notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
+-        rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
++        rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, targets.rawSubdir);
+         rawSaved = true;
+       } catch(e) {
+         console.warn('[B站下载助手] 保存原始文件失败:', e);
+       }
+     }
+ 
+     // 大文件不再一刀切跳过合并：先落盘分离文件作保底，仍尝试合并（内存边界处有机会成功）
+     const bigFile = audioBlob.size + videoBlob.size > MERGE_THRESHOLD;
+     let note = '';
+ 
+     if (!bigFile) {
+       // 小文件：直接合并（成功率接近 100%），失败才降级落盘
+       try {
+         notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '合并中' });
+         const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, taskId);
+         if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+-        await downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`, baseSubdir);
++        await downloadFile(mergedBlob, targets.mergedName, targets.mergedDir);
+         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
+       } catch(mergeError) {
+         console.error('[B站下载助手] FFmpeg 合并失败:', mergeError);
+         if (signal?.aborted) throw mergeError;
+         // 合并执行失败：降级为分离保存，任务正常完成
+         if (!rawSaved) {
+           try {
+-            await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
++            await saveRawToSubdir(audioBlob, videoBlob, targets.rawSubdir);
+             rawSaved = true;
+           } catch(e) {
+             console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
+           }
+         }
+-        try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
++        try { await saveMergeTxt(targets.rawSubdir); } catch(e) {}
+         if (!rawSaved) throw new Error('合并失败且分离文件保存失败: ' + mergeError.message);
+         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
+         note = `合并失败（${mergeError.message}），已保存分离音视频，请按 merge.txt 说明本地合并`;
+       }
+       return { note };
+     }
+ 
+     // 大文件路径：先落盘分离文件作保底（用户指定的顺序），再尝试合并。
+     // 失败时保底文件直接可用并补 merge.txt；成功后按设置决定原始文件去留。
+     if (!rawSaved) {
+       try {
+         notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
+-        rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
++        rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, targets.rawSubdir);
+         rawSaved = true;
+       } catch(e) {
+         console.error('[B站下载助手] 分离文件保存失败:', e);
+       }
+     }
+     if (!rawSaved) throw new Error(`分离文件保存失败（文件 ${fmtBytesText(audioBlob.size + videoBlob.size)}）`);
+ 
+     // 实测 wasm 堆上限 2GB：总大小 ≥900MB 时合并必然 OOM，直接落盘保底不再尝试
+     const worthMerging = audioBlob.size + videoBlob.size < MERGE_HARD_LIMIT;
+     let mergedOk = false;
+     if (worthMerging) {
+       try {
+         notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '尝试合并' });
+         const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, taskId);
+         if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+-        await downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`, baseSubdir);
++        await downloadFile(mergedBlob, targets.mergedName, targets.mergedDir);
+         mergedOk = true;
+         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
+       } catch(mergeError) {
+         console.error('[B站下载助手] 大文件 FFmpeg 合并失败:', mergeError);
+         if (signal?.aborted) throw mergeError;
+-        try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
++        try { await saveMergeTxt(targets.rawSubdir); } catch(e) {}
+         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
+         note = `内存不足未能自动合并，分离音视频已就绪，请按 merge.txt 说明本地合并`;
+       }
+     }
+     if (!mergedOk && !worthMerging) {
+       // 确定性失败区：不浪费一次注定失败的合并尝试，保底文件即最终交付
+-      try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
++      try { await saveMergeTxt(targets.rawSubdir); } catch(e) {}
+       notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
+       note = `文件较大（${fmtBytesText(audioBlob.size + videoBlob.size)}），已保存分离音视频，请按 merge.txt 说明本地合并`;
+     }
+     if (mergedOk && !settings.saveRawFiles && rawFileIds) {
+       // 合并成功且未开启"保存原始音频和视频文件"→ 删除刚落盘的保底文件
+       try {
+         for (const id of rawFileIds) {
+           if (id) await removeSavedFileViaPage(id);
+         }
+       } catch(e) {
+diff --git a/lib/download-core.js b/lib/download-core.js
+index 578abeb..269c80c 100644
+--- a/lib/download-core.js
++++ b/lib/download-core.js
+@@ -5,20 +5,44 @@
+ // 否则流下载返回 403
+ const BILI_REFERRER = 'https://www.bilibili.com/';
+ 
+ export const QMAP = {16:'360P',32:'480P',64:'720P',80:'1080P',112:'1080P高码率',120:'4K',125:'HDR'};
+ export const DOWNLOAD_BASE = 'bilibili_download';
+ 
+ export function sanitizeFilename(name) {
+   return name.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').substring(0, 200);
+ }
+ 
++// 输出路径解析（纯函数）：批量任务(dir/baseName)三级目录与单视频平铺两条路径的唯一事实源。
++// 有 dir：合并输出 <DOWNLOAD_BASE>/<dir>/<base>_<label>.mp4；
++//         分离文件/merge.txt 落 <DOWNLOAD_BASE>/<dir>/<base>/ —— 按 baseName 隔离，
++//         否则同一 <dir> 下多个分P任务的 audio.mp4/video.mp4 会互相覆盖
++// 无 dir：与历史行为完全一致（合并平铺根目录、分离文件落 <标题>/ 子目录）
++export function resolveOutputTargets(videoInfo, label = '') {
++  const title = (videoInfo && videoInfo.title) || '';
++  const safeTitle = sanitizeFilename(title) || '_';
++  if (videoInfo && videoInfo.dir) {
++    const safeDir = String(videoInfo.dir).split('/').map(sanitizeFilename).join('/');
++    const safeBase = sanitizeFilename(videoInfo.baseName || safeTitle);
++    return {
++      mergedDir: DOWNLOAD_BASE + '/' + safeDir,
++      mergedName: `${safeBase}${label ? '_' + label : ''}.mp4`,
++      rawSubdir: DOWNLOAD_BASE + '/' + safeDir + '/' + safeBase
++    };
++  }
++  return {
++    mergedDir: DOWNLOAD_BASE,
++    mergedName: `${safeTitle}${label ? '_' + label : ''}.mp4`,
++    rawSubdir: DOWNLOAD_BASE + '/' + safeTitle
++  };
++}
++
+ // B 站 playurl 的 dash size 字段已实测返回空值：优先取值，空则按 bandwidth(位/秒)×duration(秒) 估算
+ function dashSize(entry, durationSec) {
+   if (entry?.size) return entry.size;
+   if (entry?.bandwidth && durationSec > 0) return Math.round(entry.bandwidth / 8 * durationSec);
+   return 0;
+ }
+ 
+ export async function getPlayUrl(aid, bvid, cid, qn = 80, signal, fetchFn = fetch) {
+   const url = `https://api.bilibili.com/x/player/wbi/playurl?qn=${qn}&fnver=0&fnval=4048&fourk=1&avid=${aid}&bvid=${bvid}&cid=${cid}`;
+   const r = await fetchFn(url, { credentials: 'include', referrer: BILI_REFERRER, referrerPolicy: 'unsafe-url', signal });
+@@ -289,21 +313,20 @@ export async function mergeAudioVideo(ffmpeg, audioBlob, videoBlob, notify) {
+   ffmpeg.deleteFile(audioPath).catch(() => {});
+   ffmpeg.deleteFile(videoPath).catch(() => {});
+   const merged = await ffmpeg.readFile(outputPath);
+   ffmpeg.deleteFile(outputPath).catch(() => {});
+   return new Blob([merged.buffer], { type: 'video/mp4' });
+ }
+ 
+ export async function executeTask(taskId, videoInfo, qualityIdx, deps) {
+   const { getSettings, getFFmpeg, notify, saveBlob, removeSavedFile, signal, fetchFn } = deps;
+   const settings = (await getSettings()) || {};
+-  const title = videoInfo.title;
+ 
+   let data;
+   try {
+     data = await getPlayUrl(videoInfo.aid, videoInfo.bvid, videoInfo.cid, 80, signal, fetchFn);
+   } catch (e) {
+     if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+     const err = new Error(e.message || '获取播放地址失败');
+     err.code = 'NEEDS_PAGE';
+     throw err;
+   }
+@@ -351,34 +374,33 @@ export async function executeTask(taskId, videoInfo, qualityIdx, deps) {
+     throw e;
+   } finally {
+     if (signal) signal.removeEventListener('abort', onOuterAbort);
+   }
+ 
+   if (signal?.aborted) {
+     throw new DOMException('aborted', 'AbortError');
+   }
+   notify({ phase: 'download', percent: 100, label: '下载完成' });
+ 
+-  const safeTitle = sanitizeFilename(title);
+-  const subdir = DOWNLOAD_BASE + '/' + safeTitle;
++  const targets = resolveOutputTargets(videoInfo, label);
+   const actualTotal = audioDl.size + videoDl.size;
+   // 用真实字节数修正任务卡片的合计容量（入队时的值为估算）
+   notify({ phase: 'quality', percent: 0, totalSize: actualTotal });
+   let rawSaved = false;
+   let audioFileId = null;
+   let videoFileId = null;
+ 
+   // Blob 构造引用 OPFS 文件快照，不产生整文件的内存拷贝
+   // MIME 用 video/mp4 且文件名用 .mp4：B 站 dash 流本身是 fMP4 容器，
+   // 若命名为 .m4s，Chrome 会按内容类型把扩展名改写成 .mp4
+-  const saveAudioRaw = () => saveBlob(new Blob([audioDl.file], { type: 'video/mp4' }), 'audio.mp4', subdir);
+-  const saveVideoRaw = () => saveBlob(new Blob([videoDl.file], { type: 'video/mp4' }), 'video.mp4', subdir);
++  const saveAudioRaw = () => saveBlob(new Blob([audioDl.file], { type: 'video/mp4' }), 'audio.mp4', targets.rawSubdir);
++  const saveVideoRaw = () => saveBlob(new Blob([videoDl.file], { type: 'video/mp4' }), 'video.mp4', targets.rawSubdir);
+   // 记录 downloadId，合并成功后可按设置删除原始文件（chrome.downloads.removeFile）
+   const saveRawFiles = async () => {
+     audioFileId = await saveAudioRaw();
+     videoFileId = await saveVideoRaw();
+   };
+ 
+   if (settings.saveRawFiles) {
+     try {
+       notify({ phase: 'merge', percent: 0, label: '保存原始文件' });
+       await saveRawFiles();
+@@ -389,31 +411,31 @@ export async function executeTask(taskId, videoInfo, qualityIdx, deps) {
+   const bigFile = actualTotal > MERGE_THRESHOLD;
+   let note = '';
+ 
+   if (!bigFile) {
+     // 小文件：直接合并（成功率接近 100%），失败才降级落盘——避免多余磁盘写与删除痕迹
+     try {
+       notify({ phase: 'merge', percent: 50, label: '合并中' });
+       const ffmpeg = await getFFmpeg();
+       const mergedBlob = await mergeAudioVideo(ffmpeg, audioDl.file, videoDl.file, notify);
+       if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+-      await saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`, DOWNLOAD_BASE);
++      await saveBlob(mergedBlob, targets.mergedName, targets.mergedDir);
+       notify({ phase: 'merge', percent: 100, label: '合并完成' });
+     } catch (mergeError) {
+       if (signal?.aborted || mergeError.name === 'AbortError') {
+         throw mergeError;
+       }
+       // 合并执行失败（多为 OOM）：降级为分离保存，任务正常完成
+       if (!rawSaved) {
+         try { await saveRawFiles(); rawSaved = true; } catch (e) {}
+       }
+-      try { await saveMergeTxt(saveBlob, subdir); } catch (e) {}
++      try { await saveMergeTxt(saveBlob, targets.rawSubdir); } catch (e) {}
+       await cleanupOPFS([taskId + '_audio', taskId + '_video']);
+       if (!rawSaved) {
+         throw new Error('合并失败且分离文件保存失败: ' + mergeError.message);
+       }
+       note = `合并失败（${mergeError.message}），已保存分离音视频，请按 merge.txt 说明本地合并`;
+       notify({ phase: 'merge', percent: 100, label: '已保存分离文件' });
+     }
+   } else {
+     // 大文件：先落盘分离文件作保底（用户指定的顺序），再尝试合并——不再一刀切跳过。
+     // 卡在 wasm 内存边界附近的文件有机会合并成功；失败时保底文件直接可用。
+@@ -431,36 +453,36 @@ export async function executeTask(taskId, videoInfo, qualityIdx, deps) {
+     // 实测 wasm 堆上限 2GB：总大小 ≥900MB 时合并必然 OOM（还会杀死 worker 连累后续任务），
+     // 直接跳过尝试；600MB~900MB 的边界区间仍给合并机会
+     const worthMerging = actualTotal < MERGE_HARD_LIMIT;
+     let mergedOk = false;
+     if (worthMerging) {
+       try {
+         notify({ phase: 'merge', percent: 50, label: '尝试合并' });
+         const ffmpeg = await getFFmpeg();
+         const mergedBlob = await mergeAudioVideo(ffmpeg, audioDl.file, videoDl.file, notify);
+         if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+-        await saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`, DOWNLOAD_BASE);
++        await saveBlob(mergedBlob, targets.mergedName, targets.mergedDir);
+         mergedOk = true;
+         notify({ phase: 'merge', percent: 100, label: '合并完成' });
+       } catch (mergeError) {
+         if (signal?.aborted || mergeError.name === 'AbortError') {
+           throw mergeError;
+         }
+         // 合并失败（边界区间 OOM）：保底分离文件已在磁盘上，补 merge.txt 即完成任务
+-        try { await saveMergeTxt(saveBlob, subdir); } catch (e) {}
++        try { await saveMergeTxt(saveBlob, targets.rawSubdir); } catch (e) {}
+         note = `内存不足未能自动合并，分离音视频已就绪，请按 merge.txt 说明本地合并`;
+         notify({ phase: 'merge', percent: 100, label: '已保存分离文件' });
+       }
+     }
+     if (!mergedOk && !worthMerging) {
+       // 确定性失败区：不浪费一次注定失败的合并尝试，保底文件即最终交付
+-      try { await saveMergeTxt(saveBlob, subdir); } catch (e) {}
++      try { await saveMergeTxt(saveBlob, targets.rawSubdir); } catch (e) {}
+       note = `文件较大（${fmtBytes(actualTotal)}），已保存分离音视频，请按 merge.txt 说明本地合并`;
+       notify({ phase: 'merge', percent: 100, label: '已保存分离文件' });
+     }
+     if (mergedOk && !settings.saveRawFiles) {
+       // 合并成功且未开启"保存原始音频和视频文件"→ 删除刚落盘的保底文件
+       try {
+         if (audioFileId) await removeSavedFile(audioFileId);
+         if (videoFileId) await removeSavedFile(videoFileId);
+       } catch (e) {}
+     }
+diff --git a/test/output-paths.test.mjs b/test/output-paths.test.mjs
+new file mode 100644
+index 0000000..0368aa5
+--- /dev/null
++++ b/test/output-paths.test.mjs
+@@ -0,0 +1,41 @@
++// 输出路径规则单测: node test/output-paths.test.mjs
++import { resolveOutputTargets, DOWNLOAD_BASE } from '../lib/download-core.js';
++
++let passed = 0, failed = 0;
++function assert(cond, name, detail) {
++  if (cond) { passed++; console.log('  ✓', name); }
++  else { failed++; console.error('  ✗', name, detail ? '— ' + detail : ''); }
++}
++
++console.log('单视频路径（无 dir）—— 必须与历史行为一致');
++{
++  const t = resolveOutputTargets({ title: '我的视频' }, '1080P');
++  assert(t.mergedDir === DOWNLOAD_BASE, '合并输出在根目录');
++  assert(t.mergedName === '我的视频_1080P.mp4', '合并文件名=标题_画质');
++  assert(t.rawSubdir === DOWNLOAD_BASE + '/我的视频', '分离文件落标题子目录');
++}
++
++console.log('批量路径（有 dir/baseName）—— 三级目录');
++{
++  const t = resolveOutputTargets(
++    { title: '一级标题', dir: 'ESP32合集/一级标题', baseName: 'P03_启动流程' }, '720P');
++  assert(t.mergedDir === DOWNLOAD_BASE + '/ESP32合集/一级标题', '合并输出进三级目录');
++  assert(t.mergedName === 'P03_启动流程_720P.mp4', '合并文件名=baseName_画质');
++  assert(t.rawSubdir === DOWNLOAD_BASE + '/ESP32合集/一级标题/P03_启动流程', '分离文件按 baseName 隔离子目录');
++}
++
++console.log('非法字符清洗发生在输出边界');
++{
++  const t = resolveOutputTargets({ dir: 'a<b>c/d:e', baseName: 'x*y?"z' }, '4K');
++  assert(t.mergedDir === DOWNLOAD_BASE + '/a_b_c/d_e', '目录段逐段清洗');
++  assert(t.mergedName === 'x_y__z_4K.mp4', '文件名非法字符替换');
++}
++
++console.log('边界入参不抛错');
++{
++  const t = resolveOutputTargets(null, '');
++  assert(t.mergedDir === DOWNLOAD_BASE && t.rawSubdir === DOWNLOAD_BASE + '/_' , '空对象退化为占位名');
++}
++
++console.log(`\n${passed} passed, ${failed} failed`);
++process.exit(failed ? 1 : 0);

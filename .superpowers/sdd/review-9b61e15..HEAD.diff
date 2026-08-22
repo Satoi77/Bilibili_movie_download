@@ -1,0 +1,1485 @@
+# Review package: 9b61e15..HEAD
+
+## Commits
+e008e8f feat(ui): 合集tab两级树形勾选——父子三态联动+统一画质选择+按分P批量入队
+3582c16 feat(download): 批量任务三级目录输出——dir/baseName 贯穿队列入参到双执行器，路径规则收敛 resolveOutputTargets
+d6e4ef1 feat(collection): 页面接入两级树解析器，修复嗅探路径并把合集各视频全部分P纳入批量下载
+9498c83 refactor(parser): 提取 mapPages 助手消除 pages→parts 映射逐字重复
+16e5700 feat(parser): 合集两级树解析核心与单测——修复 ugc_season 路径错误并展开全部分P
+
+## Files changed
+ background.js                   |   4 +-
+ content-page.js                 | 570 +++++++++++++++++++++++-----------------
+ content.js                      |  10 +
+ lib/collection-parser.js        | 120 +++++++++
+ lib/download-core.js            |  42 ++-
+ manifest.json                   |   2 +-
+ test/collection-parser.test.mjs | 118 +++++++++
+ test/output-paths.test.mjs      |  41 +++
+ 8 files changed, 647 insertions(+), 260 deletions(-)
+
+## Diff
+diff --git a/background.js b/background.js
+index c04ffeb..51e37bc 100644
+--- a/background.js
++++ b/background.js
+@@ -576,21 +576,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+       const list = data.tasks || [];
+       const base = Date.now();
+       const hostTabId = sender.tab ? sender.tab.id : null;
+       for (let i = 0; i < list.length; i++) {
+         const it = list[i];
+         const task = {
+           id: it.taskId,
+           title: it.title || '',
+           quality: it.quality || '等待中',
+           bvid: it.bvid || '',
+-          videoInfo: { aid: it.aid, bvid: it.bvid, cid: it.cid, title: it.title || '' },
++          videoInfo: { aid: it.aid, bvid: it.bvid, cid: it.cid, title: it.title || '', dir: it.dir || '', baseName: it.baseName || '' },
+           qualityIdx: it.qualityIdx || 0,
+           totalSize: (it.videoSize || 0) + (it.audioSize || 0) || 0,
+           status: 'pending',
+           progress: { audio: 0, video: 0, merge: 0 },
+           retryCount: 0,
+           createdAt: new Date(base + i).toISOString(),
+           lastProgressAt: 0,
+           offscreenTried: false,
+           hostTabId
+         };
+@@ -607,21 +607,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+   }
+ 
+   if (type === 'ENQUEUE_TASK') {
+     (async () => {
+       const it = data.task || {};
+       const task = {
+         id: it.taskId,
+         title: it.title || '',
+         quality: it.quality || '等待中',
+         bvid: it.bvid || '',
+-        videoInfo: { aid: it.aid, bvid: it.bvid, cid: it.cid, title: it.title || '' },
++        videoInfo: { aid: it.aid, bvid: it.bvid, cid: it.cid, title: it.title || '', dir: it.dir || '', baseName: it.baseName || '' },
+         qualityIdx: it.qualityIdx || 0,
+         totalSize: (it.videoSize || 0) + (it.audioSize || 0) || 0,
+         status: 'pending',
+         progress: { audio: 0, video: 0, merge: 0 },
+         retryCount: 0,
+         createdAt: new Date().toISOString(),
+         lastProgressAt: 0,
+         offscreenTried: false,
+         hostTabId: sender.tab ? sender.tab.id : null
+       };
+diff --git a/content-page.js b/content-page.js
+index d549d79..f38077a 100644
+--- a/content-page.js
++++ b/content-page.js
+@@ -4,42 +4,42 @@
+   window.__biliDLInjected = true;
+ 
+   // ─── Constants ───
+   const QMAP = {16:'360P',32:'480P',64:'720P',80:'1080P',112:'1080P高码率',120:'4K',125:'HDR'};
+ 
+   // ─── Bridge to extension ───
+   function notify(type, data) {
+     window.postMessage({ source: 'bilibili-downloader', type, data }, '*');
+   }
+ 
++  // 等待 ESM 解析器就绪（模块脚本异步执行，最长等 5 秒）
++  async function ensureParser() {
++    if (window.BiliCollectionParser) return window.BiliCollectionParser;
++    for (let i = 0; i < 50; i++) {
++      await new Promise(r => setTimeout(r, 100));
++      if (window.BiliCollectionParser) return window.BiliCollectionParser;
++    }
++    throw new Error('合集解析器未就绪');
++  }
++
+   // ─── API Helpers ───
+   async function fetchPageHTML(url) {
+     const r = await fetch(url || location.href, {credentials:'include'});
+     return r.text();
+   }
+ 
+-  function parseInitialState(html) {
+-    let m = html.match(/<script>window\.__INITIAL_STATE__=(.+?)<\/script>/);
+-    if (m && m[1]) {
+-      try {
+-        let s = m[1].replace(/;\(function\(\)\{.*?\}\(\)\);?$/, '');
+-        const st = JSON.parse(s);
+-        if (st.videoData) return st.videoData;
+-      } catch(e) {}
+-    }
+-    return null;
+-  }
+-
+   async function getVideoInfo(url) {
+     const html = await fetchPageHTML(url);
+-    const vd = parseInitialState(html);
+-    if (!vd) return null;
++    const parser = await ensureParser();
++    const st = parser.extractInitialState(html);
++    if (!st || !st.videoData) return null;
++    const vd = st.videoData;
+     return { aid: vd.aid, bvid: vd.bvid, cid: vd.cid, title: vd.title, pages: vd.pages || [] };
+   }
+ 
+   async function getVideoInfoByBvid(bvid) {
+     try {
+       const r = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, {credentials:'include'});
+       const d = await r.json();
+       if (d.code !== 0 || !d.data) return null;
+       const vd = d.data;
+       return { aid: vd.aid, bvid: vd.bvid, cid: vd.cid, title: vd.title, pages: vd.pages || [] };
+@@ -51,107 +51,47 @@
+ 
+   async function getPlayUrl(avid, bvid, cid, qn = 80, signal) {
+     const url = `https://api.bilibili.com/x/player/wbi/playurl?qn=${qn}&fnver=0&fnval=4048&fourk=1&avid=${avid}&bvid=${bvid}&cid=${cid}`;
+     const r = await fetchWithTimeout(url, {credentials:'include'}, 30000, signal);
+     const d = await r.json();
+     if (d.code !== 0) return null;
+     return d.data;
+   }
+ 
+   async function sniffCollection() {
+-    const videos = [];
+-    const seen = new Set();
+-    let collectionName = '';
+-    
+-    // Extract from __INITIAL_STATE__
+     try {
+       const html = await fetchPageHTML();
+-      const stateMatch = html.match(/<script>window\.__INITIAL_STATE__=(.+?)<\/script>/);
+-      if (stateMatch && stateMatch[1]) {
+-        let stateStr = stateMatch[1].replace(/;\(function\(\)\{.*?\}\(\)\);?$/, '');
+-        const state = JSON.parse(stateStr);
+-        
+-        // Extract collection name from multiple possible locations
+-        if (state.ugc_season?.title) {
+-          collectionName = state.ugc_season.title;
+-        } else if (state.collection?.title) {
+-          collectionName = state.collection.title;
+-        } else if (state.series?.title) {
+-          collectionName = state.series.title;
+-        } else if (state.title && state.sections) {
+-          // Direct top-level with sections = collection page
+-          collectionName = state.title;
+-        }
+-        
+-        // Extract videos from ugc_season
+-        if (state.ugc_season?.section) {
+-          state.ugc_season.section.forEach(section => {
+-            (section.episodes || []).forEach(ep => {
+-              const bvid = ep.bvid;
+-              if (bvid && !seen.has(bvid)) {
+-                seen.add(bvid);
+-                videos.push({
+-                  bvid,
+-                  title: ep.title || ep.arc?.title || '',
+-                  aid: ep.aid || ep.arc?.aid,
+-                  cid: ep.cid,
+-                  url: `https://www.bilibili.com/video/${bvid}`
+-                });
+-              }
+-            });
+-          });
+-        }
+-        
+-        // Multi-page video
+-        if (state.videoData?.pages && state.videoData.pages.length > 1) {
+-          if (!collectionName) collectionName = state.videoData.title || '';
+-          state.videoData.pages.forEach(p => {
+-            const bvid = state.videoData.bvid;
+-            if (!seen.has(bvid + '_p' + p.page)) {
+-              seen.add(bvid + '_p' + p.page);
+-              videos.push({
+-                bvid,
+-                title: `P${p.page} ${p.part || ''}`,
+-                aid: state.videoData.aid,
+-                cid: p.cid,
+-                url: `https://www.bilibili.com/video/${bvid}?p=${p.page}`
+-              });
+-            }
+-          });
+-        }
+-      }
++      const parser = await ensureParser();
++      const state = parser.extractInitialState(html);
++      const tree = state && parser.buildCollectionTree(state);
++      if (tree) return tree;
+     } catch(e) {
+-      console.warn('[B站下载助手] __INITIAL_STATE__ parse error:', e);
+-    }
+-    
+-    // DOM fallback: data-key attributes
+-    if (videos.length === 0) {
+-      const items = document.querySelectorAll('[data-key^="BV"]');
+-      items.forEach(item => {
+-        const bvid = item.getAttribute('data-key');
+-        if (!bvid || seen.has(bvid)) return;
+-        seen.add(bvid);
+-        const titleEl = item.querySelector('.title-txt') || item.querySelector('[class*="title"]');
+-        const title = titleEl?.textContent?.trim() || '';
+-        if (title) {
+-          videos.push({ bvid, title, url: `https://www.bilibili.com/video/${bvid}` });
+-        }
+-      });
+-    }
+-    
+-    // Fallback collection name
+-    if (!collectionName && videos.length > 0) {
+-      collectionName = document.title?.replace(/- Bilibili.*$/, '').replace(/_哔哩哔哩.*$/, '').trim() || '合集下载';
++      console.warn('[B站下载助手] __INITIAL_STATE__ 解析失败:', e);
+     }
+-    
+-    console.log('[B站下载助手] Sniffed videos:', videos.length, 'collection:', collectionName);
+-    return { videos, collectionName };
++
++    // DOM 兜底（series 页等无状态数据场景）：partsKnown=false 组，入队时经 getVideoInfoByBvid 展开
++    const seen = new Set();
++    const groups = [];
++    document.querySelectorAll('[data-key^="BV"]').forEach(item => {
++      const bvid = item.getAttribute('data-key');
++      if (!bvid || seen.has(bvid)) return;
++      seen.add(bvid);
++      const titleEl = item.querySelector('.title-txt') || item.querySelector('[class*="title"]');
++      const title = titleEl?.textContent?.trim() || '';
++      if (title) {
++        groups.push({ title, bvid, aid: '', cover: '', partsKnown: false, parts: [] });
++      }
++    });
++    if (groups.length === 0) return null;
++    const collectionName = document.title?.replace(/- Bilibili.*$/, '').replace(/_哔哩哔哩.*$/, '').trim() || '合集下载';
++    console.log('[B站下载助手] DOM 兜底嗅探:', groups.length, '个视频');
++    return { collectionName, groups };
+   }
+ 
+   function fmtSize(bytes) {
+     if (!bytes) return '未知';
+     if (bytes > 1073741824) return (bytes/1073741824).toFixed(2)+'GB';
+     if (bytes > 1048576) return (bytes/1048576).toFixed(2)+'MB';
+     if (bytes > 1024) return (bytes/1024).toFixed(2)+'KB';
+     return bytes+'B';
+   }
+ 
+@@ -322,20 +262,39 @@
+   // 固定下载根目录：浏览器默认下载目录下的 bilibili_download 子目录
+   const DOWNLOAD_BASE = 'bilibili_download';
+   // wasm32 的 FFmpeg WASM 堆有约 2GB 硬上限：合并需同时容纳 输入+输出 ≈ 2×总大小。
+   // 该阈值不是"跳过合并"的一刀切门槛：超过阈值的大文件先落盘分离文件作保底，
+   // 仍会尝试合并（卡在内存边界附近的文件有机会成功），失败时保底文件直接可用。
+   const MERGE_THRESHOLD = 600 * 1024 * 1024;
+   // 实测（2026-08-22 内存诊断）：官方构建 wasm 堆默认上限 2GB，总大小 ≥900MB 时
+   // 合并必然 OOM 且会杀死 FFmpeg worker（连累后续任务），直接落盘保底不再尝试
+   const MERGE_HARD_LIMIT = 900 * 1024 * 1024;
+ 
++  // 输出路径解析（与 lib/download-core.js 的导出版保持一致；页面世界经典脚本无法 import）
++  function resolveOutputTargets(videoInfo, label) {
++    const safeTitle = sanitizeFilename(videoInfo.title || '') || '_';
++    if (videoInfo.dir) {
++      const safeDir = String(videoInfo.dir).split('/').map(sanitizeFilename).join('/');
++      const safeBase = sanitizeFilename(videoInfo.baseName || safeTitle);
++      return {
++        mergedDir: DOWNLOAD_BASE + '/' + safeDir,
++        mergedName: `${safeBase}${label ? '_' + label : ''}.mp4`,
++        rawSubdir: DOWNLOAD_BASE + '/' + safeDir + '/' + safeBase
++      };
++    }
++    return {
++      mergedDir: DOWNLOAD_BASE,
++      mergedName: `${safeTitle}${label ? '_' + label : ''}.mp4`,
++      rawSubdir: DOWNLOAD_BASE + '/' + safeTitle
++    };
++  }
++
+   function fmtBytesText(n) {
+     if (n >= 1073741824) return (n / 1073741824).toFixed(2) + 'GB';
+     if (n >= 1048576) return Math.round(n / 1048576) + 'MB';
+     return n + 'B';
+   }
+ 
+   // 通过 background.js 的 chrome.downloads.download 保存（可靠，支持子目录）
+   async function saveBlobViaDownloads(blob, filename, subdir) {
+     // 直接传 Blob 引用：结构化克隆共享底层数据（磁盘 backed），禁止 arrayBuffer() 全量拷贝
+     // （大文件多次拷贝会 OOM，正是"只剩 merge.txt"的元凶之一）
+@@ -382,60 +341,50 @@
+       window.postMessage({ source: 'bilibili-downloader', type: 'DELETE_BLOB_FILE', data: { requestId, downloadId } }, '*');
+     });
+   }
+ 
+   // 下载文件：保存到设置中的自定义子目录，否则浏览器默认
+   async function downloadFile(blob, filename, subdir) {
+     await saveBlobViaDownloads(blob, filename, subdir || '');
+   }
+ 
+   /**
+-   * 保存原始音频/视频文件到子目录
+-   * @param {Blob} audioBlob - 音频数据
+-   * @param {Blob} videoBlob - 视频数据
+-   * @param {string} title - 视频标题（用于子目录名）
++   * 保存原始音频/视频文件到最终子目录（目录已含 baseName 隔离层）
+    */
+-  async function saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir) {
+-    const safeTitle = sanitizeFilename(title);
++  async function saveRawToSubdir(audioBlob, videoBlob, finalSubdir) {
+     // MIME 用 video/mp4 且文件名用 .mp4：B 站 dash 流本身是 fMP4 容器，
+     // 若命名为 .m4s，Chrome 会按内容类型把扩展名改写成 .mp4
+     // 用 slice 改 MIME（引用共享零拷贝）；禁止 arrayBuffer() 全量拷贝（大文件 OOM）
+     const audioForSave = audioBlob.slice(0, audioBlob.size, 'video/mp4');
+     const videoForSave = videoBlob.slice(0, videoBlob.size, 'video/mp4');
+-
+-    const subdir = baseSubdir ? baseSubdir + '/' + safeTitle : safeTitle;
+-    const audioId = await saveBlobViaDownloads(audioForSave, 'audio.mp4', subdir);
+-    const videoId = await saveBlobViaDownloads(videoForSave, 'video.mp4', subdir);
+-    console.log('[B站下载助手] 原始文件已保存到子目录:', subdir);
++    const audioId = await saveBlobViaDownloads(audioForSave, 'audio.mp4', finalSubdir);
++    const videoId = await saveBlobViaDownloads(videoForSave, 'video.mp4', finalSubdir);
++    console.log('[B站下载助手] 原始文件已保存到子目录:', finalSubdir);
+     return [audioId, videoId]; // downloadId 列表，供合并成功后按设置删除
+   }
+ 
+   /**
+-   * 保存 merge.txt 合并说明到子目录（仅在 FFmpeg 合并失败时调用）
+-   * @param {string} title - 视频标题
+-   * @param {string} baseSubdir - 基础子目录
++   * 保存 merge.txt 合并说明到最终子目录（仅在 FFmpeg 合并失败时调用）
+    */
+-  async function saveMergeTxt(title, baseSubdir) {
+-    const safeTitle = sanitizeFilename(title);
+-    const subdir = baseSubdir ? baseSubdir + '/' + safeTitle : safeTitle;
++  async function saveMergeTxt(finalSubdir) {
+     const txtContent = [
+       '将此目录下的 audio.mp4 和 video.mp4 合并为 mp4 文件。',
+       '',
+       '方法一：使用 ffmpeg 命令行',
+       '  ffmpeg -i video.mp4 -i audio.mp4 -vcodec copy -acodec copy merged.mp4',
+       '',
+       '方法二：将本文件重命名为 merge.bat，双击运行',
+       '  （需要已安装 ffmpeg 并添加到 PATH 环境变量）'
+     ].join('\r\n');
+     const blob = new Blob([txtContent], { type: 'text/plain' });
+-    await saveBlobViaDownloads(blob, 'merge.txt', subdir);
+-    console.log('[B站下载助手] merge.txt 已保存到子目录:', subdir);
++    await saveBlobViaDownloads(blob, 'merge.txt', finalSubdir);
++    console.log('[B站下载助手] merge.txt 已保存到子目录:', finalSubdir);
+   }
+ 
+   async function deleteDownloadedFile(downloadPath) {
+     window.postMessage({
+       source: 'bilibili-downloader',
+       type: 'DELETE_FILE',
+       data: { path: downloadPath }
+     }, '*');
+   }
+ 
+@@ -680,21 +629,20 @@
+         console.error('[B站下载助手] Task failed:', taskId, e);
+         notify('TASK_ERROR', { taskId, error: e.message });
+       }
+     } finally {
+       activeTaskControllers.delete(taskId);
+     }
+   }
+ 
+   // ─── Execute a single download ───
+   async function executeDownload(taskId, videoInfo, qualityIdx, signal) {
+-    const title = videoInfo.title;
+     const settings = await fetchSettings();
+     
+     const data = await getPlayUrl(videoInfo.aid, videoInfo.bvid, videoInfo.cid, 80, signal);
+     if (!data?.dash) {
+       console.error('[B站下载助手] getPlayUrl returned null or no dash:', data);
+       throw new Error('获取播放地址失败');
+     }
+     console.log('[B站下载助手] dash videos:', data.dash.video.length, 'audios:', data.dash.audio.length);
+     
+     const videoByQ = {};
+@@ -724,122 +672,132 @@
+       downloadBlob(streamUrlList(bestAudio), taskId, 'audio', '音频', signal),
+       downloadBlob(streamUrlList(bestVideo), taskId, 'video', '视频', signal)
+     ]);
+     
+     if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+     
+     notify('download_progress', { taskId, phase: 'download', percent: 100, label: '下载完成' });
+     // 用真实字节数修正任务卡片的合计容量（入队时的值为估算）
+     notify('download_progress', { taskId, phase: 'quality', percent: 0, totalSize: audioBlob.size + videoBlob.size });
+ 
+-    const safeTitle = sanitizeFilename(title);
+-    const baseSubdir = DOWNLOAD_BASE;
++    const targets = resolveOutputTargets(videoInfo, label);
+     let rawSaved = false;
+     let rawFileIds = null;
+ 
+     // 如果开启了保存原始文件，先保存
+     if (settings.saveRawFiles) {
+       try {
+         notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
+-        rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
++        rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, targets.rawSubdir);
+         rawSaved = true;
+       } catch(e) {
+         console.warn('[B站下载助手] 保存原始文件失败:', e);
+       }
+     }
+ 
+     // 大文件不再一刀切跳过合并：先落盘分离文件作保底，仍尝试合并（内存边界处有机会成功）
+     const bigFile = audioBlob.size + videoBlob.size > MERGE_THRESHOLD;
+     let note = '';
+ 
+     if (!bigFile) {
+       // 小文件：直接合并（成功率接近 100%），失败才降级落盘
+       try {
+         notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '合并中' });
+         const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, taskId);
+         if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+-        await downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`, baseSubdir);
++        await downloadFile(mergedBlob, targets.mergedName, targets.mergedDir);
+         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
+       } catch(mergeError) {
+         console.error('[B站下载助手] FFmpeg 合并失败:', mergeError);
+         if (signal?.aborted) throw mergeError;
+         // 合并执行失败：降级为分离保存，任务正常完成
+         if (!rawSaved) {
+           try {
+-            await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
++            await saveRawToSubdir(audioBlob, videoBlob, targets.rawSubdir);
+             rawSaved = true;
+           } catch(e) {
+             console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
+           }
+         }
+-        try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
++        try { await saveMergeTxt(targets.rawSubdir); } catch(e) {}
+         if (!rawSaved) throw new Error('合并失败且分离文件保存失败: ' + mergeError.message);
+         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
+         note = `合并失败（${mergeError.message}），已保存分离音视频，请按 merge.txt 说明本地合并`;
+       }
+       return { note };
+     }
+ 
+     // 大文件路径：先落盘分离文件作保底（用户指定的顺序），再尝试合并。
+     // 失败时保底文件直接可用并补 merge.txt；成功后按设置决定原始文件去留。
+     if (!rawSaved) {
+       try {
+         notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
+-        rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
++        rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, targets.rawSubdir);
+         rawSaved = true;
+       } catch(e) {
+         console.error('[B站下载助手] 分离文件保存失败:', e);
+       }
+     }
+     if (!rawSaved) throw new Error(`分离文件保存失败（文件 ${fmtBytesText(audioBlob.size + videoBlob.size)}）`);
+ 
+     // 实测 wasm 堆上限 2GB：总大小 ≥900MB 时合并必然 OOM，直接落盘保底不再尝试
+     const worthMerging = audioBlob.size + videoBlob.size < MERGE_HARD_LIMIT;
+     let mergedOk = false;
+     if (worthMerging) {
+       try {
+         notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '尝试合并' });
+         const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, taskId);
+         if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+-        await downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`, baseSubdir);
++        await downloadFile(mergedBlob, targets.mergedName, targets.mergedDir);
+         mergedOk = true;
+         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
+       } catch(mergeError) {
+         console.error('[B站下载助手] 大文件 FFmpeg 合并失败:', mergeError);
+         if (signal?.aborted) throw mergeError;
+-        try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
++        try { await saveMergeTxt(targets.rawSubdir); } catch(e) {}
+         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
+         note = `内存不足未能自动合并，分离音视频已就绪，请按 merge.txt 说明本地合并`;
+       }
+     }
+     if (!mergedOk && !worthMerging) {
+       // 确定性失败区：不浪费一次注定失败的合并尝试，保底文件即最终交付
+-      try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
++      try { await saveMergeTxt(targets.rawSubdir); } catch(e) {}
+       notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
+       note = `文件较大（${fmtBytesText(audioBlob.size + videoBlob.size)}），已保存分离音视频，请按 merge.txt 说明本地合并`;
+     }
+     if (mergedOk && !settings.saveRawFiles && rawFileIds) {
+       // 合并成功且未开启"保存原始音频和视频文件"→ 删除刚落盘的保底文件
+       try {
+         for (const id of rawFileIds) {
+           if (id) await removeSavedFileViaPage(id);
+         }
+       } catch(e) {
+         console.warn('[B站下载助手] 清理原始文件失败:', e);
+       }
+     }
+     return { note };
+   }
+ 
+   // ─── UI ───
+   let currentVideoInfo = null;
+-  let currentCollectionVideos = [];
++
++  function escAttr(s) {
++    return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
++  }
++
++  function fmtDur(sec) {
++    sec = Math.round(sec || 0);
++    if (!sec) return '';
++    return Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0');
++  }
++
++  function padP(n) { return 'P' + String(n).padStart(2, '0'); }
+ 
+   function isVideoPage() {
+     return /\/video\/BV/.test(location.href) || /\/list\//.test(location.href) || /\/series\//.test(location.href);
+   }
+ 
+   function createUI() {
+     if (document.getElementById('bili-dl-root')) return;
+     
+     const root = document.createElement('div');
+     root.id = 'bili-dl-root';
+@@ -1015,150 +973,269 @@
+         });
+       });
+       
+     } catch(e) {
+       body.innerHTML = '<div style="text-align:center;color:#f44336;padding:20px;">加载失败: ' + e.message + '</div>';
+     }
+   }
+ 
+   async function showCollectionTab() {
+     const body = document.getElementById('bili-dl-body');
++    body.style.cssText = 'display:flex;flex-direction:column;flex:1;overflow:hidden;padding:0;margin:0;';
+     body.innerHTML = '<div style="text-align:center;color:#999;padding:20px;">正在嗅探合集视频...</div>';
+-    
+-    try {
+-      const { videos, collectionName } = await sniffCollection();
+-      currentCollectionVideos = videos;
+-      
+-      if (videos.length === 0) {
+-        body.innerHTML = `<div style="text-align:center;color:#999;padding:20px;">
+-          <div style="margin-bottom:8px;">未检测到合集/系列视频</div>
+-          <div style="font-size:12px;color:#bbb;">提示：请在以下页面使用此功能</div>
+-          <div style="font-size:12px;color:#bbb;">· UP主合集页面（视频右侧有合集列表）</div>
+-          <div style="font-size:12px;color:#bbb;">· 系列视频页面</div>
+-          <div style="font-size:12px;color:#bbb;">· 多P视频页面</div>
+-        </div>`;
+-        return;
++
++    const tree = await sniffCollection();
++    if (!tree || tree.groups.length === 0) {
++      body.style.cssText = '';
++      body.innerHTML = `<div style="text-align:center;color:#999;padding:20px;">
++        <div style="margin-bottom:8px;">未检测到合集/系列视频</div>
++        <div style="font-size:12px;color:#bbb;">提示：请在以下页面使用此功能</div>
++        <div style="font-size:12px;color:#bbb;">· UP主合集页面（视频右侧有合集列表）</div>
++        <div style="font-size:12px;color:#bbb;">· 系列视频页面</div>
++        <div style="font-size:12px;color:#bbb;">· 多P视频页面</div>
++      </div>`;
++      return;
++    }
++
++    // 选择状态：每 group 一个槽位；partsKnown=false 组用 checked 表示整视频勾选
++    const sel = tree.groups.map(g => ({
++      open: false,
++      checked: true,
++      parts: g.partsKnown ? g.parts.map(() => true) : []
++    }));
++    const totalParts = tree.groups.reduce((n, g) => n + g.parts.length, 0);
++
++    // 画质档位探测：对第一个可用分P枚举一次，全批统一使用该档位序号
++    let options = [];
++    probeLoop:
++    for (const g of tree.groups) {
++      if (!g.partsKnown) continue;
++      for (const pt of g.parts) {
++        if (!pt.cid) continue;
++        try {
++          const data = await getPlayUrl(g.aid, g.bvid, pt.cid, 80);
++          if (data?.dash) {
++            const byQ = {};
++            data.dash.video.forEach(v => { (byQ[v.id] = byQ[v.id] || []).push(v); });
++            options = Object.keys(byQ).map(Number).sort((a, b) => b - a).map(q => ({
++              q, label: QMAP[q] || q + 'P'
++            }));
++          }
++        } catch (e) {}
++        break probeLoop;
+       }
+-      
+-      body.style.cssText = 'display:flex;flex-direction:column;flex:1;overflow:hidden;padding:0;margin:0;';
+-      body.innerHTML = `
+-        <div style="flex-shrink:0;padding:16px 16px 0 16px;">
+-        <div style="margin-bottom:12px;padding:8px 12px;background:#f5f5f5;border-radius:6px;font-size:12px;color:#666;">
+-          合集: <span style="color:#00a1d6;font-weight:500;">${collectionName}</span> (${videos.length}个视频)
++    }
++
++    const listElRef = () => document.getElementById('bili-dl-video-list');
++
++    function optionsBlock() {
++      if (!options.length) return '<span style="font-size:12px;color:#999;">画质：默认最高</span>';
++      return '<span style="display:inline-flex;gap:10px;align-items:center;">' + options.map((o, i) =>
++        `<label style="cursor:pointer;font-size:12px;color:#333;"><input type="radio" name="bili-dl-q" value="${i}" ${i === 0 ? 'checked' : ''} style="accent-color:#00a1d6;">${o.label}</label>`
++      ).join('') + '</span>';
++    }
++
++    body.innerHTML = `
++      <div style="flex-shrink:0;padding:14px 16px 0 16px;">
++        <div style="margin-bottom:10px;font-weight:600;font-size:14px;color:#333;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${escAttr(tree.collectionName)}">${escAttr(tree.collectionName)}</div>
++        <div style="margin-bottom:10px;padding:8px 12px;background:#f5f5f5;border-radius:6px;font-size:12px;color:#666;">
++          共 ${tree.groups.length} 个视频 / ${totalParts} 个分P · 已选 <span id="bili-dl-sel-count">-</span> 个分P
+         </div>
+-        <div style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;">
+-          <span style="font-weight:500;">选择下载视频</span>
+-          <label style="cursor:pointer;font-size:12px;color:#00a1d6;">
+-            <input type="checkbox" id="bili-dl-select-all" checked> 全选
++        <div style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:8px;">
++          <label style="cursor:pointer;font-size:12px;color:#00a1d6;white-space:nowrap;">
++            <input type="checkbox" id="bili-dl-select-all" checked style="accent-color:#00a1d6;"> 全选
+           </label>
++          ${optionsBlock()}
+         </div>
+-        </div>
+-        <div id="bili-dl-video-list" style="flex:1;overflow-y:auto;padding:0 16px;">
+-          ${videos.map((v, i) => `
+-            <label style="display:flex;align-items:center;gap:8px;padding:8px;border-radius:6px;cursor:pointer;border:1px solid #e0e0e0;margin-bottom:4px;transition:border-color 0.2s;"
+-              onmouseenter="this.style.borderColor='#00a1d6'" onmouseleave="this.style.borderColor='#e0e0e0'">
+-              <input type="checkbox" class="bili-dl-video-check" value="${i}" checked style="accent-color:#00a1d6;">
+-              <span style="flex:1;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${v.title}">${v.title}</span>
+-            </label>
+-          `).join('')}
+-        </div>
+-        <div style="flex-shrink:0;padding:12px 16px;border-top:1px solid #f0f0f0;background:#fff;">
+-          <button id="bili-dl-batch-go" style="width:100%;padding:12px;background:linear-gradient(135deg,#00a1d6,#fb7299);color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;">批量下载选中视频</button>
+-        </div>
+-      `;
+-      
+-      
+-      document.getElementById('bili-dl-select-all').addEventListener('change', (e) => {
+-        document.querySelectorAll('.bili-dl-video-check').forEach(cb => cb.checked = e.target.checked);
++      </div>
++      <div id="bili-dl-video-list" style="flex:1;overflow-y:auto;padding:4px 16px;"></div>
++      <div style="flex-shrink:0;padding:12px 16px;border-top:1px solid #f0f0f0;background:#fff;">
++        <button id="bili-dl-batch-go" style="width:100%;padding:12px;background:linear-gradient(135deg,#00a1d6,#fb7299);color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;">批量下载</button>
++      </div>`;
++
++    function groupBadge(g) {
++      return g.partsKnown ? (g.parts.length + 'P') : '整视频';
++    }
++
++    function renderTree() {
++      listElRef().innerHTML = tree.groups.map((g, gi) => {
++        const st = sel[gi];
++        const partsWrap = g.partsKnown ? `
++          <div class="bili-p-wrap" data-gi="${gi}" style="${st.open ? '' : 'display:none;'}margin-top:3px;padding-left:18px;">
++            ${g.parts.length ? g.parts.map((pt, pi) => `
++              <label style="display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;cursor:pointer;margin-bottom:2px;border:1px solid #f0f0f0;">
++                <input type="checkbox" class="bili-p-check" data-gi="${gi}" data-pi="${pi}" ${st.parts[pi] ? 'checked' : ''} style="accent-color:#00a1d6;">
++                <span style="color:#00a1d6;font-size:12px;width:36px;flex-shrink:0;">${padP(pt.p)}</span>
++                <span style="flex:1;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${escAttr(pt.title)}">${escAttr(pt.title)}</span>
++                ${pt.duration ? `<span style="font-size:11px;color:#bbb;flex-shrink:0;">${fmtDur(pt.duration)}</span>` : ''}
++              </label>`).join('') : '<div style="font-size:11px;color:#bbb;padding:4px 12px;">无分P信息</div>'}
++          </div>` : '';
++        return `
++          <div style="margin-bottom:4px;">
++            <div style="display:flex;align-items:center;gap:8px;padding:7px 8px;border:1px solid #e0e0e0;border-radius:6px;">
++              <input type="checkbox" class="bili-g-check" data-gi="${gi}" style="accent-color:#00a1d6;">
++              <span class="bili-g-title" data-gi="${gi}" style="flex:1;font-size:13px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${escAttr(g.title)}">${escAttr(g.title)}</span>
++              <span style="font-size:11px;color:#999;flex-shrink:0;">${groupBadge(g)}</span>
++              ${g.partsKnown ? `<span class="bili-g-arrow" data-gi="${gi}" style="cursor:pointer;color:#00a1d6;font-size:11px;width:14px;text-align:center;flex-shrink:0;transition:transform 0.15s;">▶</span>` : ''}
++            </div>
++            ${partsWrap}
++          </div>`;
++      }).join('');
++      bindTreeEvents();
++      updateCounts();
++    }
++
++    // 父级复选框视觉三态同步（indeterminate 无法用 HTML 表达，须设 property）
++    function syncGroupVisual(gi) {
++      const cb = listElRef().querySelector(`.bili-g-check[data-gi="${gi}"]`);
++      if (!cb) return;
++      const st = sel[gi];
++      if (!st.parts.length) { cb.checked = st.checked; cb.indeterminate = false; return; }
++      const someOn = st.parts.some(Boolean);
++      cb.checked = st.parts.every(Boolean);
++      cb.indeterminate = someOn && !cb.checked;
++    }
++
++    function countSelected() {
++      let n = 0;
++      tree.groups.forEach((g, gi) => {
++        if (!g.partsKnown) { if (sel[gi].checked) n += 1; return; }
++        n += sel[gi].parts.filter(Boolean).length;
+       });
+-      
+-      document.getElementById('bili-dl-batch-go').addEventListener('click', async () => {
+-        const checked = [...document.querySelectorAll('.bili-dl-video-check:checked')].map(cb => parseInt(cb.value));
+-        const selected = checked.map(i => videos[i]).filter(Boolean);
+-        
+-        if (selected.length === 0) {
+-          alert('请至少选择一个视频');
++      return n;
++    }
++
++    function updateCounts() {
++      const n = countSelected();
++      const cnt = document.getElementById('bili-dl-sel-count');
++      if (cnt) cnt.textContent = String(n);
++      const go = document.getElementById('bili-dl-batch-go');
++      go.textContent = n > 0 ? `批量下载 ${n} 个分P` : '请至少选择一个分P';
++      go.style.opacity = n > 0 ? '1' : '0.5';
++      go.style.pointerEvents = n > 0 ? 'auto' : 'none';
++    }
++
++    function toggleOpen(gi) {
++      sel[gi].open = !sel[gi].open;
++      const wrap = listElRef().querySelector(`.bili-p-wrap[data-gi="${gi}"]`);
++      if (wrap) wrap.style.display = sel[gi].open ? '' : 'none';
++      const ar = listElRef().querySelector(`.bili-g-arrow[data-gi="${gi}"]`);
++      if (ar) ar.style.transform = sel[gi].open ? 'rotate(90deg)' : '';
++    }
++
++    function bindTreeEvents() {
++      document.getElementById('bili-dl-select-all').onchange = (e) => {
++        sel.forEach(s => {
++          s.checked = e.target.checked;
++          if (s.parts.length) s.parts = s.parts.map(() => e.target.checked);
++        });
++        renderTree();
++      };
++      listElRef().querySelectorAll('.bili-g-check').forEach(cb => {
++        const gi = +cb.dataset.gi;
++        syncGroupVisual(gi);
++        cb.onchange = () => {
++          sel[gi].checked = cb.checked;
++          sel[gi].parts = sel[gi].parts.map(() => cb.checked);
++          updateCounts();
++        };
++      });
++      listElRef().querySelectorAll('.bili-p-check').forEach(cb => {
++        cb.onchange = () => {
++          sel[+cb.dataset.gi].parts[+cb.dataset.pi] = cb.checked;
++          syncGroupVisual(+cb.dataset.gi);
++          updateCounts();
++        };
++      });
++      listElRef().querySelectorAll('.bili-g-title,.bili-g-arrow').forEach(el => {
++        el.onclick = () => toggleOpen(+el.dataset.gi);
++      });
++      document.getElementById('bili-dl-batch-go').onclick = onBatchGo;
++    }
++
++    async function onBatchGo() {
++      const qIdx = parseInt(document.querySelector('input[name="bili-dl-q"]:checked')?.value || '0');
++      const qualityLabel = options[qIdx]?.label || '';
++
++      const directUnits = [];
++      const expandGroups = [];
++      tree.groups.forEach((g, gi) => {
++        if (!g.partsKnown) {
++          if (sel[gi].checked) expandGroups.push(g);
+           return;
+         }
+-        
+-        console.log('[B站下载助手] Batch starting, selected:', selected.length, 'collection:', collectionName);
+-        hidePanel();
+-        
+-        // Step 1: Fetch all video infos
+-        const taskInfos = [];
+-        for (const v of selected) {
+-          try {
+-            let info;
+-            if (v.aid && v.cid) {
+-              info = { aid: v.aid, bvid: v.bvid, cid: v.cid, title: v.title };
+-            } else if (v.bvid) {
+-              info = await getVideoInfoByBvid(v.bvid);
+-            }
+-            if (info) {
+-              const taskId = 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
+-              taskInfos.push({ ...info, taskId });
+-            } else {
+-              console.warn('[B站下载助手] Could not get info for:', v.bvid);
+-            }
+-          } catch(e) {
+-            console.error('[B站下载助手] Fetch info error:', v.title, e);
++        g.parts.forEach((pt, pi) => {
++          if (sel[gi].parts[pi] && pt.cid) directUnits.push({ g, pt });
++        });
++      });
++
++      hidePanel();
++
++      const mkTask = (g, aid, cid, partTitle, pn) => ({
++        taskId: 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
++        aid, bvid: g.bvid, cid,
++        title: `${g.title} | ${pn} ${partTitle}`,
++        qualityIdx: qIdx,
++        quality: qualityLabel,
++        dir: `${tree.collectionName}/${g.title}`,
++        baseName: `${pn}_${partTitle}`
++      });
++
++      const taskItems = directUnits.map(u => mkTask(u.g, u.g.aid, u.pt.cid, u.pt.title, padP(u.pt.p)));
++
++      // DOM 兜底组：入队前拉取视频详情展开其全部分P（spec §4.1 第 4 优先级）
++      for (const g of expandGroups) {
++        try {
++          const info = await getVideoInfoByBvid(g.bvid);
++          if (!info) continue;
++          const pages = (Array.isArray(info.pages) && info.pages.length > 0)
++            ? info.pages
++            : [{ page: 1, part: '', cid: info.cid }];
++          for (const pg of pages) {
++            taskItems.push(mkTask(g, info.aid, pg.cid, pg.part || '', padP(pg.page || 1)));
+           }
++        } catch (e) {
++          console.warn('[B站下载助手] 兜底组解析失败:', g.bvid, e);
+         }
+-        
+-        if (taskInfos.length === 0) {
+-          alert('无法获取任何视频信息');
+-          return;
+-        }
+-        
+-        // Step 2: Enqueue all tasks to background queue (background dispatches one by one)
+-        notify('ENQUEUE_TASKS', {
+-          tasks: taskInfos.map(info => ({
+-            taskId: info.taskId,
+-            title: info.title,
+-            bvid: info.bvid,
+-            aid: info.aid,
+-            cid: info.cid,
+-            quality: '等待中',
+-            qualityIdx: 0
+-          }))
+-        });
+-        console.log('[B站下载助手] Enqueued', taskInfos.length, 'tasks to background queue');
+-
+-        // 异步补全各任务合计体积：不阻塞入队，单个失败静默跳过（执行期 quality 上报兜底）
+-        (async () => {
+-          for (const info of taskInfos) {
+-            try {
+-              const d = await getPlayUrl(info.aid, info.bvid, info.cid, 80);
+-              if (!d?.dash) continue;
+-              const byQ = {};
+-              d.dash.video.forEach(v => {
+-                if (!byQ[v.id]) byQ[v.id] = [];
+-                byQ[v.id].push(v);
+-              });
+-              const topQ = Object.keys(byQ).map(Number).sort((a,b) => b-a)[0];
+-              const topVideo = byQ[topQ].sort((a,b) => b.bandwidth - a.bandwidth)[0];
+-              const dur = d.dash.duration || Math.round((d.timelength || 0) / 1000);
+-              notify('UPDATE_TASK_SIZE', {
+-                taskId: info.taskId,
+-                videoSize: dashSize(topVideo, dur),
+-                audioSize: dashSize(d.dash.audio[0], dur)
+-              });
+-            } catch(e) {
+-              console.warn('[B站下载助手] 补全任务体积失败:', info.title, e);
+-            }
++      }
++
++      if (taskItems.length === 0) {
++        alert('无法获取所选内容的下载信息');
++        return;
++      }
++
++      notify('ENQUEUE_TASKS', { tasks: taskItems });
++
++      // 异步补全各分P体积（沿用 UPDATE_TASK_SIZE 既有链路；单个失败静默跳过，执行期 quality 上报兜底）
++      (async () => {
++        for (const it of taskItems) {
++          try {
++            const d = await getPlayUrl(it.aid, it.bvid, it.cid, 80);
++            if (!d?.dash) continue;
++            const byQ = {};
++            d.dash.video.forEach(v => { (byQ[v.id] = byQ[v.id] || []).push(v); });
++            const topQ = Object.keys(byQ).map(Number).sort((a, b) => b - a)[0];
++            const topVideo = byQ[topQ].sort((a, b) => b.bandwidth - a.bandwidth)[0];
++            const dur = d.dash.duration || Math.round((d.timelength || 0) / 1000);
++            notify('UPDATE_TASK_SIZE', {
++              taskId: it.taskId,
++              videoSize: dashSize(topVideo, dur),
++              audioSize: dashSize(d.dash.audio[0], dur)
++            });
++          } catch (e) {
++            console.warn('[B站下载助手] 补全任务体积失败:', it.title, e);
+           }
+-        })();
+-      });
+-      
+-    } catch(e) {
+-      body.innerHTML = '<div style="text-align:center;color:#f44336;padding:20px;">嗅探失败: ' + e.message + '</div>';
++        }
++      })();
+     }
++
++    renderTree();
+   }
+ 
+   // ─── Init ───
+   function waitAndInit() {
+     if (document.body) {
+       if (isVideoPage()) setTimeout(createUI, 3000);
+     } else {
+       document.addEventListener('DOMContentLoaded', () => {
+         if (isVideoPage()) setTimeout(createUI, 3000);
+       });
+@@ -1166,21 +1243,20 @@
+     
+     const startObserver = () => {
+       if (!document.body) return;
+       let lastUrl = location.href;
+       new MutationObserver(() => {
+         if (location.href !== lastUrl) {
+           lastUrl = location.href;
+           const el = document.getElementById('bili-dl-root');
+           if (el) el.remove();
+           currentVideoInfo = null;
+-          currentCollectionVideos = [];
+           if (isVideoPage()) {
+             setTimeout(createUI, 3000);
+           }
+         }
+       }).observe(document.body, {childList:true, subtree:true});
+     };
+     
+     if (document.body) {
+       startObserver();
+     } else {
+diff --git a/content.js b/content.js
+index 4a90ff6..50fb1d1 100644
+--- a/content.js
++++ b/content.js
+@@ -1,14 +1,24 @@
+ // content.js - Bridge between page context and extension
+ (function() {
+   let pageReady = false; // 页面世界的 content-page.js 是否已加载（宿主 tab 就绪判据）
+ 
++  // 合集解析器（ESM）：以 module 方式注入页面世界，执行后挂 window.BiliCollectionParser。
++  // 模块脚本为异步加载，与下方经典脚本的先后顺序不保证，消费方以轮询等待兜底（同 ffmpeg_urls 模式）
++  if (!document.getElementById('bilibili-dl-parser')) {
++    const p = document.createElement('script');
++    p.id = 'bilibili-dl-parser';
++    p.type = 'module';
++    p.src = chrome.runtime.getURL('lib/collection-parser.js');
++    (document.head || document.documentElement).appendChild(p);
++  }
++
+   // Always inject page script first (non-blocking)
+   if (!document.getElementById('bilibili-downloader-ext')) {
+     const s = document.createElement('script');
+     s.id = 'bilibili-downloader-ext';
+     s.src = chrome.runtime.getURL('content-page.js');
+     (document.head || document.documentElement).appendChild(s);
+   }
+ 
+   // Pre-fetch FFmpeg files asynchronously (non-blocking, best-effort)
+   const files = [
+diff --git a/lib/collection-parser.js b/lib/collection-parser.js
+new file mode 100644
+index 0000000..48546f0
+--- /dev/null
++++ b/lib/collection-parser.js
+@@ -0,0 +1,120 @@
++// lib/collection-parser.js - 合集两级树解析核心（纯函数，无 DOM/chrome 依赖）
++// 双环境：Node ESM 单测直接 import；页面世界由 content.js 以 <script type="module">
++// 注入后挂到 window.BiliCollectionParser，供经典脚本 content-page.js 轮询取用
++
++export function extractInitialState(html) {
++  if (!html) return null;
++  const m = html.match(/<script>window\.__INITIAL_STATE__=(.+?)<\/script>/);
++  if (!m || !m[1]) return null;
++  try {
++    const s = m[1].replace(/;\(function\(\)\{.*?\}\(\)\);?$/, '');
++    return JSON.parse(s);
++  } catch (e) {
++    return null;
++  }
++}
++
++// episode.pages 缺失时用 availableVideoList 同 bvid 条目补齐（availableVideoList.list[].p/title 与 pages.page/part 对应）
++function partsFromAvailableList(avList, bvid) {
++  const hit = (Array.isArray(avList) ? avList : []).find(v => v && v.bvid === bvid);
++  if (!hit || !Array.isArray(hit.list) || hit.list.length === 0) return null;
++  return hit.list.map(it => ({
++    p: it.p || 1,
++    cid: it.cid,
++    title: it.title || '',
++    duration: 0
++  }));
++}
++
++// pages→parts 的字段归一化规则只有这一份：合集分支与单视频多P分支共用，
++// 两处若各写一份极易在后续改动中漂移失配（如 P 序号、缺省值不一致），故必须收敛到此助手
++function mapPages(pages) {
++  return pages.map(pg => ({
++    p: pg.page || 1,
++    cid: pg.cid,
++    title: pg.part || ('P' + (pg.page || 1)),
++    duration: pg.duration || 0
++  }));
++}
++
++function episodeParts(ep, avList) {
++  if (Array.isArray(ep.pages) && ep.pages.length > 0) {
++    return mapPages(ep.pages);
++  }
++  const alt = partsFromAvailableList(avList, ep.bvid);
++  if (alt) return alt;
++  // 兜底：仅 P1（cid 取 episode 自身），与旧版"每个合集视频只下 P1"的行为一致
++  return [{ p: 1, cid: ep.cid, title: '', duration: 0 }];
++}
++
++/**
++ * 从 __INITIAL_STATE__ 构建合集两级树
++ * @returns {{collectionName: string, groups: Array}|null} null 表示状态数据不可用，调用方走 DOM 兜底
++ */
++export function buildCollectionTree(state) {
++  const st = state || {};
++  const vd = st.videoData || {};
++
++  // ① 合集模式：videoData.ugc_season.sections[].episodes[]
++  // 多 section 平铺为一层 groups（section 只是"正片/花絮"类分组标签，不作树的第三层级）
++  const season = vd.ugc_season;
++  if (season && Array.isArray(season.sections) && season.sections.length > 0) {
++    const avList = Array.isArray(st.availableVideoList) ? st.availableVideoList : [];
++    const groups = [];
++    const seen = new Set();
++    for (const sec of season.sections) {
++      for (const ep of (Array.isArray(sec.episodes) ? sec.episodes : [])) {
++        if (!ep || !ep.bvid || seen.has(ep.bvid)) continue;
++        seen.add(ep.bvid);
++        groups.push({
++          title: ep.title || (ep.arc && ep.arc.title) || ep.bvid,
++          bvid: ep.bvid,
++          aid: (ep.aid != null) ? ep.aid : ((ep.arc && ep.arc.aid != null) ? ep.arc.aid : ''),
++          cover: (ep.arc && ep.arc.pic) || '',
++          partsKnown: true,
++          parts: episodeParts(ep, avList)
++        });
++      }
++    }
++    if (groups.length > 0) {
++      return { collectionName: season.title || vd.title || '', groups };
++    }
++  }
++
++  // ② 单视频多P回退：当前视频作为唯一分组，分P全展开
++  if (Array.isArray(vd.pages) && vd.pages.length > 1) {
++    return {
++      collectionName: vd.title || '',
++      groups: [{
++        title: vd.title || '',
++        bvid: vd.bvid || '',
++        aid: (vd.aid != null) ? vd.aid : '',
++        cover: '',
++        partsKnown: true,
++        parts: mapPages(vd.pages)
++      }]
++    };
++  }
++
++  // ③ 单P回退：保持旧单视频能力
++  if (vd.bvid && vd.cid) {
++    return {
++      collectionName: vd.title || '',
++      groups: [{
++        title: vd.title || '',
++        bvid: vd.bvid,
++        aid: (vd.aid != null) ? vd.aid : '',
++        cover: '',
++        partsKnown: true,
++        parts: [{ p: 1, cid: vd.cid, title: vd.title || '', duration: 0 }]
++      }]
++    };
++  }
++
++  return null;
++}
++
++// 页面世界挂载（Node/offscreen/SW 无 window，自动跳过）
++if (typeof window !== 'undefined') {
++  window.BiliCollectionParser = { extractInitialState, buildCollectionTree };
++}
+diff --git a/lib/download-core.js b/lib/download-core.js
+index 578abeb..269c80c 100644
+--- a/lib/download-core.js
++++ b/lib/download-core.js
+@@ -5,20 +5,44 @@
+ // 否则流下载返回 403
+ const BILI_REFERRER = 'https://www.bilibili.com/';
+ 
+ export const QMAP = {16:'360P',32:'480P',64:'720P',80:'1080P',112:'1080P高码率',120:'4K',125:'HDR'};
+ export const DOWNLOAD_BASE = 'bilibili_download';
+ 
+ export function sanitizeFilename(name) {
+   return name.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').substring(0, 200);
+ }
+ 
++// 输出路径解析（纯函数）：批量任务(dir/baseName)三级目录与单视频平铺两条路径的唯一事实源。
++// 有 dir：合并输出 <DOWNLOAD_BASE>/<dir>/<base>_<label>.mp4；
++//         分离文件/merge.txt 落 <DOWNLOAD_BASE>/<dir>/<base>/ —— 按 baseName 隔离，
++//         否则同一 <dir> 下多个分P任务的 audio.mp4/video.mp4 会互相覆盖
++// 无 dir：与历史行为完全一致（合并平铺根目录、分离文件落 <标题>/ 子目录）
++export function resolveOutputTargets(videoInfo, label = '') {
++  const title = (videoInfo && videoInfo.title) || '';
++  const safeTitle = sanitizeFilename(title) || '_';
++  if (videoInfo && videoInfo.dir) {
++    const safeDir = String(videoInfo.dir).split('/').map(sanitizeFilename).join('/');
++    const safeBase = sanitizeFilename(videoInfo.baseName || safeTitle);
++    return {
++      mergedDir: DOWNLOAD_BASE + '/' + safeDir,
++      mergedName: `${safeBase}${label ? '_' + label : ''}.mp4`,
++      rawSubdir: DOWNLOAD_BASE + '/' + safeDir + '/' + safeBase
++    };
++  }
++  return {
++    mergedDir: DOWNLOAD_BASE,
++    mergedName: `${safeTitle}${label ? '_' + label : ''}.mp4`,
++    rawSubdir: DOWNLOAD_BASE + '/' + safeTitle
++  };
++}
++
+ // B 站 playurl 的 dash size 字段已实测返回空值：优先取值，空则按 bandwidth(位/秒)×duration(秒) 估算
+ function dashSize(entry, durationSec) {
+   if (entry?.size) return entry.size;
+   if (entry?.bandwidth && durationSec > 0) return Math.round(entry.bandwidth / 8 * durationSec);
+   return 0;
+ }
+ 
+ export async function getPlayUrl(aid, bvid, cid, qn = 80, signal, fetchFn = fetch) {
+   const url = `https://api.bilibili.com/x/player/wbi/playurl?qn=${qn}&fnver=0&fnval=4048&fourk=1&avid=${aid}&bvid=${bvid}&cid=${cid}`;
+   const r = await fetchFn(url, { credentials: 'include', referrer: BILI_REFERRER, referrerPolicy: 'unsafe-url', signal });
+@@ -289,21 +313,20 @@ export async function mergeAudioVideo(ffmpeg, audioBlob, videoBlob, notify) {
+   ffmpeg.deleteFile(audioPath).catch(() => {});
+   ffmpeg.deleteFile(videoPath).catch(() => {});
+   const merged = await ffmpeg.readFile(outputPath);
+   ffmpeg.deleteFile(outputPath).catch(() => {});
+   return new Blob([merged.buffer], { type: 'video/mp4' });
+ }
+ 
+ export async function executeTask(taskId, videoInfo, qualityIdx, deps) {
+   const { getSettings, getFFmpeg, notify, saveBlob, removeSavedFile, signal, fetchFn } = deps;
+   const settings = (await getSettings()) || {};
+-  const title = videoInfo.title;
+ 
+   let data;
+   try {
+     data = await getPlayUrl(videoInfo.aid, videoInfo.bvid, videoInfo.cid, 80, signal, fetchFn);
+   } catch (e) {
+     if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+     const err = new Error(e.message || '获取播放地址失败');
+     err.code = 'NEEDS_PAGE';
+     throw err;
+   }
+@@ -351,34 +374,33 @@ export async function executeTask(taskId, videoInfo, qualityIdx, deps) {
+     throw e;
+   } finally {
+     if (signal) signal.removeEventListener('abort', onOuterAbort);
+   }
+ 
+   if (signal?.aborted) {
+     throw new DOMException('aborted', 'AbortError');
+   }
+   notify({ phase: 'download', percent: 100, label: '下载完成' });
+ 
+-  const safeTitle = sanitizeFilename(title);
+-  const subdir = DOWNLOAD_BASE + '/' + safeTitle;
++  const targets = resolveOutputTargets(videoInfo, label);
+   const actualTotal = audioDl.size + videoDl.size;
+   // 用真实字节数修正任务卡片的合计容量（入队时的值为估算）
+   notify({ phase: 'quality', percent: 0, totalSize: actualTotal });
+   let rawSaved = false;
+   let audioFileId = null;
+   let videoFileId = null;
+ 
+   // Blob 构造引用 OPFS 文件快照，不产生整文件的内存拷贝
+   // MIME 用 video/mp4 且文件名用 .mp4：B 站 dash 流本身是 fMP4 容器，
+   // 若命名为 .m4s，Chrome 会按内容类型把扩展名改写成 .mp4
+-  const saveAudioRaw = () => saveBlob(new Blob([audioDl.file], { type: 'video/mp4' }), 'audio.mp4', subdir);
+-  const saveVideoRaw = () => saveBlob(new Blob([videoDl.file], { type: 'video/mp4' }), 'video.mp4', subdir);
++  const saveAudioRaw = () => saveBlob(new Blob([audioDl.file], { type: 'video/mp4' }), 'audio.mp4', targets.rawSubdir);
++  const saveVideoRaw = () => saveBlob(new Blob([videoDl.file], { type: 'video/mp4' }), 'video.mp4', targets.rawSubdir);
+   // 记录 downloadId，合并成功后可按设置删除原始文件（chrome.downloads.removeFile）
+   const saveRawFiles = async () => {
+     audioFileId = await saveAudioRaw();
+     videoFileId = await saveVideoRaw();
+   };
+ 
+   if (settings.saveRawFiles) {
+     try {
+       notify({ phase: 'merge', percent: 0, label: '保存原始文件' });
+       await saveRawFiles();
+@@ -389,31 +411,31 @@ export async function executeTask(taskId, videoInfo, qualityIdx, deps) {
+   const bigFile = actualTotal > MERGE_THRESHOLD;
+   let note = '';
+ 
+   if (!bigFile) {
+     // 小文件：直接合并（成功率接近 100%），失败才降级落盘——避免多余磁盘写与删除痕迹
+     try {
+       notify({ phase: 'merge', percent: 50, label: '合并中' });
+       const ffmpeg = await getFFmpeg();
+       const mergedBlob = await mergeAudioVideo(ffmpeg, audioDl.file, videoDl.file, notify);
+       if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+-      await saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`, DOWNLOAD_BASE);
++      await saveBlob(mergedBlob, targets.mergedName, targets.mergedDir);
+       notify({ phase: 'merge', percent: 100, label: '合并完成' });
+     } catch (mergeError) {
+       if (signal?.aborted || mergeError.name === 'AbortError') {
+         throw mergeError;
+       }
+       // 合并执行失败（多为 OOM）：降级为分离保存，任务正常完成
+       if (!rawSaved) {
+         try { await saveRawFiles(); rawSaved = true; } catch (e) {}
+       }
+-      try { await saveMergeTxt(saveBlob, subdir); } catch (e) {}
++      try { await saveMergeTxt(saveBlob, targets.rawSubdir); } catch (e) {}
+       await cleanupOPFS([taskId + '_audio', taskId + '_video']);
+       if (!rawSaved) {
+         throw new Error('合并失败且分离文件保存失败: ' + mergeError.message);
+       }
+       note = `合并失败（${mergeError.message}），已保存分离音视频，请按 merge.txt 说明本地合并`;
+       notify({ phase: 'merge', percent: 100, label: '已保存分离文件' });
+     }
+   } else {
+     // 大文件：先落盘分离文件作保底（用户指定的顺序），再尝试合并——不再一刀切跳过。
+     // 卡在 wasm 内存边界附近的文件有机会合并成功；失败时保底文件直接可用。
+@@ -431,36 +453,36 @@ export async function executeTask(taskId, videoInfo, qualityIdx, deps) {
+     // 实测 wasm 堆上限 2GB：总大小 ≥900MB 时合并必然 OOM（还会杀死 worker 连累后续任务），
+     // 直接跳过尝试；600MB~900MB 的边界区间仍给合并机会
+     const worthMerging = actualTotal < MERGE_HARD_LIMIT;
+     let mergedOk = false;
+     if (worthMerging) {
+       try {
+         notify({ phase: 'merge', percent: 50, label: '尝试合并' });
+         const ffmpeg = await getFFmpeg();
+         const mergedBlob = await mergeAudioVideo(ffmpeg, audioDl.file, videoDl.file, notify);
+         if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+-        await saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`, DOWNLOAD_BASE);
++        await saveBlob(mergedBlob, targets.mergedName, targets.mergedDir);
+         mergedOk = true;
+         notify({ phase: 'merge', percent: 100, label: '合并完成' });
+       } catch (mergeError) {
+         if (signal?.aborted || mergeError.name === 'AbortError') {
+           throw mergeError;
+         }
+         // 合并失败（边界区间 OOM）：保底分离文件已在磁盘上，补 merge.txt 即完成任务
+-        try { await saveMergeTxt(saveBlob, subdir); } catch (e) {}
++        try { await saveMergeTxt(saveBlob, targets.rawSubdir); } catch (e) {}
+         note = `内存不足未能自动合并，分离音视频已就绪，请按 merge.txt 说明本地合并`;
+         notify({ phase: 'merge', percent: 100, label: '已保存分离文件' });
+       }
+     }
+     if (!mergedOk && !worthMerging) {
+       // 确定性失败区：不浪费一次注定失败的合并尝试，保底文件即最终交付
+-      try { await saveMergeTxt(saveBlob, subdir); } catch (e) {}
++      try { await saveMergeTxt(saveBlob, targets.rawSubdir); } catch (e) {}
+       note = `文件较大（${fmtBytes(actualTotal)}），已保存分离音视频，请按 merge.txt 说明本地合并`;
+       notify({ phase: 'merge', percent: 100, label: '已保存分离文件' });
+     }
+     if (mergedOk && !settings.saveRawFiles) {
+       // 合并成功且未开启"保存原始音频和视频文件"→ 删除刚落盘的保底文件
+       try {
+         if (audioFileId) await removeSavedFile(audioFileId);
+         if (videoFileId) await removeSavedFile(videoFileId);
+       } catch (e) {}
+     }
+diff --git a/manifest.json b/manifest.json
+index 74e561b..2632cf6 100644
+--- a/manifest.json
++++ b/manifest.json
+@@ -26,21 +26,21 @@
+   "content_scripts": [
+     {
+       "matches": ["*://*.bilibili.com/*"],
+       "js": ["content.js"],
+       "css": ["styles/content.css"],
+       "run_at": "document_start"
+     }
+   ],
+   "web_accessible_resources": [
+     {
+-      "resources": ["content-page.js", "lib/ffmpeg.worker.js", "lib/ffmpeg-core.js", "lib/ffmpeg-core.wasm", "lib/ffmpeg-core.worker.js"],
++      "resources": ["content-page.js", "lib/collection-parser.js", "lib/ffmpeg.worker.js", "lib/ffmpeg-core.js", "lib/ffmpeg-core.wasm", "lib/ffmpeg-core.worker.js"],
+       "matches": ["*://*.bilibili.com/*"]
+     }
+   ],
+   "side_panel": {
+     "default_path": "sidepanel.html"
+   },
+   "action": {
+     "default_icon": {
+       "16": "assets/icon16.png",
+       "48": "assets/icon48.png",
+diff --git a/test/collection-parser.test.mjs b/test/collection-parser.test.mjs
+new file mode 100644
+index 0000000..60d8ba7
+--- /dev/null
++++ b/test/collection-parser.test.mjs
+@@ -0,0 +1,118 @@
++// 合集两级树解析单测: node test/collection-parser.test.mjs
++import { extractInitialState, buildCollectionTree } from '../lib/collection-parser.js';
++
++let passed = 0, failed = 0;
++function assert(cond, name, detail) {
++  if (cond) { passed++; console.log('  ✓', name); }
++  else { failed++; console.error('  ✗', name, detail ? '— ' + detail : ''); }
++}
++function eq(actual, expected, name) {
++  assert(JSON.stringify(actual) === JSON.stringify(expected), name, `got ${JSON.stringify(actual)} want ${JSON.stringify(expected)}`);
++}
++
++console.log('extractInitialState');
++{
++  const st = makeSeasonState();
++  const html = `<html><script>window.__INITIAL_STATE__=${JSON.stringify(st)};(function(){console.log(1)}());</script></html>`;
++  const got = extractInitialState(html);
++  assert(got && got.videoData.bvid === 'BV1sJwezxEpJ', '提取 JSON 并剥离尾随脚本');
++  eq(extractInitialState('<html><body>no state</body></html>'), null, '无状态脚本返回 null');
++  eq(extractInitialState('<script>window.__INITIAL_STATE__={bad json,</script>'), null, '坏 JSON 返回 null');
++  eq(extractInitialState(''), null, '空串返回 null');
++}
++
++console.log('buildCollectionTree ① 合集模式（真实结构裁剪自 BV1sJwezxEpJ）');
++{
++  const tree = buildCollectionTree(makeSeasonState());
++  assert(tree.collectionName === 'ESP32-S3 IDF入门及AIoT项目实战', '合集名取 ugc_season.title');
++  eq(tree.groups.length, 4, '跨 section 平铺 + bvid 去重 = 4 组');
++  const g0 = tree.groups[0];
++  assert(g0.bvid === 'BV1XyGX6KEv8' && g0.aid === 116650858779942, 'g0 标识字段');
++  assert(g0.cover === 'http://i1.hdslb.com/a.jpg', 'cover 取 arc.pic');
++  assert(g0.partsKnown === true && g0.parts.length === 3, 'g0 按 pages 展开三P');
++  eq(g0.parts.map(p => p.p), [1, 2, 3], 'p 序号来自 page 字段');
++  eq(g0.parts[1], { p: 2, cid: 38668992828, title: '实战一：TRAE开发环境搭建与配置', duration: 697 }, 'part 字段映射');
++  const g1 = tree.groups[1];
++  assert(g1.bvid === 'BV1eWG96zEAi' && g1.partsKnown === true && g1.parts.length === 2, '空 pages 经 availableVideoList 回退');
++  assert(g1.parts[0].cid === 38668537617 && g1.parts[1].title === '初识ESP32-S3&ESP-IDF开发框架', '回退条目字段正确');
++  const g2 = tree.groups[2];
++  assert(g2.bvid === 'BV1X52CBREjG' && g2.partsKnown === true && g2.parts.length === 1, '无任何来源降级为单P');
++  eq(g2.parts[0], { p: 1, cid: 34590492687, title: '', duration: 0 }, '单P降级 cid 取 episode 自身');
++}
++
++console.log('buildCollectionTree ② 单视频多P回退');
++{
++  const st = { videoData: { aid: 7, bvid: 'BVmulti', cid: 701, title: '多P视频',
++    pages: [
++      { cid: 701, page: 1, part: '第一集', duration: 100 },
++      { cid: 702, page: 2, part: '第二集', duration: 200 },
++      { cid: 703, page: 3, part: '第三集', duration: 300 }
++    ] } };
++  const tree = buildCollectionTree(st);
++  assert(tree.collectionName === '多P视频', '合集名取视频标题');
++  eq(tree.groups.length, 1, '单一分组');
++  assert(tree.groups[0].partsKnown === true && tree.groups[0].parts.length === 3, '三分P全部展开');
++}
++
++console.log('buildCollectionTree ③ 单P回退');
++{
++  const st = { videoData: { aid: 8, bvid: 'BVs', cid: 801, title: '单P视频',
++    pages: [{ cid: 801, page: 1, part: '唯一的P', duration: 60 }] } };
++  const tree = buildCollectionTree(st);
++  eq(tree.groups.length, 1, '单组');
++  assert(tree.groups[0].partsKnown === true && tree.groups[0].parts.length === 1, '单P');
++  assert(tree.groups[0].parts[0].cid === 801, 'cid 正确');
++}
++
++console.log('buildCollectionTree 兜底返回 null');
++eq(buildCollectionTree(null), null, 'null state');
++eq(buildCollectionTree({}), null, '空 state');
++eq(buildCollectionTree({ videoData: {} }), null, '无 bvid/cid');
++
++function makeSeasonState() {
++  return {
++    videoData: {
++      aid: 116249497637244, bvid: 'BV1sJwezxEpJ', cid: 36788832336,
++      title: '6. ESP32-S3小智AI机器人项目-桌宠机器狗',
++      ugc_season: {
++        id: 8218687, title: 'ESP32-S3 IDF入门及AIoT项目实战',
++        sections: [
++          { id: 9134838, title: '正片', type: 1, episodes: [
++            { season_id: 8218687, section_id: 9134838, id: 198339571,
++              aid: 116650858779942, cid: 38668928255, bvid: 'BV1XyGX6KEv8',
++              title: '1. 用TRAE玩转STM32和ESP32开发',
++              arc: { aid: 116650858779942, pic: 'http://i1.hdslb.com/a.jpg' },
++              pages: [
++                { cid: 38668928255, page: 1, part: '从AI_Agent热潮到开发方式升级', duration: 1136 },
++                { cid: 38668992828, page: 2, part: '实战一：TRAE开发环境搭建与配置', duration: 697 },
++                { cid: 38668994252, page: 3, part: '实战二_基于TRAE开发STM32F103', duration: 650 }
++              ] },
++            { season_id: 8218687, section_id: 9134838, id: 198339572,
++              aid: 116650758117134, cid: 38668537617, bvid: 'BV1eWG96zEAi',
++              title: '2. ESP32-S3 IDF入门开发教程(连载中)',
++              arc: { aid: 116650758117134 },
++              pages: [] },
++            { season_id: 8218687, section_id: 9134838, id: 198301325,
++              aid: 115682880590811, cid: 34590492687, bvid: 'BV1X52CBREjG',
++              title: '3. ESP32-S3 AI入门项目实战-智能方向指针',
++              arc: {} }
++          ]},
++          { id: 99, title: '花絮', type: 2, episodes: [
++            { aid: 999, cid: 888, bvid: 'BVDUP00001', title: '重复项A' },
++            { aid: 999, cid: 888, bvid: 'BVDUP00001', title: '重复项B(应去重)' }
++          ]}
++        ]
++      },
++      pages: [{ cid: 36788832336, page: 1, part: '如何打造一个属于自己的小智ai聊天机器人', duration: 920 }]
++    },
++    availableVideoList: [
++      { bvid: 'BV1eWG96zEAi', list: [
++        { aid: 116650758117134, bvid: 'BV1eWG96zEAi', cid: 38668537617, p: 1, title: 'ESP32-S3课程简介' },
++        { aid: 116650758117134, bvid: 'BV1eWG96zEAi', cid: 38668601189, p: 2, title: '初识ESP32-S3&ESP-IDF开发框架' }
++      ]}
++    ]
++  };
++}
++
++console.log(`\n${passed} passed, ${failed} failed`);
++process.exit(failed ? 1 : 0);
+diff --git a/test/output-paths.test.mjs b/test/output-paths.test.mjs
+new file mode 100644
+index 0000000..0368aa5
+--- /dev/null
++++ b/test/output-paths.test.mjs
+@@ -0,0 +1,41 @@
++// 输出路径规则单测: node test/output-paths.test.mjs
++import { resolveOutputTargets, DOWNLOAD_BASE } from '../lib/download-core.js';
++
++let passed = 0, failed = 0;
++function assert(cond, name, detail) {
++  if (cond) { passed++; console.log('  ✓', name); }
++  else { failed++; console.error('  ✗', name, detail ? '— ' + detail : ''); }
++}
++
++console.log('单视频路径（无 dir）—— 必须与历史行为一致');
++{
++  const t = resolveOutputTargets({ title: '我的视频' }, '1080P');
++  assert(t.mergedDir === DOWNLOAD_BASE, '合并输出在根目录');
++  assert(t.mergedName === '我的视频_1080P.mp4', '合并文件名=标题_画质');
++  assert(t.rawSubdir === DOWNLOAD_BASE + '/我的视频', '分离文件落标题子目录');
++}
++
++console.log('批量路径（有 dir/baseName）—— 三级目录');
++{
++  const t = resolveOutputTargets(
++    { title: '一级标题', dir: 'ESP32合集/一级标题', baseName: 'P03_启动流程' }, '720P');
++  assert(t.mergedDir === DOWNLOAD_BASE + '/ESP32合集/一级标题', '合并输出进三级目录');
++  assert(t.mergedName === 'P03_启动流程_720P.mp4', '合并文件名=baseName_画质');
++  assert(t.rawSubdir === DOWNLOAD_BASE + '/ESP32合集/一级标题/P03_启动流程', '分离文件按 baseName 隔离子目录');
++}
++
++console.log('非法字符清洗发生在输出边界');
++{
++  const t = resolveOutputTargets({ dir: 'a<b>c/d:e', baseName: 'x*y?"z' }, '4K');
++  assert(t.mergedDir === DOWNLOAD_BASE + '/a_b_c/d_e', '目录段逐段清洗');
++  assert(t.mergedName === 'x_y__z_4K.mp4', '文件名非法字符替换');
++}
++
++console.log('边界入参不抛错');
++{
++  const t = resolveOutputTargets(null, '');
++  assert(t.mergedDir === DOWNLOAD_BASE && t.rawSubdir === DOWNLOAD_BASE + '/_' , '空对象退化为占位名');
++}
++
++console.log(`\n${passed} passed, ${failed} failed`);
++process.exit(failed ? 1 : 0);
