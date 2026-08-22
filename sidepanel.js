@@ -1,6 +1,8 @@
 // sidepanel.js
 // 所有数据读写通过 background.js 消息，不直接访问存储
 
+import { buildAlertText, createAlertManager } from './lib/failure-alert.js';
+
 let tasks = [];
 
 // ─── Icons ───
@@ -69,6 +71,29 @@ function getStatusColor(task) {
     default: return '#999';
   }
 }
+
+// ─── Failure Alert Toasts ───
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+const alertHost = document.createElement('div');
+alertHost.id = 'alert-host';
+document.body.appendChild(alertHost);
+
+function renderAlerts(alerts) {
+  alertHost.innerHTML = alerts.map(a => `
+    <div class="alert-toast ${a.kind} ${a.state}" data-id="${a.id}">
+      <div class="alert-text">${escapeHtml(a.text)}</div>
+      <button class="alert-close" aria-label="关闭">&times;</button>
+    </div>`).join('');
+  alertHost.querySelectorAll('.alert-close').forEach(btn => {
+    btn.onclick = () => alertManager.dismiss(Number(btn.closest('.alert-toast').dataset.id));
+  });
+}
+
+const alertManager = createAlertManager({ onRender: renderAlerts });
 
 // ─── Confirm Dialog ───
 
@@ -295,6 +320,11 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message.type === 'TASK_REMOVED') {
     tasks = tasks.filter(t => t.id !== message.data.taskId);
     scheduleRender();
+  }
+
+  if (message.type === 'TASK_FAILED_ALERT') {
+    const d = message.data || {};
+    alertManager.add(buildAlertText(d), d.retrying ? 'retry' : 'final');
   }
 });
 

@@ -254,11 +254,13 @@ async function failTask(taskId, error, retryable) {
     t.createdAt = new Date().toISOString();
     t.progress = { audio: 0, video: 0, merge: 0 };
     t.lastProgressAt = 0;
+    notifySidePanel({ type: 'TASK_FAILED_ALERT', data: { taskId, title: t.title, error, retrying: true, attempt: t.retryCount, maxRetries: settings.retryTimes } });
     await notifyTask(t);
     return;
   }
   t.status = 'failed';
   t.error = error;
+  notifySidePanel({ type: 'TASK_FAILED_ALERT', data: { taskId, title: t.title, error, retrying: false, attempt: t.retryCount, maxRetries: settings.retryTimes } });
   await notifyTask(t);
 }
 
@@ -275,11 +277,13 @@ async function requeueTask(taskId, error) {
     t.status = 'pending';
     t.progress = { audio: 0, video: 0, merge: 0 };
     t.lastProgressAt = 0;
+    notifySidePanel({ type: 'TASK_FAILED_ALERT', data: { taskId, title: t.title, error, retrying: true, attempt: t.retryCount, maxRetries: settings.retryTimes } });
     await notifyTask(t);
     return;
   }
   t.status = 'failed';
   t.error = error;
+  notifySidePanel({ type: 'TASK_FAILED_ALERT', data: { taskId, title: t.title, error, retrying: false, attempt: t.retryCount, maxRetries: settings.retryTimes } });
   await notifyTask(t);
 }
 

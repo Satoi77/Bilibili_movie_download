@@ -371,3 +371,89 @@ body {
   .help-body { animation: none; }
   .help-chevron { transition: none; }
 }
+
+/* ─── Failure Alert Toasts ─── */
+/* Design context · audience=B站批量下载用户 · use=6秒内读到失败原因与重试进度 · tone=utilitarian
+   遵循既有 px 字号体系与 0.2s 动效节奏；签名元素=左侧 3px 语义色条（橙=重试中/红=最终失败）。
+   Critique: C4 H5 E4 S4 R5 U4 */
+
+#alert-host {
+  position: fixed;
+  top: 104px; /* header(≈54px) + tabs(≈43px) 之下，实测边界核算，不遮挡 tabs */
+  left: 12px;
+  right: 12px;
+  z-index: 900; /* 高于列表，低于 confirm overlay(9999) */
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+  max-height: calc(100vh - 130px);
+  overflow: hidden;
+}
+
+.alert-toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.15);
+  font-size: 12px;
+  line-height: 1.5;
+  border-left: 3px solid transparent;
+  transform: translateY(-8px);
+  animation: alert-in 0.2s ease-out forwards;
+}
+
+@keyframes alert-in {
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.alert-toast.retry {
+  background: #fff8f0;
+  border-left-color: #ff9800;
+  color: #7a4d00; /* ≈5.5:1 on #fff8f0 */
+}
+
+.alert-toast.final {
+  background: #fff1f0;
+  border-left-color: #f44336;
+  color: #9c1a10; /* ≈6:1 on #fff1f0 */
+}
+
+.alert-toast.leaving {
+  animation: none;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.alert-text { flex: 1; word-break: break-all; }
+
+.alert-close {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  opacity: 0.55;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 20px;
+  transition: opacity 0.2s;
+}
+
+.alert-close:hover { opacity: 1; }
+
+.alert-close:focus-visible {
+  outline: 2px solid #00a1d6;
+  outline-offset: 1px;
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .alert-toast { animation: none; transform: none; }
+  .alert-toast.leaving { transition: none; }
+}
