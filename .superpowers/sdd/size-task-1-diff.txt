@@ -1,0 +1,98 @@
+d5aaa16 feat(download): 合集批量入队后异步补全任务合计体积
+ background.js   | 20 ++++++++++++++++++++
+ content-page.js | 24 ++++++++++++++++++++++++
+ 2 files changed, 44 insertions(+)
+diff --git a/background.js b/background.js
+index a33591f..a0de7dc 100644
+--- a/background.js
++++ b/background.js
+@@ -572,20 +572,40 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+       notifySidePanel({ type: 'TASK_ADDED', data: task });
+       if (task.hostTabId) {
+         chrome.sidePanel.open({ tabId: task.hostTabId }).catch(() => {});
+       }
+       sendResponse({ status: 'ok' });
+       pumpQueue();
+     })();
+     return true;
+   }
+ 
++  if (type === 'UPDATE_TASK_SIZE') {
++    biliDB.getTask(data.taskId).then(task => {
++      if (!task) { sendResponse({ status: 'ok' }); return; }
++      // 仅在体积未知时补全，避免覆盖执行期 quality 阶段上报的实际值
++      if (!task.totalSize) {
++        const total = ((data.videoSize || 0) + (data.audioSize || 0)) || 0;
++        if (total) {
++          task.videoSize = data.videoSize || 0;
++          task.audioSize = data.audioSize || 0;
++          task.totalSize = total;
++          biliDB.updateTask(task).then(() => {
++            notifySidePanel({ type: 'TASK_UPDATED', data: task });
++          });
++        }
++      }
++      sendResponse({ status: 'ok' });
++    });
++    return true;
++  }
++
+   if (type === 'STOP_ALL') {
+     (async () => {
+       queuePaused = true;
+       const all = await biliDB.getTasks();
+       for (const t of all) {
+         if (t.status === 'downloading' || t.status === 'pending') {
+           t.status = 'paused';
+           await notifyTask(t);
+         }
+       }
+diff --git a/content-page.js b/content-page.js
+index 316a08c..696cb02 100644
+--- a/content-page.js
++++ b/content-page.js
+@@ -992,20 +992,44 @@
+             taskId: info.taskId,
+             title: info.title,
+             bvid: info.bvid,
+             aid: info.aid,
+             cid: info.cid,
+             quality: '等待中',
+             qualityIdx: 0
+           }))
+         });
+         console.log('[B站下载助手] Enqueued', taskInfos.length, 'tasks to background queue');
++
++        // 异步补全各任务合计体积：不阻塞入队，单个失败静默跳过（执行期 quality 上报兜底）
++        (async () => {
++          for (const info of taskInfos) {
++            try {
++              const d = await getPlayUrl(info.aid, info.bvid, info.cid, 80);
++              if (!d?.dash) continue;
++              const byQ = {};
++              d.dash.video.forEach(v => {
++                if (!byQ[v.id]) byQ[v.id] = [];
++                byQ[v.id].push(v);
++              });
++              const topQ = Object.keys(byQ).map(Number).sort((a,b) => b-a)[0];
++              const topVideo = byQ[topQ].sort((a,b) => b.bandwidth - a.bandwidth)[0];
++              notify('UPDATE_TASK_SIZE', {
++                taskId: info.taskId,
++                videoSize: topVideo?.size || 0,
++                audioSize: d.dash.audio[0]?.size || 0
++              });
++            } catch(e) {
++              console.warn('[B站下载助手] 补全任务体积失败:', info.title, e);
++            }
++          }
++        })();
+       });
+       
+     } catch(e) {
+       body.innerHTML = '<div style="text-align:center;color:#f44336;padding:20px;">嗅探失败: ' + e.message + '</div>';
+     }
+   }
+ 
+   // ─── Init ───
+   function waitAndInit() {
+     if (document.body) {

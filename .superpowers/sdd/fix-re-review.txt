@@ -1,0 +1,153 @@
+﻿=== git log ===
+5bbc6fa fix(download): 涓嬭浇杩涘害鎸夐煶瑙嗛鍒嗙浉涓婃姤锛孎Fmpeg worker 宕╂簝鑷剤锛宱ffscreen_merge 琛?catch
+=== git diff --stat ===
+ background.js        | 2 +-
+ lib/download-core.js | 8 ++++----
+ offscreen.js         | 7 +++++++
+ 3 files changed, 12 insertions(+), 5 deletions(-)
+=== git diff -U12 ===
+diff --git a/background.js b/background.js
+index 4b43dcc..7f2101f 100644
+--- a/background.js
++++ b/background.js
+@@ -664,25 +664,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+         chrome.downloads.removeFile(results[0].id, () => sendResponse({ success: true }));
+       } else {
+         sendResponse({ success: false, error: 'File not found' });
+       }
+     });
+     return true;
+   }
+ 
+   // 鈹€鈹€鈹€ Offscreen Merge 鈹€鈹€鈹€
+   if (type === 'offscreen_merge' && sender.tab) {
+     ensureOffscreen().then(() => {
+       chrome.runtime.sendMessage({ type: 'offscreen_merge_request', data: data });
+-    });
++    }).catch(() => {});
+     return true;
+   }
+ 
+   if (type === 'offscreen_merge_result') {
+     chrome.tabs.query({}, (tabs) => {
+       tabs.forEach(tab => {
+         chrome.tabs.sendMessage(tab.id, { type: 'offscreen_merge_result', data }).catch(() => {});
+       });
+     });
+     sendResponse({ status: 'ok' });
+     return true;
+   }
+diff --git a/lib/download-core.js b/lib/download-core.js
+index 92c9b46..744c1c3 100644
+--- a/lib/download-core.js
++++ b/lib/download-core.js
+@@ -31,42 +31,42 @@ function readWithTimeout(reader, ms, signal) {
+         resolve(v);
+       },
+       (e) => {
+         clearTimeout(timer);
+         if (signal) signal.removeEventListener('abort', onAbort);
+         if (signal?.aborted) reject(new DOMException('aborted', 'AbortError'));
+         else reject(e);
+       }
+     );
+   });
+ }
+ 
+-export async function downloadStream(url, signal, notify, fetchFn = fetch) {
++export async function downloadStream(url, phase, signal, notify, fetchFn = fetch) {
+   const r = await fetchFn(url, { credentials: 'include', signal });
+   if (!r.ok) throw new Error('娴?HTTP ' + r.status);
+   const total = parseInt(r.headers.get('content-length') || '0');
+   const reader = r.body.getReader();
+   const chunks = [];
+   let received = 0;
+   let lastSent = -1;
+   while (true) {
+     if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+     const res = await readWithTimeout(reader, 30000, signal);
+     if (res.done) break;
+     chunks.push(res.value);
+     received += res.value.length;
+     const percent = total > 0 ? Math.round(received / total * 100) : -1;
+     if (percent !== lastSent) {
+       lastSent = percent;
+-      notify({ phase: 'download', percent, label: '涓嬭浇涓? });
++      notify({ phase, percent, label: '涓嬭浇涓? });
+     }
+   }
+   if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+   return new Blob(chunks);
+ }
+ 
+ export async function mergeAudioVideo(ffmpeg, audioBlob, videoBlob, notify) {
+   const tag = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+   const audioPath = tag + '_audio.m4s';
+   const videoPath = tag + '_video.m4s';
+   const outputPath = tag + '_merged.mp4';
+ 
+@@ -128,26 +128,26 @@ export async function executeTask(taskId, videoInfo, qualityIdx, deps) {
+   const options = Object.keys(videoByQ).map(Number).sort((a, b) => b - a);
+   const q = options[qualityIdx] || options[0];
+   const streams = videoByQ[q].sort((a, b) => b.bandwidth - a.bandwidth);
+   const bestVideo = streams[0];
+   const bestAudio = data.dash.audio[0];
+   const label = QMAP[q] || q + 'P';
+ 
+   notify({ phase: 'quality', percent: 0, label });
+   if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+   notify({ phase: 'download', percent: 0, label: '涓嬭浇涓? });
+ 
+   const [audioBlob, videoBlob] = await Promise.all([
+-    downloadStream(bestAudio.baseUrl, signal, notify, fetchFn),
+-    downloadStream(bestVideo.baseUrl, signal, notify, fetchFn)
++    downloadStream(bestAudio.baseUrl, 'audio', signal, notify, fetchFn),
++    downloadStream(bestVideo.baseUrl, 'video', signal, notify, fetchFn)
+   ]);
+ 
+   if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+   notify({ phase: 'download', percent: 100, label: '涓嬭浇瀹屾垚' });
+ 
+   const safeTitle = sanitizeFilename(title);
+   const baseSubdir = DOWNLOAD_BASE;
+   let rawSaved = false;
+ 
+   if (settings.saveRawFiles) {
+     try {
+       notify({ phase: 'merge', percent: 0, label: '淇濆瓨鍘熷鏂囦欢' });
+diff --git a/offscreen.js b/offscreen.js
+index 387bce0..104eeb5 100644
+--- a/offscreen.js
++++ b/offscreen.js
+@@ -122,24 +122,31 @@ const RESULT_OPS = new Set([Op.LOAD, Op.EXEC, Op.WRITE_FILE, Op.READ_FILE, Op.DE
+ let nextMsgId = 0;
+ 
+ class FFmpegBridge {
+   #worker = null;
+   #pending = {};
+   #logHandlers = [];
+   #progressHandlers = [];
+   ready = false;
+ 
+   constructor(worker) {
+     this.#worker = worker;
+     this.#attachReceiver();
++    this.#worker.onerror = (e) => {
++      const err = new Error('FFmpeg worker 閿欒: ' + (e && e.message ? e.message : 'unknown'));
++      const pending = this.#pending;
++      this.#pending = {};
++      Object.values(pending).forEach(p => p.reject(err));
++      this.ready = false;
++    };
+   }
+ 
+   #attachReceiver() {
+     this.#worker.onmessage = ({ data: { id, type, data } }) => {
+       if (type === Op.LOG) {
+         this.#logHandlers.forEach(fn => fn(data));
+         return;
+       }
+       if (type === Op.PROGRESS) {
+         this.#progressHandlers.forEach(fn => fn(data));
+         return;
+       }

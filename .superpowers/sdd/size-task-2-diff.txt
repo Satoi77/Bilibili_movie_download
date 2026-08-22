@@ -1,0 +1,105 @@
+9560a18 feat(download): 任务卡片>600MB大文件提示需手动合并
+ sidepanel.css | 3 ++-
+ sidepanel.js  | 6 ++++++
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+diff --git a/sidepanel.css b/sidepanel.css
+index 1c5ab44..2e52ffd 100644
+--- a/sidepanel.css
++++ b/sidepanel.css
+@@ -166,21 +166,22 @@ body {
+   white-space: nowrap;
+   overflow: hidden;
+   text-overflow: ellipsis;
+   max-width: 150px;
+ }
+ 
+ .task-time { color: #999; margin-left: auto; }
+ 
+ .task-size { color: #999; font-size: 11px; }
+ 
+-.task-note {
++.task-note,
++.task-warn {
+   margin-top: 6px;
+   font-size: 11px;
+   line-height: 1.4;
+   color: #ff9800;
+   white-space: nowrap;
+   overflow: hidden;
+   text-overflow: ellipsis;
+ }
+ 
+ /* Progress section */
+diff --git a/sidepanel.js b/sidepanel.js
+index 72839ac..16ab186 100644
+--- a/sidepanel.js
++++ b/sidepanel.js
+@@ -43,20 +43,24 @@ function getStatusText(task) {
+   switch(task.status) {
+     case 'downloading': return '下载中';
+     case 'pending': return '等待中';
+     case 'completed': return '已完成';
+     case 'failed': return '失败';
+     case 'paused': return '已暂停';
+     default: return '等待中';
+   }
+ }
+ 
++// 与 lib/download-core.js 的 MERGE_THRESHOLD 一致：超过此大小跳过 FFmpeg 自动合并，
++// 保存分离音视频 + merge.txt，故提前在卡片上提醒用户
++const MERGE_SIZE_WARN = 600 * 1024 * 1024;
++
+ // 任务总体积：优先用执行期上报的 totalSize，回退到入队时携带的音视频分项
+ function getTaskSize(task) {
+   return task.totalSize || ((task.videoSize || 0) + (task.audioSize || 0)) || 0;
+ }
+ 
+ function getStatusColor(task) {
+   switch(task.status) {
+     case 'downloading': return '#00a1d6';
+     case 'pending': return '#9e9e9e';
+     case 'completed': return '#4caf50';
+@@ -142,20 +146,21 @@ function renderTasks() {
+                       Math.round((audioP + videoP) / 2);
+       let phaseLabel = '下载中';
+       if (t.status === 'pending') phaseLabel = '等待中';
+       else if (t.status === 'paused') phaseLabel = '已暂停';
+       else if (t.status === 'failed') phaseLabel = '—';
+       else if (mergeP > 0) phaseLabel = '合并中';
+       
+       const isStop = t.status === 'downloading';
+       const controlIcon = isStop ? ICON_PAUSE : ICON_PLAY;
+       const sizeText = fmtSize(getTaskSize(t));
++      const sizeWarn = getTaskSize(t) > MERGE_SIZE_WARN;
+ 
+       return `
+         <div class="task-card ${t.status}">
+           <div class="task-header-row">
+             <div class="task-title" title="${t.title}">${t.title}</div>
+             <button class="btn-task-control ${isStop ? 'stop' : 'start'}" data-id="${t.id}" data-action="${isStop ? 'stop' : 'start'}" title="${isStop ? '停止' : '开始'}">${controlIcon}</button>
+             <button class="btn-delete-task" data-id="${t.id}" title="删除">&times;</button>
+           </div>
+           <div class="task-meta">
+             <span class="task-quality">${t.quality || ''}</span>
+@@ -165,20 +170,21 @@ function renderTasks() {
+           </div>
+           <div class="task-progress-section">
+             <div class="progress-row">
+               <span class="progress-label">${phaseLabel}</span>
+               <div class="progress-bar">
+                 <div class="progress-fill" style="width:${overall}%;background:${getStatusColor(t)}"></div>
+               </div>
+               <span class="progress-pct">${overall}%</span>
+             </div>
+             ${t.note ? `<div class="task-note" title="${t.note}">${t.note}</div>` : ''}
++            ${sizeWarn ? '<div class="task-warn" title="超过600MB的文件合并时可能内存不足，将保存分离音视频">⚠ 超过600MB，可能无法自动合并为单一视频，完成后需按 merge.txt 手动合并</div>' : ''}
+           </div>
+         </div>
+       `;
+     }).join('');
+     
+     dlList.querySelectorAll('.btn-task-control').forEach(btn => {
+       btn.onclick = async (e) => {
+         e.stopPropagation();
+         const id = btn.getAttribute('data-id');
+         const action = btn.getAttribute('data-action');

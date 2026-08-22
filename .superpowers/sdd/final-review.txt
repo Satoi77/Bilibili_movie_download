@@ -1,0 +1,997 @@
+﻿=== git log 9da799e..HEAD ===
+1adfc9d feat(download): 闃熷垪娲惧彂鏀?offscreen 浼樺厛锛屽け璐ヨ嚜鍔ㄥ垏闅愯棌瀹夸富 tab 鍏滃簳
+4162c12 fix(manifest): 鏀惧 blob: worker CSP 渚?offscreen 浣跨敤锛宑ontent.js 杩囨护 OFFSCREEN_* 闃插洖澹?4d4caa6 feat(download): offscreen 鏂板鍚庡彴涓嬭浇鎵ц鍣紝鐩戝惉 OFFSCREEN_RUN_TASK
+6f328e5 feat(download): 鏂板涓婁笅鏂囨棤鍏崇殑涓嬭浇鎵ц寮曟搸 download-core
+=== git diff --stat ===
+ background.js        | 220 ++++++++++++++++++++++++++++++++++++++++++---------
+ content.js           |   3 +-
+ lib/download-core.js | 185 +++++++++++++++++++++++++++++++++++++++++++
+ manifest.json        |   3 +
+ offscreen.html       |   2 +-
+ offscreen.js         | 202 +++++++++++++++++++++++++++++++++++++++++++++-
+ 6 files changed, 575 insertions(+), 40 deletions(-)
+=== git diff -U10 ===
+diff --git a/background.js b/background.js
+index 24db055..4b43dcc 100644
+--- a/background.js
++++ b/background.js
+@@ -6,42 +6,126 @@ biliDB.init().then(() => {
+ });
+ 
+ // 鈹€鈹€鈹€ Download Queue Manager 鈹€鈹€鈹€
+ // 闃熷垪鍦ㄥ悗鍙拌繍琛岋細閫愪釜娲惧彂 pending 浠诲姟缁欏彂璧烽〉鎵ц锛岄〉闈㈠洖鎶?TASK_DONE/ERROR/ABORTED銆? // 鏀寔鍏ㄩ儴/鍗曚釜 鍋滄-缁х画锛屼互鍙婂垹闄ゅ叏閮ㄣ€? 
+ let queuePaused = false;
+ let queueBusy = false;       // 褰撳墠鏄惁鏈変换鍔″湪娲惧彂/鎵ц涓? let inFlightTaskId = null;   // 姝ｅ湪鎵ц鐨勪换鍔?id
+ let nextDispatchAt = 0;      // 涓嬩竴娆″厑璁告淳鍙戠殑鏃堕棿鎴筹紙淇濊瘉浠诲姟闂村欢鏃讹級
++let inFlightExecutor = null; // 'offscreen' | 'hostTab' | null
++let hostTabId = null;        // 瀹夸富 B 绔?tab id锛堝厹搴曟墽琛岀敤锛? 
+ const STALL_TIMEOUT = 5 * 60 * 1000; // 浠诲姟瓒呰繃 5 鍒嗛挓鏃犺繘搴︽洿鏂拌涓哄仠婊? 
+ async function loadQueueSettings() {
+   const saved = await chrome.storage.local.get('settings');
+   return { delayMin: 3000, delayMax: 12000, retryTimes: 3, ...(saved.settings || {}) };
+ }
+ 
+ function sleep(ms) {
+   return new Promise(resolve => setTimeout(resolve, ms));
+ }
+ 
+ async function notifyTask(task) {
+   await biliDB.updateTask(task);
+   notifySidePanel({ type: 'TASK_UPDATED', data: task });
+ }
+ 
+-async function sendAbort(task) {
+-  if (!task || !task.hostTabId) return;
++async function sendAbort(taskId) {
++  if (inFlightExecutor === 'offscreen') {
++    try { await chrome.runtime.sendMessage({ type: 'OFFSCREEN_ABORT_TASK', data: { taskId } }); } catch (e) {}
++  } else if (inFlightExecutor === 'hostTab' && hostTabId) {
++    try { await chrome.tabs.sendMessage(hostTabId, { type: 'ABORT_TASK', data: { taskId } }); } catch (e) {}
++  }
++}
++
++// 鈹€鈹€鈹€ Offscreen 涓庡涓?tab 宸ュ叿 鈹€鈹€鈹€
++async function ensureOffscreen() {
++  const existing = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
++  if (existing.length === 0) {
++    await chrome.offscreen.createDocument({
++      url: 'offscreen.html',
++      reasons: ['WORKERS'],
++      justification: '鍚庡彴涓嬭浇涓?FFmpeg 鍚堝苟'
++    });
++  }
++  for (let i = 0; i < 50; i++) {
++    try {
++      const res = await chrome.runtime.sendMessage({ type: 'OFFSCREEN_PING' });
++      if (res?.status === 'ok') return;
++    } catch (e) {}
++    await sleep(200);
++  }
++  throw new Error('offscreen 鏈氨缁?);
++}
++
++async function ensureHostTab() {
++  if (hostTabId) {
++    try {
++      const tab = await chrome.tabs.get(hostTabId);
++      if (tab && tab.status === 'complete') return hostTabId;
++    } catch (e) {}
++  }
++  const tab = await chrome.tabs.create({ url: 'https://www.bilibili.com', active: false });
++  hostTabId = tab.id;
++  await waitHostTabReady(hostTabId);
++  return hostTabId;
++}
++
++async function waitHostTabReady(tabId) {
++  const deadline = Date.now() + 15000;
++  while (Date.now() < deadline) {
++    try {
++      const tab = await chrome.tabs.get(tabId);
++      if (tab?.status === 'complete') {
++        try {
++          await chrome.tabs.sendMessage(tabId, { type: 'HOST_PING' });
++          return;
++        } catch (e) {}
++      }
++    } catch (e) {
++      throw e;
++    }
++    await sleep(500);
++  }
++  throw new Error('瀹夸富椤甸潰灏辩华瓒呮椂');
++}
++
++async function dispatchToHostTab(task) {
+   try {
+-    await chrome.tabs.sendMessage(task.hostTabId, { type: 'ABORT_TASK', data: { taskId: task.id } });
+-  } catch (e) {}
++    const host = await ensureHostTab();
++    inFlightExecutor = 'hostTab';
++    await chrome.tabs.sendMessage(host, {
++      type: 'RUN_TASK',
++      data: { taskId: task.id, videoInfo: task.videoInfo, qualityIdx: task.qualityIdx || 0 }
++    });
++    return true;
++  } catch (e) {
++    await failTask(task.id, '涓嬭浇椤甸潰涓嶅彲鐢?, false);
++    queueBusy = false;
++    inFlightTaskId = null;
++    inFlightExecutor = null;
++    nextDispatchAt = 0;
++    return false;
++  }
++}
++
++async function maybeCloseHostTab() {
++  if (!hostTabId) return;
++  const all = await biliDB.getTasks();
++  const active = all.filter(t => t.status === 'pending' || t.status === 'downloading');
++  if (active.length === 0) {
++    try { await chrome.tabs.remove(hostTabId); } catch (e) {}
++    hostTabId = null;
++  }
+ }
+ 
+ // 鍋滄粸妫€娴嬶細闀挎椂闂存棤杩涘害鐨?downloading 浠诲姟鏍囪涓哄け璐ワ紝骞堕噴鏀鹃槦鍒楀崰鐢? async function checkStalledTasks() {
+   const now = Date.now();
+   const all = await biliDB.getTasks();
+   let stalled = false;
+   for (const t of all) {
+     if (t.status === 'downloading' && (now - (t.lastProgressAt || 0)) > STALL_TIMEOUT) {
+       t.status = 'failed';
+@@ -69,39 +153,30 @@ async function pumpQueue() {
+   if (pending.length === 0) return false;
+ 
+   const task = pending[0];
+   task.status = 'downloading';
+   task.lastProgressAt = Date.now();
+   await notifyTask(task);
+ 
+   inFlightTaskId = task.id;
+   queueBusy = true;
+ 
+-  if (!task.hostTabId) {
+-    await failTask(task.id, '涓嬭浇椤甸潰涓嶅彲鐢?, false);
+-    queueBusy = false;
+-    inFlightTaskId = null;
+-    nextDispatchAt = 0;
+-    return pumpQueue(); // 缁х画澶勭悊涓嬩竴涓?-  }
+-
+   try {
+-    await chrome.tabs.sendMessage(task.hostTabId, {
+-      type: 'RUN_TASK',
++    await ensureOffscreen();
++    inFlightExecutor = 'offscreen';
++    await chrome.runtime.sendMessage({
++      type: 'OFFSCREEN_RUN_TASK',
+       data: { taskId: task.id, videoInfo: task.videoInfo, qualityIdx: task.qualityIdx || 0 }
+     });
+   } catch (e) {
+-    await failTask(task.id, '涓嬭浇椤甸潰宸插叧闂紝浠诲姟鏃犳硶缁х画', false);
+-    queueBusy = false;
+-    inFlightTaskId = null;
+-    nextDispatchAt = 0;
+-    return pumpQueue(); // 缁х画澶勭悊涓嬩竴涓?+    const ok = await dispatchToHostTab(task);
++    if (!ok) return pumpQueue(); // 缁х画澶勭悊涓嬩竴涓?   }
+   return true;
+ }
+ 
+ async function failTask(taskId, error, retryable) {
+   const settings = await loadQueueSettings();
+   const t = await biliDB.getTask(taskId);
+   if (!t) return;
+   if (t.status !== 'downloading' && t.status !== 'pending') return;
+   t.retryCount = (t.retryCount || 0) + 1;
+@@ -118,26 +193,28 @@ async function failTask(taskId, error, retryable) {
+   t.status = 'failed';
+   t.error = error;
+   await notifyTask(t);
+ }
+ 
+ // 浠诲姟缁撴潫鍚庯細閲婃斁闃熷垪鍗犵敤锛屾寜璁剧疆寤舵椂鍚庢淳鍙戜笅涓€涓换鍔? async function advanceQueue(taskId) {
+   if (!taskId || inFlightTaskId === taskId) {
+     inFlightTaskId = null;
+     queueBusy = false;
++    inFlightExecutor = null;
+   }
+   if (queuePaused) return;
+   const settings = await loadQueueSettings();
+   const delay = Math.floor(Math.random() * (settings.delayMax - settings.delayMin + 1)) + settings.delayMin;
+   nextDispatchAt = Date.now() + delay;
+   await sleep(delay);
++  maybeCloseHostTab();
+   pumpQueue();
+ }
+ 
+ // SW 瀛樻椿鍏滃簳锛氬畾鏃跺敜閱掗噸鏂版淳鍙戯紙SW 浼戠湢鏈熼棿鍙兘閿欒繃 sleep 鍚庣殑 pump锛? chrome.alarms?.create('queue-pump', { periodInMinutes: 0.5 });
+ chrome.alarms?.onAlarm.addListener((alarm) => {
+   if (alarm.name === 'queue-pump') {
+     checkStalledTasks();
+     pumpQueue();
+   }
+@@ -146,20 +223,98 @@ chrome.alarms?.onAlarm.addListener((alarm) => {
+ chrome.runtime.onInstalled.addListener(() => {
+   console.log('[Bilibili Downloader] Extension installed');
+ });
+ 
+ // 鈹€鈹€鈹€ Unified Storage Layer 鈹€鈹€鈹€
+ // 鎵€鏈夋暟鎹鍐欓€氳繃姝?handler锛屽叾浠栦笂涓嬫枃涓嶇洿鎺ヨ闂瓨鍌? 
+ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+   const { type, data } = message;
+ 
++  // 鈹€鈹€鈹€ Offscreen 鍚庡彴涓嬭浇 鈹€鈹€鈹€
++  if (type === 'OFFSCREEN_PING') {
++    sendResponse({ status: 'ok' });
++    return true;
++  }
++
++  if (type === 'OFFSCREEN_PROGRESS') {
++    biliDB.getTask(data.taskId).then(task => {
++      if (!task) return;
++      if (data.phase === 'audio') task.progress.audio = data.percent;
++      if (data.phase === 'video') task.progress.video = data.percent;
++      if (data.phase === 'merge') task.progress.merge = data.percent;
++      if (data.phase === 'delay') task.delayMessage = data.label;
++      if (data.phase === 'quality' && data.label) task.quality = data.label;
++      task.lastProgressAt = Date.now();
++      biliDB.updateTask(task).then(() => {
++        notifySidePanel({ type: 'TASK_UPDATED', data: task });
++      });
++    });
++    sendResponse({ status: 'ok' });
++    return true;
++  }
++
++  if (type === 'OFFSCREEN_TASK_DONE') {
++    (async () => {
++      const t = await biliDB.getTask(data.taskId);
++      if (t && t.status === 'downloading') {
++        t.status = 'completed';
++        t.progress = { audio: 100, video: 100, merge: 100 };
++        t.completedAt = new Date().toISOString();
++        await notifyTask(t);
++      }
++      advanceQueue(data.taskId);
++      sendResponse({ status: 'ok' });
++    })();
++    return true;
++  }
++
++  if (type === 'OFFSCREEN_TASK_ERROR') {
++    (async () => {
++      await failTask(data.taskId, data.error || '鏈煡閿欒', true);
++      advanceQueue(data.taskId);
++      sendResponse({ status: 'ok' });
++    })();
++    return true;
++  }
++
++  if (type === 'OFFSCREEN_TASK_ABORTED') {
++    (async () => {
++      const t = await biliDB.getTask(data.taskId);
++      if (t && t.status === 'downloading') {
++        t.status = 'paused';
++        await notifyTask(t);
++      }
++      if (inFlightTaskId === data.taskId) {
++        inFlightTaskId = null;
++        queueBusy = false;
++        inFlightExecutor = null;
++      }
++      sendResponse({ status: 'ok' });
++    })();
++    return true;
++  }
++
++  if (type === 'OFFSCREEN_NEEDS_PAGE') {
++    (async () => {
++      const t = await biliDB.getTask(data.taskId);
++      if (t && t.status === 'downloading') {
++        t.offscreenTried = true;
++        await notifyTask(t);
++        const ok = await dispatchToHostTab(t);
++        if (!ok) advanceQueue(data.taskId);
++      }
++      sendResponse({ status: 'ok' });
++    })();
++    return true;
++  }
++
+   // 鈹€鈹€鈹€ Settings 鈹€鈹€鈹€
+   if (type === 'GET_SETTINGS') {
+     chrome.storage.local.get('settings', (result) => {
+       sendResponse(result.settings || {});
+     });
+     return true;
+   }
+ 
+   if (type === 'SAVE_SETTINGS') {
+     chrome.storage.local.set({ settings: data.settings }, () => {
+@@ -175,23 +330,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+     });
+     pumpQueue();
+     return true;
+   }
+ 
+   if (type === 'DELETE_TASK') {
+     if (!data.taskId) { sendResponse({ status: 'ok' }); return true; }
+     (async () => {
+       if (inFlightTaskId === data.taskId) {
+         const inflight = await biliDB.getTask(data.taskId);
+-        if (inflight) await sendAbort(inflight);
++        if (inflight) await sendAbort(inflight.id);
+         inFlightTaskId = null;
+         queueBusy = false;
++        inFlightExecutor = null;
+       }
+       await biliDB.deleteTask(data.taskId);
+       notifySidePanel({ type: 'TASK_REMOVED', data: { taskId: data.taskId } });
+       sendResponse({ status: 'ok' });
+     })();
+     return true;
+   }
+ 
+   if (type === 'CLEAR_COMPLETED') {
+     biliDB.getTasks().then(tasks => {
+@@ -311,20 +467,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+           title: it.title || '',
+           quality: it.quality || '绛夊緟涓?,
+           bvid: it.bvid || '',
+           videoInfo: { aid: it.aid, bvid: it.bvid, cid: it.cid, title: it.title || '' },
+           qualityIdx: it.qualityIdx || 0,
+           status: 'pending',
+           progress: { audio: 0, video: 0, merge: 0 },
+           retryCount: 0,
+           createdAt: new Date(base + i).toISOString(),
+           lastProgressAt: 0,
++          offscreenTried: false,
+           hostTabId
+         };
+         await biliDB.updateTask(task);
+         notifySidePanel({ type: 'TASK_ADDED', data: task });
+       }
+       if (hostTabId) {
+         chrome.sidePanel.open({ tabId: hostTabId }).catch(() => {});
+       }
+       sendResponse({ status: 'ok', count: list.length });
+       pumpQueue();
+@@ -340,20 +497,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+         title: it.title || '',
+         quality: it.quality || '绛夊緟涓?,
+         bvid: it.bvid || '',
+         videoInfo: { aid: it.aid, bvid: it.bvid, cid: it.cid, title: it.title || '' },
+         qualityIdx: it.qualityIdx || 0,
+         status: 'pending',
+         progress: { audio: 0, video: 0, merge: 0 },
+         retryCount: 0,
+         createdAt: new Date().toISOString(),
+         lastProgressAt: 0,
++        offscreenTried: false,
+         hostTabId: sender.tab ? sender.tab.id : null
+       };
+       await biliDB.updateTask(task);
+       notifySidePanel({ type: 'TASK_ADDED', data: task });
+       if (task.hostTabId) {
+         chrome.sidePanel.open({ tabId: task.hostTabId }).catch(() => {});
+       }
+       sendResponse({ status: 'ok' });
+       pumpQueue();
+     })();
+@@ -364,21 +522,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+     (async () => {
+       queuePaused = true;
+       const all = await biliDB.getTasks();
+       for (const t of all) {
+         if (t.status === 'downloading' || t.status === 'pending') {
+           t.status = 'paused';
+           await notifyTask(t);
+         }
+       }
+       const inflight = inFlightTaskId ? await biliDB.getTask(inFlightTaskId) : null;
+-      if (inflight) await sendAbort(inflight);
++      if (inflight) await sendAbort(inflight.id);
++      inFlightExecutor = null;
+       inFlightTaskId = null;
+       queueBusy = false;
+       sendResponse({ status: 'ok' });
+     })();
+     return true;
+   }
+ 
+   if (type === 'RESUME_ALL') {
+     (async () => {
+       queuePaused = false;
+@@ -397,22 +556,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+   }
+ 
+   if (type === 'STOP_TASK') {
+     (async () => {
+       const t = await biliDB.getTask(data.taskId);
+       if (t && (t.status === 'downloading' || t.status === 'pending')) {
+         const wasInFlight = t.status === 'downloading';
+         t.status = 'paused';
+         await notifyTask(t);
+         if (wasInFlight) {
+-          await sendAbort(t);
+-          if (inFlightTaskId === t.id) { inFlightTaskId = null; queueBusy = false; }
++          await sendAbort(t.id);
++          if (inFlightTaskId === t.id) { inFlightTaskId = null; queueBusy = false; inFlightExecutor = null; }
+         }
+       }
+       sendResponse({ status: 'ok' });
+     })();
+     return true;
+   }
+ 
+   if (type === 'RESUME_TASK') {
+     (async () => {
+       const t = await biliDB.getTask(data.taskId);
+@@ -427,26 +586,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+       sendResponse({ status: 'ok' });
+       nextDispatchAt = 0;
+       pumpQueue();
+     })();
+     return true;
+   }
+ 
+   if (type === 'DELETE_ALL') {
+     (async () => {
+       const inflight = inFlightTaskId ? await biliDB.getTask(inFlightTaskId) : null;
+-      if (inflight) await sendAbort(inflight);
++      if (inflight) await sendAbort(inflight.id);
+       const all = await biliDB.getTasks();
+       await Promise.all(all.map(t => biliDB.deleteTask(t.id)));
+       all.forEach(t => notifySidePanel({ type: 'TASK_REMOVED', data: { taskId: t.id } }));
+       inFlightTaskId = null;
+       queueBusy = false;
++      inFlightExecutor = null;
+       sendResponse({ status: 'ok', deleted: all.length });
+     })();
+     return true;
+   }
+ 
+   if (type === 'TASK_DONE') {
+     (async () => {
+       const t = await biliDB.getTask(data.taskId);
+       if (t && t.status === 'downloading') {
+         t.status = 'completed';
+@@ -529,25 +689,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+ 
+   return true;
+ });
+ 
+ function notifySidePanel(message) {
+   try {
+     chrome.runtime.sendMessage(message).catch(() => {});
+   } catch(e) {}
+ }
+ 
+-async function ensureOffscreen() {
+-  const existingContexts = await chrome.runtime.getContexts({
+-    contextTypes: ['OFFSCREEN_DOCUMENT']
+-  });
+-  if (existingContexts.length > 0) return;
+-  await chrome.offscreen.createDocument({
+-    url: 'offscreen.html',
+-    reasons: ['WORKERS'],
+-    justification: 'FFmpeg WASM merge'
+-  });
+-}
+-
+ chrome.sidePanel?.setPanelBehavior({ openPanelOnActionClick: true });
+ 
+ console.log('[Bilibili Downloader] Background loaded');
+diff --git a/content.js b/content.js
+index 52a3ce8..17856af 100644
+--- a/content.js
++++ b/content.js
+@@ -180,18 +180,19 @@
+       });
+       return;
+     }
+ 
+     // Handle DELETE_FILE
+     if (type === 'DELETE_FILE') {
+       chrome.runtime.sendMessage({ type: 'DELETE_FILE', data }, () => {});
+       return;
+     }
+ 
+-    // Forward other messages to background
++    // Forward other messages to background锛堣烦杩?OFFSCREEN_*锛岄槻 chrome.runtime.sendMessage 骞挎挱鍥炲０锛?     try {
++      if (type.startsWith('OFFSCREEN_')) return;
+       chrome.runtime.sendMessage({ type, data }, () => {
+         if (chrome.runtime.lastError) {}
+       });
+     } catch(e) {}
+   });
+ })();
+diff --git a/lib/download-core.js b/lib/download-core.js
+new file mode 100644
+index 0000000..92c9b46
+--- /dev/null
++++ b/lib/download-core.js
+@@ -0,0 +1,185 @@
++// lib/download-core.js - 涓庝笂涓嬫枃鏃犲叧鐨勪笅杞芥墽琛屽紩鎿庯紙offscreen 涓昏矾寰勪娇鐢級
++
++export const QMAP = {16:'360P',32:'480P',64:'720P',80:'1080P',112:'1080P楂樼爜鐜?,120:'4K',125:'HDR'};
++export const DOWNLOAD_BASE = 'bilibili_download';
++
++export function sanitizeFilename(name) {
++  return name.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').substring(0, 200);
++}
++
++export async function getPlayUrl(aid, bvid, cid, qn = 80, signal, fetchFn = fetch) {
++  const url = `https://api.bilibili.com/x/player/wbi/playurl?qn=${qn}&fnver=0&fnval=4048&fourk=1&avid=${aid}&bvid=${bvid}&cid=${cid}`;
++  const r = await fetchFn(url, { credentials: 'include', signal });
++  if (!r.ok) throw new Error('鎾斁鍦板潃 HTTP ' + r.status);
++  const d = await r.json();
++  if (d.code !== 0 || !d.data) throw new Error('鎾斁鍦板潃鑾峰彇澶辫触 code=' + d.code);
++  return d.data;
++}
++
++function readWithTimeout(reader, ms, signal) {
++  return new Promise((resolve, reject) => {
++    const timer = setTimeout(() => reject(new Error('璇诲彇瓒呮椂')), ms);
++    const onAbort = () => {
++      clearTimeout(timer);
++      reject(new DOMException('aborted', 'AbortError'));
++    };
++    if (signal) signal.addEventListener('abort', onAbort, { once: true });
++    reader.read().then(
++      (v) => {
++        clearTimeout(timer);
++        if (signal) signal.removeEventListener('abort', onAbort);
++        resolve(v);
++      },
++      (e) => {
++        clearTimeout(timer);
++        if (signal) signal.removeEventListener('abort', onAbort);
++        if (signal?.aborted) reject(new DOMException('aborted', 'AbortError'));
++        else reject(e);
++      }
++    );
++  });
++}
++
++export async function downloadStream(url, signal, notify, fetchFn = fetch) {
++  const r = await fetchFn(url, { credentials: 'include', signal });
++  if (!r.ok) throw new Error('娴?HTTP ' + r.status);
++  const total = parseInt(r.headers.get('content-length') || '0');
++  const reader = r.body.getReader();
++  const chunks = [];
++  let received = 0;
++  let lastSent = -1;
++  while (true) {
++    if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
++    const res = await readWithTimeout(reader, 30000, signal);
++    if (res.done) break;
++    chunks.push(res.value);
++    received += res.value.length;
++    const percent = total > 0 ? Math.round(received / total * 100) : -1;
++    if (percent !== lastSent) {
++      lastSent = percent;
++      notify({ phase: 'download', percent, label: '涓嬭浇涓? });
++    }
++  }
++  if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
++  return new Blob(chunks);
++}
++
++export async function mergeAudioVideo(ffmpeg, audioBlob, videoBlob, notify) {
++  const tag = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
++  const audioPath = tag + '_audio.m4s';
++  const videoPath = tag + '_video.m4s';
++  const outputPath = tag + '_merged.mp4';
++
++  await ffmpeg.writeFile(audioPath, new Uint8Array(await audioBlob.arrayBuffer()));
++  await ffmpeg.writeFile(videoPath, new Uint8Array(await videoBlob.arrayBuffer()));
++
++  const heartbeat = setInterval(() => {
++    notify({ phase: 'merge', percent: 50, label: '鍚堝苟涓? });
++  }, 20000);
++
++  try {
++    await ffmpeg.run(['-i', videoPath, '-i', audioPath, '-vcodec', 'copy', '-acodec', 'copy', outputPath]);
++  } finally {
++    clearInterval(heartbeat);
++  }
++
++  const merged = await ffmpeg.readFile(outputPath);
++  ffmpeg.deleteFile(audioPath).catch(() => {});
++  ffmpeg.deleteFile(videoPath).catch(() => {});
++  ffmpeg.deleteFile(outputPath).catch(() => {});
++  return new Blob([merged.buffer], { type: 'video/mp4' });
++}
++
++async function saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir, saveBlob) {
++  const safeTitle = sanitizeFilename(title);
++  const audioForSave = new Blob([await audioBlob.arrayBuffer()], { type: 'video/mp4' });
++  const videoForSave = new Blob([await videoBlob.arrayBuffer()], { type: 'video/mp4' });
++  const subdir = baseSubdir ? baseSubdir + '/' + safeTitle : safeTitle;
++  await saveBlob(audioForSave, 'audio.m4s', subdir);
++  await saveBlob(videoForSave, 'video.m4s', subdir);
++}
++
++export async function executeTask(taskId, videoInfo, qualityIdx, deps) {
++  const { getSettings, getFFmpeg, notify, saveBlob, signal, fetchFn } = deps;
++  const settings = (await getSettings()) || {};
++  const title = videoInfo.title;
++
++  let data;
++  try {
++    data = await getPlayUrl(videoInfo.aid, videoInfo.bvid, videoInfo.cid, 80, signal, fetchFn);
++  } catch (e) {
++    if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
++    const err = new Error(e.message || '鑾峰彇鎾斁鍦板潃澶辫触');
++    err.code = 'NEEDS_PAGE';
++    throw err;
++  }
++  if (!data?.dash) {
++    const err = new Error('鑾峰彇鎾斁鍦板潃澶辫触');
++    err.code = 'NEEDS_PAGE';
++    throw err;
++  }
++
++  const videoByQ = {};
++  data.dash.video.forEach(v => {
++    if (!videoByQ[v.id]) videoByQ[v.id] = [];
++    videoByQ[v.id].push(v);
++  });
++
++  const options = Object.keys(videoByQ).map(Number).sort((a, b) => b - a);
++  const q = options[qualityIdx] || options[0];
++  const streams = videoByQ[q].sort((a, b) => b.bandwidth - a.bandwidth);
++  const bestVideo = streams[0];
++  const bestAudio = data.dash.audio[0];
++  const label = QMAP[q] || q + 'P';
++
++  notify({ phase: 'quality', percent: 0, label });
++  if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
++  notify({ phase: 'download', percent: 0, label: '涓嬭浇涓? });
++
++  const [audioBlob, videoBlob] = await Promise.all([
++    downloadStream(bestAudio.baseUrl, signal, notify, fetchFn),
++    downloadStream(bestVideo.baseUrl, signal, notify, fetchFn)
++  ]);
++
++  if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
++  notify({ phase: 'download', percent: 100, label: '涓嬭浇瀹屾垚' });
++
++  const safeTitle = sanitizeFilename(title);
++  const baseSubdir = DOWNLOAD_BASE;
++  let rawSaved = false;
++
++  if (settings.saveRawFiles) {
++    try {
++      notify({ phase: 'merge', percent: 0, label: '淇濆瓨鍘熷鏂囦欢' });
++      await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir, saveBlob);
++      rawSaved = true;
++    } catch(e) {}
++  }
++
++  try {
++    notify({ phase: 'merge', percent: 50, label: '鍚堝苟涓? });
++    const ffmpeg = await getFFmpeg();
++    const mergedBlob = await mergeAudioVideo(ffmpeg, audioBlob, videoBlob, notify);
++    if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
++    await saveBlob(mergedBlob, `${safeTitle}_${label}.mp4`, baseSubdir);
++    notify({ phase: 'merge', percent: 100, label: '鍚堝苟瀹屾垚' });
++  } catch (mergeError) {
++    if (signal?.aborted) throw mergeError;
++    if (!rawSaved) {
++      try { await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir, saveBlob); } catch(e) {}
++    }
++    try {
++      const txtContent = [
++        '灏嗘鐩綍涓嬬殑 audio.m4s 鍜?video.m4s 鍚堝苟涓?mp4 鏂囦欢銆?,
++        '',
++        '鏂规硶涓€锛氫娇鐢?ffmpeg 鍛戒护琛?,
++        '  ffmpeg -i video.m4s -i audio.m4s -vcodec copy -acodec copy merged.mp4',
++        '',
++        '鏂规硶浜岋細灏嗘湰鏂囦欢閲嶅懡鍚嶄负 merge.bat锛屽弻鍑昏繍琛?,
++        '  锛堥渶瑕佸凡瀹夎 ffmpeg 骞舵坊鍔犲埌 PATH 鐜鍙橀噺锛?
++      ].join('\r\n');
++      await saveBlob(new Blob([txtContent], { type: 'text/plain' }), 'merge.txt', baseSubdir + '/' + safeTitle);
++    } catch(e) {}
++    throw new Error('鍚堝苟澶辫触: ' + mergeError.message);
++  }
++}
+diff --git a/manifest.json b/manifest.json
+index b2d4e30..e959516 100644
+--- a/manifest.json
++++ b/manifest.json
+@@ -9,20 +9,23 @@
+     "sidePanel",
+     "activeTab",
+     "scripting",
+     "offscreen",
+     "alarms"
+   ],
+   "host_permissions": [
+     "*://*.bilibili.com/*",
+     "*://*.bilivideo.com/*"
+   ],
++  "content_security_policy": {
++    "extension_pages": "script-src 'self' blob: 'wasm-unsafe-eval'; worker-src 'self' blob:; object-src 'self'"
++  },
+   "background": {
+     "service_worker": "background.js",
+     "type": "module"
+   },
+   "content_scripts": [
+     {
+       "matches": ["*://*.bilibili.com/*"],
+       "js": ["content.js"],
+       "css": ["styles/content.css"],
+       "run_at": "document_start"
+diff --git a/offscreen.html b/offscreen.html
+index 96860d5..b9f5527 100644
+--- a/offscreen.html
++++ b/offscreen.html
+@@ -1,7 +1,7 @@
+ <!DOCTYPE html>
+ <html>
+ <head><meta charset="utf-8"><title>FFmpeg Offscreen</title></head>
+ <body>
+-<script src="offscreen.js"></script>
++<script type="module" src="offscreen.js"></script>
+ </body>
+ </html>
+diff --git a/offscreen.js b/offscreen.js
+index a823cb4..387bce0 100644
+--- a/offscreen.js
++++ b/offscreen.js
+@@ -1,11 +1,14 @@
+-// offscreen.js - FFmpeg merge in offscreen document (MV3)
++// offscreen.js - 鍚庡彴涓嬭浇鎵ц锛堜富锛? FFmpeg 鍚堝苟锛堜繚鐣欙級
++import { executeTask } from './lib/download-core.js';
++
++// 鈹€鈹€鈹€ FFmpeg 鍚堝苟锛堝師鏈夛紝渚濊禆 lib/ffmpeg.js + FFmpegWASM 鍏ㄥ眬锛夆攢鈹€鈹€
+ let ffmpegInstance = null;
+ let loadPromise = null;
+ 
+ function loadScript(url) {
+   return new Promise((resolve, reject) => {
+     const script = document.createElement('script');
+     script.src = url;
+     script.onload = resolve;
+     script.onerror = () => reject(new Error('Failed to load: ' + url));
+     document.head.appendChild(script);
+@@ -94,28 +97,221 @@ async function mergeWithFFmpeg(taskId) {
+   console.log('[FFmpeg Offscreen] Running merge...');
+   await ffmpeg.exec(['-i', 'video.m4s', '-i', 'audio.m4s', '-c', 'copy', 'output.mp4']);
+ 
+   const result = await ffmpeg.readFile('output.mp4');
+   console.log('[FFmpeg Offscreen] Merge done, output size:', result.length);
+ 
+   await ffmpeg.deleteFile('audio.m4s');
+   await ffmpeg.deleteFile('video.m4s');
+   await ffmpeg.deleteFile('output.mp4');
+ 
+-  // Cleanup source blobs from DB
+   await deleteBlobFromDB(taskId + '_audio');
+   await deleteBlobFromDB(taskId + '_video');
+ 
+   return result.buffer;
+ }
+ 
++// 鈹€鈹€鈹€ 涓嬭浇鎵ц寮曟搸锛團FmpegBridge锛孊lob URL Worker锛夆攢鈹€鈹€
++const Op = {
++  LOAD: 'LOAD', EXEC: 'EXEC',
++  WRITE_FILE: 'WRITE_FILE', READ_FILE: 'READ_FILE',
++  DELETE_FILE: 'DELETE_FILE',
++  ERROR: 'ERROR', LOG: 'LOG', PROGRESS: 'PROGRESS'
++};
++const RESULT_OPS = new Set([Op.LOAD, Op.EXEC, Op.WRITE_FILE, Op.READ_FILE, Op.DELETE_FILE]);
++
++let nextMsgId = 0;
++
++class FFmpegBridge {
++  #worker = null;
++  #pending = {};
++  #logHandlers = [];
++  #progressHandlers = [];
++  ready = false;
++
++  constructor(worker) {
++    this.#worker = worker;
++    this.#attachReceiver();
++  }
++
++  #attachReceiver() {
++    this.#worker.onmessage = ({ data: { id, type, data } }) => {
++      if (type === Op.LOG) {
++        this.#logHandlers.forEach(fn => fn(data));
++        return;
++      }
++      if (type === Op.PROGRESS) {
++        this.#progressHandlers.forEach(fn => fn(data));
++        return;
++      }
++      const p = this.#pending[id];
++      if (!p) return;
++      delete this.#pending[id];
++      if (type === Op.ERROR) {
++        p.reject(new Error(data));
++      } else if (RESULT_OPS.has(type)) {
++        if (type === Op.LOAD) this.ready = true;
++        p.resolve(data);
++      }
++    };
++  }
++
++  #send(type, payload, transferable) {
++    return new Promise((resolve, reject) => {
++      const id = nextMsgId++;
++      this.#pending[id] = { resolve, reject };
++      this.#worker.postMessage({ id, type, data: payload }, transferable || []);
++    });
++  }
++
++  on(event, handler) {
++    if (event === 'log') this.#logHandlers.push(handler);
++    else if (event === 'progress') this.#progressHandlers.push(handler);
++  }
++
++  load(opts) {
++    return this.#send(Op.LOAD, opts);
++  }
++
++  run(args, timeout) {
++    return this.#send(Op.EXEC, { args, timeout: timeout ?? -1 });
++  }
++
++  writeFile(path, data) {
++    const xfer = data instanceof Uint8Array ? [data.buffer] : [];
++    return this.#send(Op.WRITE_FILE, { path, data }, xfer);
++  }
++
++  readFile(path, encoding) {
++    return this.#send(Op.READ_FILE, { path, encoding });
++  }
++
++  deleteFile(path) {
++    return this.#send(Op.DELETE_FILE, { path });
++  }
++
++  destroy() {
++    if (this.#worker) {
++      this.#worker.terminate();
++      this.#worker = null;
++      this.ready = false;
++    }
++  }
++}
++
++let ffmpegBridge = null;
++
++async function toBlobURL(resourceURL, mimeType) {
++  const res = await fetch(resourceURL);
++  if (!res.ok) throw new Error('fetch 澶辫触: ' + resourceURL + ' HTTP ' + res.status);
++  const buf = await res.arrayBuffer();
++  return URL.createObjectURL(new Blob([buf], { type: mimeType }));
++}
++
++async function createFFmpeg() {
++  if (ffmpegBridge?.ready) return ffmpegBridge;
++
++  const workerBlobURL = await toBlobURL(chrome.runtime.getURL('lib/ffmpeg.worker.js'), 'text/javascript');
++  const worker = new Worker(workerBlobURL);
++  ffmpegBridge = new FFmpegBridge(worker);
++
++  ffmpegBridge.on('log', ({ message }) => {
++    if (message) console.log('[FFmpeg Offscreen]', message);
++  });
++
++  await ffmpegBridge.load({
++    coreURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.js'), 'text/javascript'),
++    wasmURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.wasm'), 'application/wasm'),
++    workerURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.worker.js'), 'text/javascript')
++  });
++
++  console.log('[B绔欎笅杞藉姪鎵媇 offscreen FFmpeg WASM 鍒濆鍖栧畬鎴?);
++  return ffmpegBridge;
++}
++
++// 鈹€鈹€鈹€ 鍚庡彴浠诲姟鎵ц 鈹€鈹€鈹€
++const activeTaskControllers = new Map();
++
++function sendToBg(message) {
++  chrome.runtime.sendMessage(message).catch(() => {});
++}
++
++function notify(taskId, payload) {
++  sendToBg({ type: 'OFFSCREEN_PROGRESS', data: { taskId, ...payload } });
++}
++
++async function getSettings() {
++  try {
++    return (await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' })) || {};
++  } catch (e) {
++    return {};
++  }
++}
++
++async function saveBlob(blob, filename, subdir) {
++  const buffer = await blob.arrayBuffer();
++  const blobUrl = URL.createObjectURL(new Blob([buffer], { type: blob.type || 'application/octet-stream' }));
++  try {
++    const result = await chrome.runtime.sendMessage({
++      type: 'SAVE_FILE',
++      data: { url: blobUrl, path: subdir ? subdir + '/' + filename : filename }
++    });
++    if (!result?.success) throw new Error(result?.error || '淇濆瓨澶辫触');
++  } finally {
++    setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
++  }
++}
++
++async function runOffscreenTask(taskId, videoInfo, qualityIdx) {
++  const controller = new AbortController();
++  activeTaskControllers.set(taskId, controller);
++  try {
++    await executeTask(taskId, videoInfo, qualityIdx, {
++      getSettings,
++      getFFmpeg: createFFmpeg,
++      notify: (payload) => notify(taskId, payload),
++      saveBlob,
++      signal: controller.signal
++    });
++    sendToBg({ type: 'OFFSCREEN_TASK_DONE', data: { taskId } });
++  } catch (e) {
++    if (controller.signal.aborted) {
++      sendToBg({ type: 'OFFSCREEN_TASK_ABORTED', data: { taskId } });
++    } else if (e.code === 'NEEDS_PAGE') {
++      sendToBg({ type: 'OFFSCREEN_NEEDS_PAGE', data: { taskId } });
++    } else {
++      console.error('[B绔欎笅杞藉姪鎵媇 Offscreen task failed:', taskId, e);
++      sendToBg({ type: 'OFFSCREEN_TASK_ERROR', data: { taskId, error: e.message } });
++    }
++  } finally {
++    activeTaskControllers.delete(taskId);
++  }
++}
++
+ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
++  if (message.type === 'OFFSCREEN_PING') {
++    sendResponse({ status: 'ok' });
++    return false;
++  }
++
++  if (message.type === 'OFFSCREEN_RUN_TASK') {
++    const { taskId, videoInfo, qualityIdx } = message.data || {};
++    if (taskId && videoInfo) runOffscreenTask(taskId, videoInfo, qualityIdx || 0);
++    return false;
++  }
++
++  if (message.type === 'OFFSCREEN_ABORT_TASK') {
++    const c = activeTaskControllers.get((message.data || {}).taskId);
++    if (c) { try { c.abort(); } catch (e) {} }
++    return false;
++  }
++
+   if (message.type === 'offscreen_merge_request') {
+     const { taskId } = message.data;
+ 
+     console.log('[FFmpeg Offscreen] Merge request for task:', taskId);
+ 
+     mergeWithFFmpeg(taskId)
+       .then(merged => {
+         console.log('[FFmpeg Offscreen] Merge success, sending result back');
+         chrome.runtime.sendMessage({
+           type: 'offscreen_merge_result',
+@@ -125,11 +321,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+       .catch(e => {
+         console.error('[FFmpeg Offscreen] Merge failed:', e);
+         chrome.runtime.sendMessage({
+           type: 'offscreen_merge_result',
+           data: { taskId, success: false, error: e.message }
+         });
+       });
+ 
+     return false;
+   }
++
++  return false;
+ });

@@ -1,0 +1,202 @@
+9560a18 feat(download): 任务卡片>600MB大文件提示需手动合并
+d5aaa16 feat(download): 合集批量入队后异步补全任务合计体积
+ background.js   | 20 ++++++++++++++++++++
+ content-page.js | 24 ++++++++++++++++++++++++
+ sidepanel.css   |  3 ++-
+ sidepanel.js    |  6 ++++++
+ 4 files changed, 52 insertions(+), 1 deletion(-)
+diff --git a/background.js b/background.js
+index a33591f..a0de7dc 100644
+--- a/background.js
++++ b/background.js
+@@ -572,20 +572,40 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+       notifySidePanel({ type: 'TASK_ADDED', data: task });
+       if (task.hostTabId) {
+         chrome.sidePanel.open({ tabId: task.hostTabId }).catch(() => {});
+       }
+       sendResponse({ status: 'ok' });
+       pumpQueue();
+     })();
+     return true;
+   }
+ 
++  if (type === 'UPDATE_TASK_SIZE') {
++    biliDB.getTask(data.taskId).then(task => {
++      if (!task) { sendResponse({ status: 'ok' }); return; }
++      // 仅在体积未知时补全，避免覆盖执行期 quality 阶段上报的实际值
++      if (!task.totalSize) {
++        const total = ((data.videoSize || 0) + (data.audioSize || 0)) || 0;
++        if (total) {
++          task.videoSize = data.videoSize || 0;
++          task.audioSize = data.audioSize || 0;
++          task.totalSize = total;
++          biliDB.updateTask(task).then(() => {
++            notifySidePanel({ type: 'TASK_UPDATED', data: task });
++          });
++        }
++      }
++      sendResponse({ status: 'ok' });
++    });
++    return true;
++  }
++
+   if (type === 'STOP_ALL') {
+     (async () => {
+       queuePaused = true;
+       const all = await biliDB.getTasks();
+       for (const t of all) {
+         if (t.status === 'downloading' || t.status === 'pending') {
+           t.status = 'paused';
+           await notifyTask(t);
+         }
+       }
+diff --git a/content-page.js b/content-page.js
+index 316a08c..696cb02 100644
+--- a/content-page.js
++++ b/content-page.js
+@@ -992,20 +992,44 @@
+             taskId: info.taskId,
+             title: info.title,
+             bvid: info.bvid,
+             aid: info.aid,
+             cid: info.cid,
+             quality: '等待中',
+             qualityIdx: 0
+           }))
+         });
+         console.log('[B站下载助手] Enqueued', taskInfos.length, 'tasks to background queue');
++
++        // 异步补全各任务合计体积：不阻塞入队，单个失败静默跳过（执行期 quality 上报兜底）
++        (async () => {
++          for (const info of taskInfos) {
++            try {
++              const d = await getPlayUrl(info.aid, info.bvid, info.cid, 80);
++              if (!d?.dash) continue;
++              const byQ = {};
++              d.dash.video.forEach(v => {
++                if (!byQ[v.id]) byQ[v.id] = [];
++                byQ[v.id].push(v);
++              });
++              const topQ = Object.keys(byQ).map(Number).sort((a,b) => b-a)[0];
++              const topVideo = byQ[topQ].sort((a,b) => b.bandwidth - a.bandwidth)[0];
++              notify('UPDATE_TASK_SIZE', {
++                taskId: info.taskId,
++                videoSize: topVideo?.size || 0,
++                audioSize: d.dash.audio[0]?.size || 0
++              });
++            } catch(e) {
++              console.warn('[B站下载助手] 补全任务体积失败:', info.title, e);
++            }
++          }
++        })();
+       });
+       
+     } catch(e) {
+       body.innerHTML = '<div style="text-align:center;color:#f44336;padding:20px;">嗅探失败: ' + e.message + '</div>';
+     }
+   }
+ 
+   // ─── Init ───
+   function waitAndInit() {
+     if (document.body) {
+diff --git a/sidepanel.css b/sidepanel.css
+index 1c5ab44..2e52ffd 100644
+--- a/sidepanel.css
++++ b/sidepanel.css
+@@ -166,21 +166,22 @@ body {
+   white-space: nowrap;
+   overflow: hidden;
+   text-overflow: ellipsis;
+   max-width: 150px;
+ }
+ 
+ .task-time { color: #999; margin-left: auto; }
+ 
+ .task-size { color: #999; font-size: 11px; }
+ 
+-.task-note {
++.task-note,
++.task-warn {
+   margin-top: 6px;
+   font-size: 11px;
+   line-height: 1.4;
+   color: #ff9800;
+   white-space: nowrap;
+   overflow: hidden;
+   text-overflow: ellipsis;
+ }
+ 
+ /* Progress section */
+diff --git a/sidepanel.js b/sidepanel.js
+index 72839ac..16ab186 100644
+--- a/sidepanel.js
++++ b/sidepanel.js
+@@ -43,20 +43,24 @@ function getStatusText(task) {
+   switch(task.status) {
+     case 'downloading': return '下载中';
+     case 'pending': return '等待中';
+     case 'completed': return '已完成';
+     case 'failed': return '失败';
+     case 'paused': return '已暂停';
+     default: return '等待中';
+   }
+ }
+ 
++// 与 lib/download-core.js 的 MERGE_THRESHOLD 一致：超过此大小跳过 FFmpeg 自动合并，
++// 保存分离音视频 + merge.txt，故提前在卡片上提醒用户
++const MERGE_SIZE_WARN = 600 * 1024 * 1024;
++
+ // 任务总体积：优先用执行期上报的 totalSize，回退到入队时携带的音视频分项
+ function getTaskSize(task) {
+   return task.totalSize || ((task.videoSize || 0) + (task.audioSize || 0)) || 0;
+ }
+ 
+ function getStatusColor(task) {
+   switch(task.status) {
+     case 'downloading': return '#00a1d6';
+     case 'pending': return '#9e9e9e';
+     case 'completed': return '#4caf50';
+@@ -142,20 +146,21 @@ function renderTasks() {
+                       Math.round((audioP + videoP) / 2);
+       let phaseLabel = '下载中';
+       if (t.status === 'pending') phaseLabel = '等待中';
+       else if (t.status === 'paused') phaseLabel = '已暂停';
+       else if (t.status === 'failed') phaseLabel = '—';
+       else if (mergeP > 0) phaseLabel = '合并中';
+       
+       const isStop = t.status === 'downloading';
+       const controlIcon = isStop ? ICON_PAUSE : ICON_PLAY;
+       const sizeText = fmtSize(getTaskSize(t));
++      const sizeWarn = getTaskSize(t) > MERGE_SIZE_WARN;
+ 
+       return `
+         <div class="task-card ${t.status}">
+           <div class="task-header-row">
+             <div class="task-title" title="${t.title}">${t.title}</div>
+             <button class="btn-task-control ${isStop ? 'stop' : 'start'}" data-id="${t.id}" data-action="${isStop ? 'stop' : 'start'}" title="${isStop ? '停止' : '开始'}">${controlIcon}</button>
+             <button class="btn-delete-task" data-id="${t.id}" title="删除">&times;</button>
+           </div>
+           <div class="task-meta">
+             <span class="task-quality">${t.quality || ''}</span>
+@@ -165,20 +170,21 @@ function renderTasks() {
+           </div>
+           <div class="task-progress-section">
+             <div class="progress-row">
+               <span class="progress-label">${phaseLabel}</span>
+               <div class="progress-bar">
+                 <div class="progress-fill" style="width:${overall}%;background:${getStatusColor(t)}"></div>
+               </div>
+               <span class="progress-pct">${overall}%</span>
+             </div>
+             ${t.note ? `<div class="task-note" title="${t.note}">${t.note}</div>` : ''}
++            ${sizeWarn ? '<div class="task-warn" title="超过600MB的文件合并时可能内存不足，将保存分离音视频">⚠ 超过600MB，可能无法自动合并为单一视频，完成后需按 merge.txt 手动合并</div>' : ''}
+           </div>
+         </div>
+       `;
+     }).join('');
+     
+     dlList.querySelectorAll('.btn-task-control').forEach(btn => {
+       btn.onclick = async (e) => {
+         e.stopPropagation();
+         const id = btn.getAttribute('data-id');
+         const action = btn.getAttribute('data-action');

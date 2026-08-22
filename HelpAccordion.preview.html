@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>HelpAccordion · 8态预览</title>
+<link rel="stylesheet" href="sidepanel.css">
+<style>body{max-width:420px;margin:24px auto;padding:0 12px}h2{font-size:13px;color:#888;margin:20px 0 8px}</style>
+</head>
+<body>
+<div class="settings-section"><h3>使用说明 · 8 态预览</h3></div>
+
+<h2>1. default（收起）</h2>
+<div class="settings-section">
+  <details class="help-item">
+    <summary><span>如何下载视频</span><svg class="help-chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></summary>
+    <div class="help-body"><p>内容区。</p></div>
+  </details>
+</div>
+
+<h2>2. hover（收起+悬停）</h2>
+<div class="settings-section">
+  <details class="help-item hover-sim">
+    <summary style="color:#00a1d6;"><span>如何下载视频</span><svg class="help-chevron" style="color:#00a1d6;" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></summary>
+    <div class="help-body"><p>标题与箭头变 Bilibili 蓝。</p></div>
+  </details>
+</div>
+
+<h2>3. focus-visible（键盘聚焦）</h2>
+<div class="settings-section">
+  <details class="help-item" open>
+    <summary style="outline:2px solid #00a1d6;outline-offset:2px;border-radius:4px;"><span>大视频怎么办</span><svg class="help-chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></summary>
+    <div class="help-body"><p>蓝色 outline 环绕整行。</p></div>
+  </details>
+</div>
+
+<h2>4. open / active（展开）</h2>
+<div class="settings-section">
+  <details class="help-item" open>
+    <summary style="color:#00a1d6;"><span>要不要关闭 B 站页面</span><svg class="help-chevron" style="transform:rotate(180deg);color:#00a1d6;" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></summary>
+    <div class="help-body"><p>箭头旋转 180°，内容淡入，含 <span class="help-warn">警示色文本示例</span> 与步骤编号样式。</p>
+    <ol class="help-steps"><li>步骤一</li><li>步骤二</li></ol></div>
+  </details>
+</div>
+
+<h2>5-8. disabled / loading / error / success</h2>
+<div class="settings-section"><div class="help-body">静态说明组件：无禁用、无异步加载、无错误/成功语义 —— 四态天然不适用（N/A）。</div></div>
+</body>
+</html>

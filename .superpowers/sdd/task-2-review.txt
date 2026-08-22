@@ -1,0 +1,277 @@
+﻿=== git log ===
+4d4caa6 feat(download): offscreen 鏂板鍚庡彴涓嬭浇鎵ц鍣紝鐩戝惉 OFFSCREEN_RUN_TASK
+=== git diff --stat ===
+ offscreen.html |   2 +-
+ offscreen.js   | 202 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 201 insertions(+), 3 deletions(-)
+=== git diff -U10 ===
+diff --git a/offscreen.html b/offscreen.html
+index 96860d5..b9f5527 100644
+--- a/offscreen.html
++++ b/offscreen.html
+@@ -1,7 +1,7 @@
+ <!DOCTYPE html>
+ <html>
+ <head><meta charset="utf-8"><title>FFmpeg Offscreen</title></head>
+ <body>
+-<script src="offscreen.js"></script>
++<script type="module" src="offscreen.js"></script>
+ </body>
+ </html>
+diff --git a/offscreen.js b/offscreen.js
+index a823cb4..387bce0 100644
+--- a/offscreen.js
++++ b/offscreen.js
+@@ -1,11 +1,14 @@
+-// offscreen.js - FFmpeg merge in offscreen document (MV3)
++// offscreen.js - 鍚庡彴涓嬭浇鎵ц锛堜富锛? FFmpeg 鍚堝苟锛堜繚鐣欙級
++import { executeTask } from './lib/download-core.js';
++
++// 鈹€鈹€鈹€ FFmpeg 鍚堝苟锛堝師鏈夛紝渚濊禆 lib/ffmpeg.js + FFmpegWASM 鍏ㄥ眬锛夆攢鈹€鈹€
+ let ffmpegInstance = null;
+ let loadPromise = null;
+ 
+ function loadScript(url) {
+   return new Promise((resolve, reject) => {
+     const script = document.createElement('script');
+     script.src = url;
+     script.onload = resolve;
+     script.onerror = () => reject(new Error('Failed to load: ' + url));
+     document.head.appendChild(script);
+@@ -94,28 +97,221 @@ async function mergeWithFFmpeg(taskId) {
+   console.log('[FFmpeg Offscreen] Running merge...');
+   await ffmpeg.exec(['-i', 'video.m4s', '-i', 'audio.m4s', '-c', 'copy', 'output.mp4']);
+ 
+   const result = await ffmpeg.readFile('output.mp4');
+   console.log('[FFmpeg Offscreen] Merge done, output size:', result.length);
+ 
+   await ffmpeg.deleteFile('audio.m4s');
+   await ffmpeg.deleteFile('video.m4s');
+   await ffmpeg.deleteFile('output.mp4');
+ 
+-  // Cleanup source blobs from DB
+   await deleteBlobFromDB(taskId + '_audio');
+   await deleteBlobFromDB(taskId + '_video');
+ 
+   return result.buffer;
+ }
+ 
++// 鈹€鈹€鈹€ 涓嬭浇鎵ц寮曟搸锛團FmpegBridge锛孊lob URL Worker锛夆攢鈹€鈹€
++const Op = {
++  LOAD: 'LOAD', EXEC: 'EXEC',
++  WRITE_FILE: 'WRITE_FILE', READ_FILE: 'READ_FILE',
++  DELETE_FILE: 'DELETE_FILE',
++  ERROR: 'ERROR', LOG: 'LOG', PROGRESS: 'PROGRESS'
++};
++const RESULT_OPS = new Set([Op.LOAD, Op.EXEC, Op.WRITE_FILE, Op.READ_FILE, Op.DELETE_FILE]);
++
++let nextMsgId = 0;
++
++class FFmpegBridge {
++  #worker = null;
++  #pending = {};
++  #logHandlers = [];
++  #progressHandlers = [];
++  ready = false;
++
++  constructor(worker) {
++    this.#worker = worker;
++    this.#attachReceiver();
++  }
++
++  #attachReceiver() {
++    this.#worker.onmessage = ({ data: { id, type, data } }) => {
++      if (type === Op.LOG) {
++        this.#logHandlers.forEach(fn => fn(data));
++        return;
++      }
++      if (type === Op.PROGRESS) {
++        this.#progressHandlers.forEach(fn => fn(data));
++        return;
++      }
++      const p = this.#pending[id];
++      if (!p) return;
++      delete this.#pending[id];
++      if (type === Op.ERROR) {
++        p.reject(new Error(data));
++      } else if (RESULT_OPS.has(type)) {
++        if (type === Op.LOAD) this.ready = true;
++        p.resolve(data);
++      }
++    };
++  }
++
++  #send(type, payload, transferable) {
++    return new Promise((resolve, reject) => {
++      const id = nextMsgId++;
++      this.#pending[id] = { resolve, reject };
++      this.#worker.postMessage({ id, type, data: payload }, transferable || []);
++    });
++  }
++
++  on(event, handler) {
++    if (event === 'log') this.#logHandlers.push(handler);
++    else if (event === 'progress') this.#progressHandlers.push(handler);
++  }
++
++  load(opts) {
++    return this.#send(Op.LOAD, opts);
++  }
++
++  run(args, timeout) {
++    return this.#send(Op.EXEC, { args, timeout: timeout ?? -1 });
++  }
++
++  writeFile(path, data) {
++    const xfer = data instanceof Uint8Array ? [data.buffer] : [];
++    return this.#send(Op.WRITE_FILE, { path, data }, xfer);
++  }
++
++  readFile(path, encoding) {
++    return this.#send(Op.READ_FILE, { path, encoding });
++  }
++
++  deleteFile(path) {
++    return this.#send(Op.DELETE_FILE, { path });
++  }
++
++  destroy() {
++    if (this.#worker) {
++      this.#worker.terminate();
++      this.#worker = null;
++      this.ready = false;
++    }
++  }
++}
++
++let ffmpegBridge = null;
++
++async function toBlobURL(resourceURL, mimeType) {
++  const res = await fetch(resourceURL);
++  if (!res.ok) throw new Error('fetch 澶辫触: ' + resourceURL + ' HTTP ' + res.status);
++  const buf = await res.arrayBuffer();
++  return URL.createObjectURL(new Blob([buf], { type: mimeType }));
++}
++
++async function createFFmpeg() {
++  if (ffmpegBridge?.ready) return ffmpegBridge;
++
++  const workerBlobURL = await toBlobURL(chrome.runtime.getURL('lib/ffmpeg.worker.js'), 'text/javascript');
++  const worker = new Worker(workerBlobURL);
++  ffmpegBridge = new FFmpegBridge(worker);
++
++  ffmpegBridge.on('log', ({ message }) => {
++    if (message) console.log('[FFmpeg Offscreen]', message);
++  });
++
++  await ffmpegBridge.load({
++    coreURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.js'), 'text/javascript'),
++    wasmURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.wasm'), 'application/wasm'),
++    workerURL: await toBlobURL(chrome.runtime.getURL('lib/ffmpeg-core.worker.js'), 'text/javascript')
++  });
++
++  console.log('[B绔欎笅杞藉姪鎵媇 offscreen FFmpeg WASM 鍒濆鍖栧畬鎴?);
++  return ffmpegBridge;
++}
++
++// 鈹€鈹€鈹€ 鍚庡彴浠诲姟鎵ц 鈹€鈹€鈹€
++const activeTaskControllers = new Map();
++
++function sendToBg(message) {
++  chrome.runtime.sendMessage(message).catch(() => {});
++}
++
++function notify(taskId, payload) {
++  sendToBg({ type: 'OFFSCREEN_PROGRESS', data: { taskId, ...payload } });
++}
++
++async function getSettings() {
++  try {
++    return (await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' })) || {};
++  } catch (e) {
++    return {};
++  }
++}
++
++async function saveBlob(blob, filename, subdir) {
++  const buffer = await blob.arrayBuffer();
++  const blobUrl = URL.createObjectURL(new Blob([buffer], { type: blob.type || 'application/octet-stream' }));
++  try {
++    const result = await chrome.runtime.sendMessage({
++      type: 'SAVE_FILE',
++      data: { url: blobUrl, path: subdir ? subdir + '/' + filename : filename }
++    });
++    if (!result?.success) throw new Error(result?.error || '淇濆瓨澶辫触');
++  } finally {
++    setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
++  }
++}
++
++async function runOffscreenTask(taskId, videoInfo, qualityIdx) {
++  const controller = new AbortController();
++  activeTaskControllers.set(taskId, controller);
++  try {
++    await executeTask(taskId, videoInfo, qualityIdx, {
++      getSettings,
++      getFFmpeg: createFFmpeg,
++      notify: (payload) => notify(taskId, payload),
++      saveBlob,
++      signal: controller.signal
++    });
++    sendToBg({ type: 'OFFSCREEN_TASK_DONE', data: { taskId } });
++  } catch (e) {
++    if (controller.signal.aborted) {
++      sendToBg({ type: 'OFFSCREEN_TASK_ABORTED', data: { taskId } });
++    } else if (e.code === 'NEEDS_PAGE') {
++      sendToBg({ type: 'OFFSCREEN_NEEDS_PAGE', data: { taskId } });
++    } else {
++      console.error('[B绔欎笅杞藉姪鎵媇 Offscreen task failed:', taskId, e);
++      sendToBg({ type: 'OFFSCREEN_TASK_ERROR', data: { taskId, error: e.message } });
++    }
++  } finally {
++    activeTaskControllers.delete(taskId);
++  }
++}
++
+ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
++  if (message.type === 'OFFSCREEN_PING') {
++    sendResponse({ status: 'ok' });
++    return false;
++  }
++
++  if (message.type === 'OFFSCREEN_RUN_TASK') {
++    const { taskId, videoInfo, qualityIdx } = message.data || {};
++    if (taskId && videoInfo) runOffscreenTask(taskId, videoInfo, qualityIdx || 0);
++    return false;
++  }
++
++  if (message.type === 'OFFSCREEN_ABORT_TASK') {
++    const c = activeTaskControllers.get((message.data || {}).taskId);
++    if (c) { try { c.abort(); } catch (e) {} }
++    return false;
++  }
++
+   if (message.type === 'offscreen_merge_request') {
+     const { taskId } = message.data;
+ 
+     console.log('[FFmpeg Offscreen] Merge request for task:', taskId);
+ 
+     mergeWithFFmpeg(taskId)
+       .then(merged => {
+         console.log('[FFmpeg Offscreen] Merge success, sending result back');
+         chrome.runtime.sendMessage({
+           type: 'offscreen_merge_result',
+@@ -125,11 +321,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+       .catch(e => {
+         console.error('[FFmpeg Offscreen] Merge failed:', e);
+         chrome.runtime.sendMessage({
+           type: 'offscreen_merge_result',
+           data: { taskId, success: false, error: e.message }
+         });
+       });
+ 
+     return false;
+   }
++
++  return false;
+ });

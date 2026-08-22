@@ -1,0 +1,59 @@
+﻿=== git log ===
+4162c12 fix(manifest): 鏀惧 blob: worker CSP 渚?offscreen 浣跨敤锛宑ontent.js 杩囨护 OFFSCREEN_* 闃插洖澹?
+=== git diff --stat ===
+ content.js    | 3 ++-
+ manifest.json | 3 +++
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+=== git diff -U10 ===
+diff --git a/content.js b/content.js
+index 52a3ce8..17856af 100644
+--- a/content.js
++++ b/content.js
+@@ -180,18 +180,19 @@
+       });
+       return;
+     }
+ 
+     // Handle DELETE_FILE
+     if (type === 'DELETE_FILE') {
+       chrome.runtime.sendMessage({ type: 'DELETE_FILE', data }, () => {});
+       return;
+     }
+ 
+-    // Forward other messages to background
++    // Forward other messages to background锛堣烦杩?OFFSCREEN_*锛岄槻 chrome.runtime.sendMessage 骞挎挱鍥炲０锛?     try {
++      if (type.startsWith('OFFSCREEN_')) return;
+       chrome.runtime.sendMessage({ type, data }, () => {
+         if (chrome.runtime.lastError) {}
+       });
+     } catch(e) {}
+   });
+ })();
+diff --git a/manifest.json b/manifest.json
+index b2d4e30..e959516 100644
+--- a/manifest.json
++++ b/manifest.json
+@@ -9,20 +9,23 @@
+     "sidePanel",
+     "activeTab",
+     "scripting",
+     "offscreen",
+     "alarms"
+   ],
+   "host_permissions": [
+     "*://*.bilibili.com/*",
+     "*://*.bilivideo.com/*"
+   ],
++  "content_security_policy": {
++    "extension_pages": "script-src 'self' blob: 'wasm-unsafe-eval'; worker-src 'self' blob:; object-src 'self'"
++  },
+   "background": {
+     "service_worker": "background.js",
+     "type": "module"
+   },
+   "content_scripts": [
+     {
+       "matches": ["*://*.bilibili.com/*"],
+       "js": ["content.js"],
+       "css": ["styles/content.css"],
+       "run_at": "document_start"
