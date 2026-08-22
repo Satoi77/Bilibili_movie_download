@@ -287,6 +287,25 @@
   // 合并必然 OOM 且会杀死 FFmpeg worker（连累后续任务），直接落盘保底不再尝试
   const MERGE_HARD_LIMIT = 900 * 1024 * 1024;
 
+  // 输出路径解析（与 lib/download-core.js 的导出版保持一致；页面世界经典脚本无法 import）
+  function resolveOutputTargets(videoInfo, label) {
+    const safeTitle = sanitizeFilename(videoInfo.title || '') || '_';
+    if (videoInfo.dir) {
+      const safeDir = String(videoInfo.dir).split('/').map(sanitizeFilename).join('/');
+      const safeBase = sanitizeFilename(videoInfo.baseName || safeTitle);
+      return {
+        mergedDir: DOWNLOAD_BASE + '/' + safeDir,
+        mergedName: `${safeBase}${label ? '_' + label : ''}.mp4`,
+        rawSubdir: DOWNLOAD_BASE + '/' + safeDir + '/' + safeBase
+      };
+    }
+    return {
+      mergedDir: DOWNLOAD_BASE,
+      mergedName: `${safeTitle}${label ? '_' + label : ''}.mp4`,
+      rawSubdir: DOWNLOAD_BASE + '/' + safeTitle
+    };
+  }
+
   function fmtBytesText(n) {
     if (n >= 1073741824) return (n / 1073741824).toFixed(2) + 'GB';
     if (n >= 1048576) return Math.round(n / 1048576) + 'MB';
@@ -347,34 +366,24 @@
   }
 
   /**
-   * 保存原始音频/视频文件到子目录
-   * @param {Blob} audioBlob - 音频数据
-   * @param {Blob} videoBlob - 视频数据
-   * @param {string} title - 视频标题（用于子目录名）
+   * 保存原始音频/视频文件到最终子目录（目录已含 baseName 隔离层）
    */
-  async function saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir) {
-    const safeTitle = sanitizeFilename(title);
+  async function saveRawToSubdir(audioBlob, videoBlob, finalSubdir) {
     // MIME 用 video/mp4 且文件名用 .mp4：B 站 dash 流本身是 fMP4 容器，
     // 若命名为 .m4s，Chrome 会按内容类型把扩展名改写成 .mp4
     // 用 slice 改 MIME（引用共享零拷贝）；禁止 arrayBuffer() 全量拷贝（大文件 OOM）
     const audioForSave = audioBlob.slice(0, audioBlob.size, 'video/mp4');
     const videoForSave = videoBlob.slice(0, videoBlob.size, 'video/mp4');
-
-    const subdir = baseSubdir ? baseSubdir + '/' + safeTitle : safeTitle;
-    const audioId = await saveBlobViaDownloads(audioForSave, 'audio.mp4', subdir);
-    const videoId = await saveBlobViaDownloads(videoForSave, 'video.mp4', subdir);
-    console.log('[B站下载助手] 原始文件已保存到子目录:', subdir);
+    const audioId = await saveBlobViaDownloads(audioForSave, 'audio.mp4', finalSubdir);
+    const videoId = await saveBlobViaDownloads(videoForSave, 'video.mp4', finalSubdir);
+    console.log('[B站下载助手] 原始文件已保存到子目录:', finalSubdir);
     return [audioId, videoId]; // downloadId 列表，供合并成功后按设置删除
   }
 
   /**
-   * 保存 merge.txt 合并说明到子目录（仅在 FFmpeg 合并失败时调用）
-   * @param {string} title - 视频标题
-   * @param {string} baseSubdir - 基础子目录
+   * 保存 merge.txt 合并说明到最终子目录（仅在 FFmpeg 合并失败时调用）
    */
-  async function saveMergeTxt(title, baseSubdir) {
-    const safeTitle = sanitizeFilename(title);
-    const subdir = baseSubdir ? baseSubdir + '/' + safeTitle : safeTitle;
+  async function saveMergeTxt(finalSubdir) {
     const txtContent = [
       '将此目录下的 audio.mp4 和 video.mp4 合并为 mp4 文件。',
       '',
@@ -385,8 +394,8 @@
       '  （需要已安装 ffmpeg 并添加到 PATH 环境变量）'
     ].join('\r\n');
     const blob = new Blob([txtContent], { type: 'text/plain' });
-    await saveBlobViaDownloads(blob, 'merge.txt', subdir);
-    console.log('[B站下载助手] merge.txt 已保存到子目录:', subdir);
+    await saveBlobViaDownloads(blob, 'merge.txt', finalSubdir);
+    console.log('[B站下载助手] merge.txt 已保存到子目录:', finalSubdir);
   }
 
   async function deleteDownloadedFile(downloadPath) {
@@ -645,7 +654,6 @@
 
   // ─── Execute a single download ───
   async function executeDownload(taskId, videoInfo, qualityIdx, signal) {
-    const title = videoInfo.title;
     const settings = await fetchSettings();
     
     const data = await getPlayUrl(videoInfo.aid, videoInfo.bvid, videoInfo.cid, 80, signal);
@@ -689,8 +697,7 @@
     // 用真实字节数修正任务卡片的合计容量（入队时的值为估算）
     notify('download_progress', { taskId, phase: 'quality', percent: 0, totalSize: audioBlob.size + videoBlob.size });
 
-    const safeTitle = sanitizeFilename(title);
-    const baseSubdir = DOWNLOAD_BASE;
+    const targets = resolveOutputTargets(videoInfo, label);
     let rawSaved = false;
     let rawFileIds = null;
 
@@ -698,7 +705,7 @@
     if (settings.saveRawFiles) {
       try {
         notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
-        rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
+        rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, targets.rawSubdir);
         rawSaved = true;
       } catch(e) {
         console.warn('[B站下载助手] 保存原始文件失败:', e);
@@ -715,7 +722,7 @@
         notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '合并中' });
         const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, taskId);
         if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
-        await downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`, baseSubdir);
+        await downloadFile(mergedBlob, targets.mergedName, targets.mergedDir);
         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
       } catch(mergeError) {
         console.error('[B站下载助手] FFmpeg 合并失败:', mergeError);
@@ -723,13 +730,13 @@
         // 合并执行失败：降级为分离保存，任务正常完成
         if (!rawSaved) {
           try {
-            await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
+            await saveRawToSubdir(audioBlob, videoBlob, targets.rawSubdir);
             rawSaved = true;
           } catch(e) {
             console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
           }
         }
-        try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
+        try { await saveMergeTxt(targets.rawSubdir); } catch(e) {}
         if (!rawSaved) throw new Error('合并失败且分离文件保存失败: ' + mergeError.message);
         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
         note = `合并失败（${mergeError.message}），已保存分离音视频，请按 merge.txt 说明本地合并`;
@@ -742,7 +749,7 @@
     if (!rawSaved) {
       try {
         notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
-        rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
+        rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, targets.rawSubdir);
         rawSaved = true;
       } catch(e) {
         console.error('[B站下载助手] 分离文件保存失败:', e);
@@ -758,20 +765,20 @@
         notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '尝试合并' });
         const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, taskId);
         if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
-        await downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`, baseSubdir);
+        await downloadFile(mergedBlob, targets.mergedName, targets.mergedDir);
         mergedOk = true;
         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
       } catch(mergeError) {
         console.error('[B站下载助手] 大文件 FFmpeg 合并失败:', mergeError);
         if (signal?.aborted) throw mergeError;
-        try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
+        try { await saveMergeTxt(targets.rawSubdir); } catch(e) {}
         notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
         note = `内存不足未能自动合并，分离音视频已就绪，请按 merge.txt 说明本地合并`;
       }
     }
     if (!mergedOk && !worthMerging) {
       // 确定性失败区：不浪费一次注定失败的合并尝试，保底文件即最终交付
-      try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
+      try { await saveMergeTxt(targets.rawSubdir); } catch(e) {}
       notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
       note = `文件较大（${fmtBytesText(audioBlob.size + videoBlob.size)}），已保存分离音视频，请按 merge.txt 说明本地合并`;
     }
