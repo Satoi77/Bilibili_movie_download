@@ -166,9 +166,10 @@ function renderTasks() {
       const audioP = t.progress?.audio || 0;
       const videoP = t.progress?.video || 0;
       const mergeP = t.progress?.merge || 0;
+      // 进度条只反映音视频两路的下载字节；合并不折算进度，避免下载到 100% 后
+      // 因进入合并阶段又回落成 95% 的观感倒退，合并进展通过阶段文案体现
       const overall = t.status === 'completed' ? 100 : 
                       t.status === 'failed' ? 0 : 
-                      mergeP > 0 ? Math.round(90 + mergeP * 0.1) :
                       Math.round((audioP + videoP) / 2);
       let phaseLabel = '下载中';
       if (t.status === 'pending') phaseLabel = '等待中';
