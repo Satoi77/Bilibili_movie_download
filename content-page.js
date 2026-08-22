@@ -1170,17 +1170,22 @@
 
       hidePanel();
 
-      const mkTask = (g, aid, cid, partTitle, pn) => ({
-        taskId: 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
-        aid, bvid: g.bvid, cid,
-        title: `${g.title} | ${pn} ${partTitle}`,
-        qualityIdx: qIdx,
-        quality: qualityLabel,
-        dir: `${tree.collectionName}/${g.title}`,
-        baseName: `${pn}_${partTitle}`
-      });
+      // 单P 视频（partCount===1）不建视频名子目录：文件直接以视频名落合集目录；
+      // 多P 保持 合集/视频名/Pn_分P名 三级结构（resolveOutputTargets 按 dir/baseName 解析）
+      const mkTask = (g, aid, cid, partTitle, pn, partCount) => {
+        const flat = partCount === 1;
+        return {
+          taskId: 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
+          aid, bvid: g.bvid, cid,
+          title: `${g.title} | ${pn} ${partTitle}`,
+          qualityIdx: qIdx,
+          quality: qualityLabel,
+          dir: flat ? tree.collectionName : `${tree.collectionName}/${g.title}`,
+          baseName: flat ? g.title : `${pn}_${partTitle}`
+        };
+      };
 
-      const taskItems = directUnits.map(u => mkTask(u.g, u.g.aid, u.pt.cid, u.pt.title, padP(u.pt.p)));
+      const taskItems = directUnits.map(u => mkTask(u.g, u.g.aid, u.pt.cid, u.pt.title, padP(u.pt.p), u.g.parts.length));
 
       // DOM 兜底组：入队前拉取视频详情展开其全部分P（spec §4.1 第 4 优先级）
       for (const g of expandGroups) {
@@ -1191,7 +1196,7 @@
             ? info.pages
             : [{ page: 1, part: '', cid: info.cid }];
           for (const pg of pages) {
-            taskItems.push(mkTask(g, info.aid, pg.cid, pg.part || '', padP(pg.page || 1)));
+            taskItems.push(mkTask(g, info.aid, pg.cid, pg.part || '', padP(pg.page || 1), pages.length));
           }
         } catch (e) {
           console.warn('[B站下载助手] 兜底组解析失败:', g.bvid, e);
