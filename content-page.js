@@ -305,6 +305,9 @@
   // 该阈值不是"跳过合并"的一刀切门槛：超过阈值的大文件先落盘分离文件作保底，
   // 仍会尝试合并（卡在内存边界附近的文件有机会成功），失败时保底文件直接可用。
   const MERGE_THRESHOLD = 600 * 1024 * 1024;
+  // 实测（2026-08-22 内存诊断）：官方构建 wasm 堆默认上限 2GB，总大小 ≥900MB 时
+  // 合并必然 OOM 且会杀死 FFmpeg worker（连累后续任务），直接落盘保底不再尝试
+  const MERGE_HARD_LIMIT = 900 * 1024 * 1024;
 
   function fmtBytesText(n) {
     if (n >= 1073741824) return (n / 1073741824).toFixed(2) + 'GB';
@@ -602,11 +605,10 @@
     } finally {
       clearInterval(heartbeat);
     }
-    const merged = await ffmpeg.readFile(outputPath);
-
-    // 清理临时文件
+    // 先删输入再读输出：读出的副本复用刚释放的输入区，堆峰值从 ≈3×总大小 降到 ≈2×总大小
     ffmpeg.deleteFile(audioPath).catch(() => {});
     ffmpeg.deleteFile(videoPath).catch(() => {});
+    const merged = await ffmpeg.readFile(outputPath);
     ffmpeg.deleteFile(outputPath).catch(() => {});
 
     return new Blob([merged.buffer], { type: 'video/mp4' });
@@ -770,20 +772,30 @@
     }
     if (!rawSaved) throw new Error(`分离文件保存失败（文件 ${fmtBytesText(audioBlob.size + videoBlob.size)}）`);
 
+    // 实测 wasm 堆上限 2GB：总大小 ≥900MB 时合并必然 OOM，直接落盘保底不再尝试
+    const worthMerging = audioBlob.size + videoBlob.size < MERGE_HARD_LIMIT;
     let mergedOk = false;
-    try {
-      notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '尝试合并' });
-      const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, taskId);
-      if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
-      await downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`, baseSubdir);
-      mergedOk = true;
-      notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
-    } catch(mergeError) {
-      console.error('[B站下载助手] 大文件 FFmpeg 合并失败:', mergeError);
-      if (signal?.aborted) throw mergeError;
+    if (worthMerging) {
+      try {
+        notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '尝试合并' });
+        const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, taskId);
+        if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+        await downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`, baseSubdir);
+        mergedOk = true;
+        notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
+      } catch(mergeError) {
+        console.error('[B站下载助手] 大文件 FFmpeg 合并失败:', mergeError);
+        if (signal?.aborted) throw mergeError;
+        try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
+        notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
+        note = `内存不足未能自动合并，分离音视频已就绪，请按 merge.txt 说明本地合并`;
+      }
+    }
+    if (!mergedOk && !worthMerging) {
+      // 确定性失败区：不浪费一次注定失败的合并尝试，保底文件即最终交付
       try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
       notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
-      note = `内存不足未能自动合并，分离音视频已就绪，请按 merge.txt 说明本地合并`;
+      note = `文件较大（${fmtBytesText(audioBlob.size + videoBlob.size)}），已保存分离音视频，请按 merge.txt 说明本地合并`;
     }
     if (mergedOk && !settings.saveRawFiles && rawFileIds) {
       // 合并成功且未开启"保存原始音频和视频文件"→ 删除刚落盘的保底文件
