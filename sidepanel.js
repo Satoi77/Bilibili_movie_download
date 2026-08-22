@@ -397,12 +397,6 @@ document.getElementById('save-settings')?.addEventListener('click', async () => 
   setTimeout(() => btn.textContent = '保存设置', 2000);
 });
 
-// FFmpeg 内存诊断页（feature/ffmpeg-4gb 分支实验入口）
-document.getElementById('open-memory-probe')?.addEventListener('click', (e) => {
-  e.preventDefault();
-  chrome.tabs.create({ url: chrome.runtime.getURL('test/memory-probe.html') });
-});
-
 // ─── Init ───
 
 (async () => {

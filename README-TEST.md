@@ -1,6 +1,7 @@
-# FFmpeg 4GB 内存方案验证（feature/ffmpeg-4gb 分支）
+# FFmpeg 内存上限调研结论（feature/ffmpeg-4gb 已合入 master）
 
-> **2026-08-22 实测完成，最终结论见文末「实测结果」。**
+> **2026-08-22 实测完成。诊断页已随入口移除删除（git 历史 bb9debd..ba146b9 可找回）；
+> `lib/ffmpeg.worker.js` 的 PROBE/MOUNT_WORKERFS 指令保留，供将来自编译升级复用。**
 
 ## 背景与调研结论
 
