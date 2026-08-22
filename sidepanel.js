@@ -50,8 +50,8 @@ function getStatusText(task) {
   }
 }
 
-// 与 lib/download-core.js 的 MERGE_THRESHOLD 一致：超过此大小跳过 FFmpeg 自动合并，
-// 保存分离音视频 + merge.txt，故提前在卡片上提醒用户
+// 与 lib/download-core.js 的 MERGE_THRESHOLD 一致：超过此大小会先落盘分离音视频作保底，
+// 再尝试 FFmpeg 自动合并（内存边界处可能成功）；失败时保底文件直接可用，提前在卡片上提醒用户
 const MERGE_SIZE_WARN = 600 * 1024 * 1024;
 
 // 任务总体积：优先用执行期上报的 totalSize，回退到入队时携带的音视频分项
@@ -177,7 +177,7 @@ function renderTasks() {
               <span class="progress-pct">${overall}%</span>
             </div>
             ${t.note ? `<div class="task-note" title="${t.note}">${t.note}</div>` : ''}
-            ${sizeWarn ? '<div class="task-warn" title="超过600MB的文件合并时可能内存不足，将保存分离音视频">⚠ 超过600MB，可能无法自动合并为单一视频，完成后需按 merge.txt 手动合并</div>' : ''}
+            ${sizeWarn ? '<div class="task-warn" title="大文件将先保存分离音视频，再尝试自动合并；若内存不足未能合并，可直接使用分离文件或按 merge.txt 手动合并">⚠ 超过600MB：先保存分离文件再尝试合并，若内存不足请按 merge.txt 本地合并</div>' : ''}
           </div>
         </div>
       `;

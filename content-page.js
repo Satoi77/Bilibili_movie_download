@@ -274,8 +274,9 @@
 
   // 固定下载根目录：浏览器默认下载目录下的 bilibili_download 子目录
   const DOWNLOAD_BASE = 'bilibili_download';
-  // wasm32 的 FFmpeg WASM 堆有约 2GB 硬上限：合并需同时容纳 输入+输出 ≈ 2×总大小，
-  // 超过该阈值必然 OOM 中止。大文件直接走“分离保存 + 本地合并脚本”。
+  // wasm32 的 FFmpeg WASM 堆有约 2GB 硬上限：合并需同时容纳 输入+输出 ≈ 2×总大小。
+  // 该阈值不是"跳过合并"的一刀切门槛：超过阈值的大文件先落盘分离文件作保底，
+  // 仍会尝试合并（卡在内存边界附近的文件有机会成功），失败时保底文件直接可用。
   const MERGE_THRESHOLD = 600 * 1024 * 1024;
 
   function fmtBytesText(n) {
@@ -290,14 +291,14 @@
     // （大文件多次拷贝会 OOM，正是"只剩 merge.txt"的元凶之一）
     const requestId = filename + '_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
     try {
-      await new Promise((resolve, reject) => {
+      const downloadId = await new Promise((resolve, reject) => {
         const handler = (e) => {
           if (e.data?.source !== 'bilibili-downloader') return;
           if (e.data.type !== 'save_blob_result') return;
           if (e.data.data.requestId !== requestId) return;
           window.removeEventListener('message', handler);
           clearTimeout(t);
-          if (e.data.data.success) resolve(e.data.data.result);
+          if (e.data.data.success) resolve(e.data.data.downloadId || null);
           else reject(new Error(e.data.data.error || '保存失败'));
         };
         window.addEventListener('message', handler);
@@ -305,10 +306,31 @@
         const t = setTimeout(() => { window.removeEventListener('message', handler); reject(new Error('保存超时')); }, 30 * 60 * 1000);
         window.postMessage({ source: 'bilibili-downloader', type: 'SAVE_BLOB', data: { requestId, blob, filename, subdir: subdir || '' } }, '*');
       });
+      return downloadId; // 供"合并成功后按设置删除原始文件"使用
     } catch(e) {
       console.warn('[B站下载助手] SAVE_BLOB 失败，回退到 <a download>:', e);
       saveBlob(blob, filename);
+      return null;
     }
+  }
+
+  // 删除已通过 chrome.downloads 落盘的原始文件（经 content.js 转发到 background）
+  async function removeSavedFileViaPage(downloadId) {
+    const requestId = 'del_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
+    await new Promise((resolve, reject) => {
+      const handler = (e) => {
+        if (e.data?.source !== 'bilibili-downloader') return;
+        if (e.data.type !== 'delete_blob_result') return;
+        if (e.data.data.requestId !== requestId) return;
+        window.removeEventListener('message', handler);
+        clearTimeout(t);
+        if (e.data.data.success) resolve();
+        else reject(new Error(e.data.data.error || '删除原始文件失败'));
+      };
+      window.addEventListener('message', handler);
+      const t = setTimeout(() => { window.removeEventListener('message', handler); reject(new Error('删除请求超时')); }, 30000);
+      window.postMessage({ source: 'bilibili-downloader', type: 'DELETE_BLOB_FILE', data: { requestId, downloadId } }, '*');
+    });
   }
 
   // 下载文件：保存到设置中的自定义子目录，否则浏览器默认
@@ -331,9 +353,10 @@
     const videoForSave = videoBlob.slice(0, videoBlob.size, 'video/mp4');
 
     const subdir = baseSubdir ? baseSubdir + '/' + safeTitle : safeTitle;
-    await saveBlobViaDownloads(audioForSave, 'audio.mp4', subdir);
-    await saveBlobViaDownloads(videoForSave, 'video.mp4', subdir);
+    const audioId = await saveBlobViaDownloads(audioForSave, 'audio.mp4', subdir);
+    const videoId = await saveBlobViaDownloads(videoForSave, 'video.mp4', subdir);
     console.log('[B站下载助手] 原始文件已保存到子目录:', subdir);
+    return [audioId, videoId]; // downloadId 列表，供合并成功后按设置删除
   }
 
   /**
@@ -662,61 +685,88 @@
     const safeTitle = sanitizeFilename(title);
     const baseSubdir = DOWNLOAD_BASE;
     let rawSaved = false;
+    let rawFileIds = null;
 
     // 如果开启了保存原始文件，先保存
     if (settings.saveRawFiles) {
       try {
         notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
-        await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
+        rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
         rawSaved = true;
       } catch(e) {
         console.warn('[B站下载助手] 保存原始文件失败:', e);
       }
     }
 
-    // 超过内存安全阈值的文件直接跳过 FFmpeg 合并（必然 OOM），走分离保存
-    const skipMerge = audioBlob.size + videoBlob.size > MERGE_THRESHOLD;
+    // 大文件不再一刀切跳过合并：先落盘分离文件作保底，仍尝试合并（内存边界处有机会成功）
+    const bigFile = audioBlob.size + videoBlob.size > MERGE_THRESHOLD;
     let note = '';
 
-    if (skipMerge) {
-      if (!rawSaved) {
-        try {
-          notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
-          await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
-          rawSaved = true;
-        } catch(e) {
-          console.error('[B站下载助手] 分离文件保存失败:', e);
+    if (!bigFile) {
+      // 小文件：直接合并（成功率接近 100%），失败才降级落盘
+      try {
+        notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '合并中' });
+        const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, taskId);
+        if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+        await downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`, baseSubdir);
+        notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
+      } catch(mergeError) {
+        console.error('[B站下载助手] FFmpeg 合并失败:', mergeError);
+        if (signal?.aborted) throw mergeError;
+        // 合并执行失败：降级为分离保存，任务正常完成
+        if (!rawSaved) {
+          try {
+            await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
+            rawSaved = true;
+          } catch(e) {
+            console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
+          }
         }
+        try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
+        if (!rawSaved) throw new Error('合并失败且分离文件保存失败: ' + mergeError.message);
+        notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
+        note = `合并失败（${mergeError.message}），已保存分离音视频，请按 merge.txt 说明本地合并`;
       }
-      try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
-      if (!rawSaved) throw new Error(`分离文件保存失败（文件 ${fmtBytesText(audioBlob.size + videoBlob.size)}）`);
-      notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
-      return { note: `文件较大（${fmtBytesText(audioBlob.size + videoBlob.size)}），已保存分离音视频，请按 merge.txt 说明本地合并` };
+      return { note };
     }
 
-    // 尝试 FFmpeg 合并
+    // 大文件路径：先落盘分离文件作保底（用户指定的顺序），再尝试合并。
+    // 失败时保底文件直接可用并补 merge.txt；成功后按设置决定原始文件去留。
+    if (!rawSaved) {
+      try {
+        notify('download_progress', { taskId, phase: 'merge', percent: 0, label: '保存原始文件' });
+        rawFileIds = await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
+        rawSaved = true;
+      } catch(e) {
+        console.error('[B站下载助手] 分离文件保存失败:', e);
+      }
+    }
+    if (!rawSaved) throw new Error(`分离文件保存失败（文件 ${fmtBytesText(audioBlob.size + videoBlob.size)}）`);
+
+    let mergedOk = false;
     try {
-      notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '合并中' });
+      notify('download_progress', { taskId, phase: 'merge', percent: 50, label: '尝试合并' });
       const mergedBlob = await mergeWithFFmpeg(audioBlob, videoBlob, taskId);
       if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
       await downloadFile(mergedBlob, `${safeTitle}_${label}.mp4`, baseSubdir);
+      mergedOk = true;
       notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '合并完成' });
     } catch(mergeError) {
-      console.error('[B站下载助手] FFmpeg 合并失败:', mergeError);
+      console.error('[B站下载助手] 大文件 FFmpeg 合并失败:', mergeError);
       if (signal?.aborted) throw mergeError;
-      // 合并执行失败（大文件多为 OOM，重试无法解决）：降级为分离保存，任务正常完成
-      if (!rawSaved) {
-        try {
-          await saveRawToSubdir(audioBlob, videoBlob, title, baseSubdir);
-          rawSaved = true;
-        } catch(e) {
-          console.error('[B站下载助手] 兜底保存原始文件也失败:', e);
-        }
-      }
       try { await saveMergeTxt(title, baseSubdir); } catch(e) {}
-      if (!rawSaved) throw new Error('合并失败且分离文件保存失败: ' + mergeError.message);
       notify('download_progress', { taskId, phase: 'merge', percent: 100, label: '已保存分离文件' });
-      note = `合并失败（${mergeError.message}），已保存分离音视频，请按 merge.txt 说明本地合并`;
+      note = `内存不足未能自动合并，分离音视频已就绪，请按 merge.txt 说明本地合并`;
+    }
+    if (mergedOk && !settings.saveRawFiles && rawFileIds) {
+      // 合并成功且未开启"保存原始音频和视频文件"→ 删除刚落盘的保底文件
+      try {
+        for (const id of rawFileIds) {
+          if (id) await removeSavedFileViaPage(id);
+        }
+      } catch(e) {
+        console.warn('[B站下载助手] 清理原始文件失败:', e);
+      }
     }
     return { note };
   }

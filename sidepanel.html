@@ -97,12 +97,13 @@
             <svg class="help-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </summary>
           <div class="help-body">
-            <p>音视频合计超过 600MB 时，受浏览器内存限制无法在扩展内自动合并，会改为分开保存：<b>audio.mp4</b>（声音）、<b>video.mp4</b>（画面）和一份 <b>merge.txt</b> 说明，位于「bilibili_download/视频标题」子目录。</p>
-            <p><b>观看方式二选一：</b></p>
+            <p>音视频合计超过 600MB 时，会<b>先保存分离文件作保底</b>（<b>audio.mp4</b> 声音、<b>video.mp4</b> 画面，位于「bilibili_download/视频标题」子目录），随后仍会尝试自动合并——卡在内存边界附近的视频有机会成功。</p>
+            <p>若提示内存不足未能合并，分离文件可直接使用：</p>
             <ol class="help-steps">
               <li>直接播放：用 PotPlayer 打开 video.mp4 后加载外部音频 audio.mp4；或用 VLC「媒体 → 打开多个文件」，勾选「同步播放另一个媒体」选中 audio.mp4</li>
               <li>合并成一个文件：安装 ffmpeg 后，进入该子目录，执行 merge.txt 中记录的命令即可得到完整 mp4</li>
             </ol>
+            <p>合并成功时：开启「保存原始音频和视频文件」则保留分离文件，否则自动清理。</p>
           </div>
         </details>
         <details class="help-item">

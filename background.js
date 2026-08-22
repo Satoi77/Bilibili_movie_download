@@ -798,6 +798,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (type === 'DELETE_SAVED_FILE') {
+    // 删除已落盘的下载文件（合并成功后按设置清理原始分离文件用）；不影响下载历史记录
+    chrome.downloads.removeFile(data.downloadId, () => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ success: false, error: chrome.runtime.lastError.message });
+      } else {
+        sendResponse({ success: true });
+      }
+    });
+    return true;
+  }
+
   if (type === 'DELETE_FILE') {
     chrome.downloads.search({ filenameQuery: data.path, limit: 1 }, (results) => {
       if (results && results.length > 0) {

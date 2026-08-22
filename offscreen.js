@@ -259,9 +259,19 @@ async function saveBlob(blob, filename, subdir) {
       data: { url: blobUrl, path: subdir ? subdir + '/' + filename : filename }
     });
     if (!result?.success) throw new Error(result?.error || '保存失败');
+    return result.downloadId || null; // 供"合并成功后按设置删除原始文件"使用
   } finally {
     URL.revokeObjectURL(blobUrl);
   }
+}
+
+// 删除已通过 chrome.downloads 落盘的原始文件（仅删文件，不清理下载历史记录）
+async function removeSavedFile(downloadId) {
+  const result = await chrome.runtime.sendMessage({
+    type: 'DELETE_SAVED_FILE',
+    data: { downloadId }
+  });
+  if (!result?.success) throw new Error(result?.error || '删除原始文件失败');
 }
 
 async function runOffscreenTask(taskId, videoInfo, qualityIdx) {
@@ -279,6 +289,7 @@ async function runOffscreenTask(taskId, videoInfo, qualityIdx) {
       getFFmpeg: createFFmpeg,
       notify: (payload) => notify(taskId, payload),
       saveBlob,
+      removeSavedFile,
       signal: controller.signal
     }).then((result) => {
       sendToBg({ type: 'OFFSCREEN_TASK_DONE', data: { taskId, note: result?.note || '' } });

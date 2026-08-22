@@ -194,7 +194,21 @@
           window.postMessage({ source: 'bilibili-downloader', type: 'save_blob_result', data: { requestId, success: false, error: chrome.runtime.lastError.message } }, '*');
           return;
         }
-        window.postMessage({ source: 'bilibili-downloader', type: 'save_blob_result', data: { requestId, success: result?.success, error: result?.error } }, '*');
+        // downloadId 透传给页面世界，供"合并成功后按设置删除原始文件"使用
+        window.postMessage({ source: 'bilibili-downloader', type: 'save_blob_result', data: { requestId, success: result?.success, error: result?.error, downloadId: result?.downloadId || null } }, '*');
+      });
+      return;
+    }
+
+    // Handle DELETE_BLOB_FILE - 删除已落盘的原始文件（合并成功后按设置清理）
+    if (type === 'DELETE_BLOB_FILE') {
+      const { requestId, downloadId } = data;
+      chrome.runtime.sendMessage({ type: 'DELETE_SAVED_FILE', data: { downloadId } }, (result) => {
+        if (chrome.runtime.lastError) {
+          window.postMessage({ source: 'bilibili-downloader', type: 'delete_blob_result', data: { requestId, success: false, error: chrome.runtime.lastError.message } }, '*');
+          return;
+        }
+        window.postMessage({ source: 'bilibili-downloader', type: 'delete_blob_result', data: { requestId, success: result?.success, error: result?.error } }, '*');
       });
       return;
     }
