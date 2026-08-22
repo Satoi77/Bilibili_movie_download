@@ -75,6 +75,59 @@
           <div class="setting-hint">在子目录中保存 audio.mp4、video.mp4 和合并说明</div>
         </div>
       </div>
+      <div class="settings-section">
+        <h3>使用说明</h3>
+        <details class="help-item">
+          <summary>
+            <span>如何下载视频</span>
+            <svg class="help-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </summary>
+          <div class="help-body">
+            <ol class="help-steps">
+              <li>打开 B 站视频播放页，页面上会出现「下载」按钮</li>
+              <li>点击按钮、选择清晰度，任务加入下载队列</li>
+              <li>队列按顺序自动下载，完成后自动合并为一个 mp4 保存</li>
+            </ol>
+            <p>合集、多 P 视频可在同一页面批量加入队列。</p>
+          </div>
+        </details>
+        <details class="help-item">
+          <summary>
+            <span>大视频（超过 600MB）怎么办</span>
+            <svg class="help-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </summary>
+          <div class="help-body">
+            <p>音视频合计超过 600MB 时，受浏览器内存限制无法在扩展内自动合并，会改为分开保存：<b>audio.mp4</b>（声音）、<b>video.mp4</b>（画面）和一份 <b>merge.txt</b> 说明，位于「bilibili_download/视频标题」子目录。</p>
+            <p><b>观看方式二选一：</b></p>
+            <ol class="help-steps">
+              <li>直接播放：用 PotPlayer 打开 video.mp4 后加载外部音频 audio.mp4；或用 VLC「媒体 → 打开多个文件」，勾选「同步播放另一个媒体」选中 audio.mp4</li>
+              <li>合并成一个文件：安装 ffmpeg 后，进入该子目录，执行 merge.txt 中记录的命令即可得到完整 mp4</li>
+            </ol>
+          </div>
+        </details>
+        <details class="help-item">
+          <summary>
+            <span>要不要关闭 B 站页面</span>
+            <svg class="help-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </summary>
+          <div class="help-body">
+            <p><b>通常可以关：</b>下载由浏览器后台完成，关闭视频页面不影响进行中的任务。</p>
+            <p><b>例外情况：</b>个别任务因风控限制需借助已打开的 B 站页面执行——表现为进度停滞一段时间后恢复，或失败后自动重试。<span class="help-warn">这类任务执行期间尽量不要关闭或跳转该页面</span>；万一关了，任务会在几分钟后自动重启恢复，保证有一个 B 站页面开着即可。</p>
+            <p>扩展只会复用你已打开的 B 站页面；仅当没有任何可用页面时才在后台新建一个，空闲后自动关闭，不会打扰浏览。</p>
+          </div>
+        </details>
+        <details class="help-item">
+          <summary>
+            <span>文件保存在哪里</span>
+            <svg class="help-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </summary>
+          <div class="help-body">
+            <p>全部位于浏览器默认下载目录的 <b>bilibili_download</b> 文件夹：</p>
+            <p>· 自动合并成功：单个「标题_清晰度.mp4」<br>· 分离保存：「视频标题」子目录内的 audio.mp4、video.mp4、merge.txt</p>
+            <p>可在上方开启「合并成功后删除原始文件」，避免重复占用空间。</p>
+          </div>
+        </details>
+      </div>
       <button class="btn-save" id="save-settings">保存设置</button>
     </div>
   </div>
