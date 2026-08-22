@@ -1,5 +1,5 @@
 // offscreen.js - 后台下载执行（主）+ FFmpeg 合并（保留）
-import { executeTask } from './lib/download-core.js';
+import { executeTask, cleanupOPFS, cleanupOrphanOpfsParts } from './lib/download-core.js';
 
 // ─── FFmpeg 合并（原有，依赖 lib/ffmpeg.js + FFmpegWASM 全局）───
 let ffmpegInstance = null;
@@ -329,6 +329,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'OFFSCREEN_ABORT_TASK') {
     const c = activeTaskControllers.get((message.data || {}).taskId);
     if (c) { try { c.abort(); } catch (e) {} }
+    return false;
+  }
+
+  if (message.type === 'OFFSCREEN_CLEANUP_OPFS') {
+    // 任务删除：清理其 OPFS 半成品（best-effort，无需等待完成）
+    const ids = message.data?.taskIds || [];
+    cleanupOPFS(ids.flatMap(id => [id + '_audio', id + '_video']));
+    sendResponse({ status: 'ok' });
+    return false;
+  }
+
+  if (message.type === 'OFFSCREEN_CLEANUP_OPFS_EXCEPT') {
+    // 孤儿对账：清理不属于任何现存任务的半成品
+    cleanupOrphanOpfsParts(new Set(message.data?.keepPrefixes || []));
+    sendResponse({ status: 'ok' });
     return false;
   }
 

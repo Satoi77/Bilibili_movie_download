@@ -1,5 +1,5 @@
 // background.js
-import { biliDB } from './lib/db.js';
+import { biliDB, isActiveTask } from './lib/db.js';
 
 biliDB.init().then(() => {
   console.log('[Bilibili Downloader] Database initialized');
@@ -51,6 +51,8 @@ async function sendAbort(taskId) {
 }
 
 // ─── Offscreen 与宿主 tab 工具 ───
+let opfsPartsReconciled = false; // offscreen 就绪后对账一次；offscreen 重建/SW 冷启动后重新触发
+
 async function ensureOffscreen() {
   const existing = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
   if (existing.length === 0) {
@@ -63,11 +65,23 @@ async function ensureOffscreen() {
   for (let i = 0; i < 50; i++) {
     try {
       const res = await chrome.runtime.sendMessage({ type: 'OFFSCREEN_PING' });
-      if (res?.status === 'ok') return;
+      if (res?.status === 'ok') {
+        if (!opfsPartsReconciled) {
+          opfsPartsReconciled = true;
+          reconcileOpfsParts().catch(() => {});
+        }
+        return;
+      }
     } catch (e) {}
     await sleep(200);
   }
   throw new Error('offscreen 未就绪');
+}
+
+// 孤儿半成品对账：清理不属于任何现存任务的 OPFS 残留（失败保留半成品策略的兜底）
+async function reconcileOpfsParts() {
+  const tasks = await biliDB.getTasks();
+  chrome.runtime.sendMessage({ type: 'OFFSCREEN_CLEANUP_OPFS_EXCEPT', data: { keepPrefixes: tasks.map(t => t.id) } }).catch(() => {});
 }
 
 // 宿主 tab 就绪探测：content.js 应答 status:'ok' 表示页面世界 content-page.js 已加载，
@@ -443,6 +457,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         inFlightExecutor = null;
       }
       await biliDB.deleteTask(data.taskId);
+      // 任务已删除 → 其 OPFS 半成品一并清理（offscreen 未起时消息失败静默，孤儿由对账兜底）
+      chrome.runtime.sendMessage({ type: 'OFFSCREEN_CLEANUP_OPFS', data: { taskIds: [data.taskId] } }).catch(() => {});
       notifySidePanel({ type: 'TASK_REMOVED', data: { taskId: data.taskId } });
       sendResponse({ status: 'ok' });
     })();
@@ -451,9 +467,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (type === 'CLEAR_COMPLETED') {
     biliDB.getTasks().then(tasks => {
-      const toDelete = tasks.filter(t =>
-        (t.status === 'completed' || t.status === 'failed') && t.id
-      );
+      // 仅清除「已完成」页面的记录；失败任务属于「下载中」页面，由「清理失败任务」按钮负责
+      const toDelete = tasks.filter(t => t.status === 'completed' && t.id);
       Promise.all(toDelete.map(t => biliDB.deleteTask(t.id))).then(() => {
         sendResponse({ status: 'ok', deleted: toDelete.length });
       });
@@ -718,12 +733,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const inflight = inFlightTaskId ? await biliDB.getTask(inFlightTaskId) : null;
       if (inflight) await sendAbort(inflight.id);
       const all = await biliDB.getTasks();
-      await Promise.all(all.map(t => biliDB.deleteTask(t.id)));
-      all.forEach(t => notifySidePanel({ type: 'TASK_REMOVED', data: { taskId: t.id } }));
+      // 仅清除「下载中」页面的任务（pending/downloading/paused/failed），「已完成」记录保留
+      const toDelete = all.filter(t => t.id && isActiveTask(t));
+      await Promise.all(toDelete.map(t => biliDB.deleteTask(t.id)));
+      toDelete.forEach(t => notifySidePanel({ type: 'TASK_REMOVED', data: { taskId: t.id } }));
       inFlightTaskId = null;
       queueBusy = false;
       inFlightExecutor = null;
-      sendResponse({ status: 'ok', deleted: all.length });
+      sendResponse({ status: 'ok', deleted: toDelete.length });
     })();
     return true;
   }

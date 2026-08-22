@@ -230,17 +230,35 @@
       .filter(u => typeof u === 'string' && u.length > 0);
   }
 
-  // 单个地址的完整尝试：请求 + 读流 + 进度上报
-  async function downloadBlobOnce(url, taskId, phase, label, signal) {
-    const r = await fetchWithTimeout(url, {}, 60000, signal);
+  // 单个地址的完整尝试：请求 + 读流 + 进度上报；state.chunks 跨地址保留已收字节（断点续传）
+  async function downloadBlobOnce(url, taskId, phase, label, signal, state) {
+    const chunks = state.chunks;
+    let baseOffset = chunks.reduce((n, c) => n + c.length, 0);
+    let r = await fetchWithTimeout(url, { headers: baseOffset > 0 ? { Range: 'bytes=' + baseOffset + '-' } : {} }, 60000, signal);
     if (!r.ok) throw new Error(`${label} HTTP ${r.status}`);
-    
-    const total = parseInt(r.headers.get('content-length') || '0');
+    let total = parseInt(r.headers.get('content-length') || '0');
+    if (baseOffset > 0) {
+      const m = r.status === 206 ? /^bytes (\d+)-\d+\/(\d+)$/.exec(r.headers.get('content-range') || '') : null;
+      if (m && Number(m[1]) === baseOffset) {
+        total = Number(m[2]);
+      } else if (r.status !== 200) {
+        // CDN 未按请求续传且给的不是干净全量（如区间错位的 206）：字节序列不可信，弃响应重发
+        try { await r.body.cancel(); } catch (_) {}
+        chunks.length = 0;
+        baseOffset = 0;
+        r = await fetchWithTimeout(url, {}, 60000, signal);
+        if (!r.ok) throw new Error(`${label} HTTP ${r.status}`);
+        total = parseInt(r.headers.get('content-length') || '0');
+      } else {
+        // CDN 忽略 Range 返回全量：从头覆盖
+        chunks.length = 0;
+        baseOffset = 0;
+      }
+    }
     const reader = r.body.getReader();
-    const chunks = [];
     let received = 0;
     let lastSent = -1;
-    
+
     while (true) {
       if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
       let res;
@@ -253,32 +271,34 @@
       if (res.done) break;
       chunks.push(res.value);
       received += res.value.length;
-      
-      const percent = total > 0 ? Math.round(received / total * 100) : -1;
+
+      const percent = total > 0 ? Math.round((baseOffset + received) / total * 100) : -1;
       if (percent !== lastSent) {
         lastSent = percent;
         notify('download_progress', {
           taskId, phase, percent,
-          received, total,
+          received: baseOffset + received, total,
           label
         });
       }
     }
-    
+
     if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+    if (total > 0 && baseOffset + received !== total) throw new Error(`${label} 流长度不完整(${baseOffset + received}/${total})`);
     return new Blob(chunks);
   }
 
   // 逐个候选地址尝试：B 站 CDN 瞬时抖动（连接重置等表现为 TypeError: Failed to fetch）
-  // 只影响单个地址，切换备用链接重下即可，不再让整任务失败
+  // 只影响单个地址，切换备用链接并携带已收字节（Range）续传，不再让整任务失败
   async function downloadBlob(urls, taskId, phase, label, signal) {
     const candidates = Array.isArray(urls) ? urls.filter(Boolean) : [urls].filter(Boolean);
     if (candidates.length === 0) throw new Error(`${label} 无可用下载地址`);
+    const state = { chunks: [] };
     let lastErr = null;
     for (const url of candidates) {
       if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
       try {
-        return await downloadBlobOnce(url, taskId, phase, label, signal);
+        return await downloadBlobOnce(url, taskId, phase, label, signal, state);
       } catch (e) {
         // 用户中止立即透传，不浪费剩余地址
         if (e.name === 'AbortError' || signal?.aborted) throw e;
